@@ -1,0 +1,37 @@
+{
+  "$schema": "./node_modules/@biomejs/biome/configuration_schema.json",
+  "extends": [
+    "ultracite/biome/core",
+    "ultracite/biome/react",
+    "ultracite/biome/vitest"
+  ],
+  "linter": {
+    "rules": {
+      "performance": {
+        "useTopLevelRegex": "off"
+      }
+    }
+  },
+  "overrides": [
+    {
+      "includes": ["packages/*/src/index.ts"],
+      "linter": {
+        "rules": {
+          "performance": {
+            "noBarrelFile": "off"
+          }
+        }
+      }
+    },
+    {
+      "includes": ["packages/values/src/uuid.ts"],
+      "linter": {
+        "rules": {
+          "suspicious": {
+            "noBitwiseOperators": "off"
+          }
+        }
+      }
+    }
+  ]
+}

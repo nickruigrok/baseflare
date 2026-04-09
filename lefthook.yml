@@ -1,0 +1,26 @@
+pre-commit:
+  jobs:
+    - run: pnpm exec ultracite fix {staged_files}
+      glob:
+        - "**/*.mjs"
+        - "**/*.cjs"
+        - "**/*.js"
+        - "**/*.jsx"
+        - "**/*.ts"
+        - "**/*.tsx"
+        - "**/*.json"
+        - "**/*.jsonc"
+        - "**/*.css"
+        - "**/*.scss"
+        - "**/*.md"
+        - "**/*.mdx"
+        - "**/*.yml"
+        - "**/*.yaml"
+      stage_fixed: true
+commit-msg:
+  jobs:
+    - run: pnpm exec commitlint --edit {1}
+pre-push:
+  jobs:
+    - run: pnpm typecheck
+    - run: pnpm test

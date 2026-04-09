@@ -1,0 +1,37 @@
+{
+  "name": "baseflare-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.8.0",
+  "engines": {
+    "node": ">=22.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "typecheck": "turbo run typecheck",
+    "lint": "ultracite check .",
+    "format": "ultracite fix .",
+    "test": "turbo run test",
+    "clean": "turbo run clean && rimraf .turbo coverage",
+    "changeset": "changeset",
+    "version-packages": "changeset version",
+    "release": "changeset publish",
+    "check": "pnpm lint && pnpm typecheck && pnpm test",
+    "prepare": "lefthook install"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.10",
+    "@changesets/cli": "^2.29.5",
+    "@commitlint/cli": "^20.5.0",
+    "@commitlint/config-conventional": "^20.5.0",
+    "@types/node": "^22.15.18",
+    "lefthook": "^2.1.5",
+    "rimraf": "^6.0.1",
+    "tsup": "^8.5.0",
+    "turbo": "^2.5.3",
+    "typescript": "^5.8.3",
+    "ultracite": "7.4.4",
+    "vitest": "^3.1.3"
+  }
+}
