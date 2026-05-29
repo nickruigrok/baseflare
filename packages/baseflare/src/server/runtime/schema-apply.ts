@@ -2,6 +2,7 @@ import {
   createIndexStatement,
   createTableVersionStatements,
   type Schema,
+  type SqlStatement,
 } from "../schema/types";
 
 import {
@@ -19,21 +20,22 @@ export async function applyRuntimeSchema(
   database: D1Database,
   schema: Schema
 ): Promise<void> {
-  const statements: string[] = [];
+  const statements: SqlStatement[] = [];
   const tableNames = Object.keys(schema.tables);
 
   for (const tableName of tableNames) {
-    statements.push(createRuntimeTableStatement(tableName));
+    statements.push({
+      sql: createRuntimeTableStatement(tableName),
+      params: [],
+    });
   }
 
   for (const [tableName, table] of Object.entries(schema.tables)) {
     for (const index of table.indexes) {
-      statements.push(
-        createIndexStatement(tableName, index).replace(
-          "CREATE INDEX ",
-          "CREATE INDEX IF NOT EXISTS "
-        )
-      );
+      statements.push({
+        sql: createIndexStatement(tableName, index, { ifNotExists: true }),
+        params: [],
+      });
     }
   }
 
@@ -43,7 +45,9 @@ export async function applyRuntimeSchema(
     "Failed to apply runtime schema",
     async () => {
       const results = await database.batch(
-        statements.map((statement) => database.prepare(statement))
+        statements.map((statement) =>
+          database.prepare(statement.sql).bind(...statement.params)
+        )
       );
 
       if (results.length !== statements.length) {
@@ -55,7 +59,7 @@ export async function applyRuntimeSchema(
       for (const [index, result] of results.entries()) {
         ensureSuccessfulD1Result(
           result,
-          `Failed to apply schema statement "${statements[index] ?? "unknown"}"`
+          `Failed to apply schema statement "${statements[index]?.sql ?? "unknown"}"`
         );
       }
     }

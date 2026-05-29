@@ -7,6 +7,7 @@ import { applyRuntimeSchema } from "./schema-apply";
 import type { D1Database, D1PreparedStatement, D1Result } from "./types";
 
 class FakePreparedStatement implements D1PreparedStatement {
+  readonly params: unknown[] = [];
   readonly query: string;
 
   constructor(query: string) {
@@ -17,7 +18,8 @@ class FakePreparedStatement implements D1PreparedStatement {
     return Promise.resolve({ results: [], success: true });
   }
 
-  bind(): D1PreparedStatement {
+  bind(...values: unknown[]): D1PreparedStatement {
+    this.params.push(...values);
     return this;
   }
 
@@ -66,7 +68,13 @@ describe("runtime schema apply", () => {
       "CREATE TABLE IF NOT EXISTS todos (_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0 CHECK(_rev >= 0))",
       "CREATE INDEX IF NOT EXISTS todos_by_owner ON todos (json_extract(_data, '$.ownerToken'))",
       "CREATE TABLE IF NOT EXISTS _bf_table_versions (table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0))",
-      "INSERT OR IGNORE INTO _bf_table_versions (table_name, version) VALUES ('todos', 0)",
+      "INSERT OR IGNORE INTO _bf_table_versions (table_name, version) VALUES (?, 0)",
+    ]);
+    expect(preparedStatements.map((statement) => statement.params)).toEqual([
+      [],
+      [],
+      [],
+      ["todos"],
     ]);
   });
 });

@@ -9,7 +9,6 @@ import type {
 import {
   jsonResult,
   NotFoundRuntimeError,
-  PayloadTooLargeRuntimeError,
   RuntimeError,
   toErrorResponse,
   ValidationRuntimeError,
@@ -22,6 +21,7 @@ import {
 } from "./execution";
 import { createFunctionIndex } from "./function-index";
 import { getRequestLogFields, logRuntimeEvent } from "./logging";
+import { readRequestBodyText } from "./request-body";
 import type {
   BaseflareExecutionContext,
   BaseflareManifest,
@@ -46,37 +46,6 @@ function getRouteName(pathname: string, prefix: string): string | null {
   } catch {
     throw new ValidationRuntimeError("RPC route name is malformed");
   }
-}
-
-async function readRequestBodyText(
-  request: Request,
-  maxBytes: number
-): Promise<string> {
-  if (!request.body) {
-    return "";
-  }
-
-  const reader = request.body.getReader();
-  const decoder = new TextDecoder();
-  let totalBytes = 0;
-  let bodyText = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) {
-      break;
-    }
-
-    totalBytes += value.byteLength;
-    if (totalBytes > maxBytes) {
-      throw new PayloadTooLargeRuntimeError();
-    }
-
-    bodyText += decoder.decode(value, { stream: true });
-  }
-
-  bodyText += decoder.decode();
-  return bodyText;
 }
 
 async function parseRpcBodyArgs(request: Request): Promise<unknown> {

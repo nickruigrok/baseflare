@@ -64,6 +64,11 @@ export interface DiffedIndex {
   readonly tableName: string;
 }
 
+export interface SqlStatement {
+  readonly params: readonly (number | string | null)[];
+  readonly sql: string;
+}
+
 export interface SchemaDiff {
   readonly addedIndexes: readonly DiffedIndex[];
   readonly addedTables: SchemaTables;
@@ -110,26 +115,32 @@ export function createTableStatement(tableName: string): string {
 
 export function createIndexStatement(
   tableName: string,
-  index: TableIndex
+  index: TableIndex,
+  options: { ifNotExists?: boolean } = {}
 ): string {
   const expressions = index.fields
     .map((field) => `json_extract(_data, '$.${field}')`)
     .join(", ");
+  const ifNotExists = options.ifNotExists ? " IF NOT EXISTS" : "";
 
-  return `CREATE INDEX ${tableName}_${index.name} ON ${tableName} (${expressions})`;
+  return `CREATE INDEX${ifNotExists} ${tableName}_${index.name} ON ${tableName} (${expressions})`;
 }
 
 export function createTableVersionStatements(
   tableNames: readonly string[]
-): string[] {
-  const statements = [
-    `CREATE TABLE IF NOT EXISTS ${TABLE_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0))`,
+): SqlStatement[] {
+  const statements: SqlStatement[] = [
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${TABLE_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0))`,
+      params: [],
+    },
   ];
 
   for (const tableName of tableNames) {
-    statements.push(
-      `INSERT OR IGNORE INTO ${TABLE_VERSION_TABLE_NAME} (table_name, version) VALUES ('${tableName}', 0)`
-    );
+    statements.push({
+      sql: `INSERT OR IGNORE INTO ${TABLE_VERSION_TABLE_NAME} (table_name, version) VALUES (?, 0)`,
+      params: [tableName],
+    });
   }
 
   return statements;
