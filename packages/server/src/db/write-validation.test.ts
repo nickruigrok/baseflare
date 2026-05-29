@@ -74,6 +74,33 @@ describe("write validation", () => {
     });
   });
 
+  it("rejects deleting required and defaulted fields through patch", () => {
+    const todos = defineTable({
+      text: v.string(),
+      completed: v.boolean().default(false),
+      assignee: v.optional(v.id("users")),
+    });
+
+    const current = {
+      _id: generateId(),
+      _createdAt: Date.now(),
+      text: "draft",
+      completed: true,
+      assignee: generateId(),
+    };
+
+    expect(() =>
+      validatePatchData(todos, current, { text: undefined })
+    ).toThrow(/cannot delete a required field/);
+    expect(() =>
+      validatePatchData(todos, current, { completed: undefined })
+    ).toThrow(/cannot delete a required field/);
+    expect(validatePatchData(todos, current, { assignee: undefined })).toEqual({
+      text: "draft",
+      completed: true,
+    });
+  });
+
   it("patches unrelated fields on documents missing a newly-required field", () => {
     const todos = defineTable({
       text: v.string(),

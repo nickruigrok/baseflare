@@ -1,10 +1,26 @@
 import { UUID, uuidv7 } from "uuidv7";
 
+import { ValidationError } from "./errors";
+
 const UUID_V7_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const MAX_UUID_V7_TIMESTAMP_MS = 0xff_ff_ff_ff_ff_ff;
 const MAX_UUID_V7_RAND_A = 0x0f_ff;
 const MAX_UUID_V7_RAND_B_HIGH = 0x3f_ff_ff_ff;
 const MAX_UUID_V7_RAND_B_LOW = 0xff_ff_ff_ff;
+
+function assertUuidV7Timestamp(milliseconds: number): void {
+  if (
+    !Number.isSafeInteger(milliseconds) ||
+    milliseconds < 0 ||
+    milliseconds > MAX_UUID_V7_TIMESTAMP_MS
+  ) {
+    throw new ValidationError(
+      "milliseconds",
+      `milliseconds must be an integer between 0 and ${MAX_UUID_V7_TIMESTAMP_MS}`
+    );
+  }
+}
 
 export function isUuidV7(value: string): boolean {
   return UUID_V7_PATTERN.test(value);
@@ -15,10 +31,12 @@ export function generateId(): string {
 }
 
 export function minIdForMs(milliseconds: number): string {
+  assertUuidV7Timestamp(milliseconds);
   return UUID.fromFieldsV7(milliseconds, 0, 0, 0).toString();
 }
 
 export function maxIdForMs(milliseconds: number): string {
+  assertUuidV7Timestamp(milliseconds);
   return UUID.fromFieldsV7(
     milliseconds,
     MAX_UUID_V7_RAND_A,

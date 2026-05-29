@@ -101,6 +101,13 @@ export function validatePatchData(
     }
 
     if (value === undefined) {
+      if (!fieldValidator.definition.optional) {
+        throw new ValidationError(
+          `document.${key}`,
+          `document.${key} cannot delete a required field`
+        );
+      }
+
       delete next[key];
       continue;
     }

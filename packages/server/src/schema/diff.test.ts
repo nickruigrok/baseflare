@@ -51,13 +51,9 @@ describe("diff", () => {
     const schemaDiff = diff(current, target);
 
     expect(schemaDiff.orphanedTables).toEqual(["legacy"]);
-    expect(schemaDiff.removedIndexes).toEqual([
-      { tableName: "legacy", index: { name: "by_value", fields: ["value"] } },
-    ]);
+    expect(schemaDiff.removedIndexes).toEqual([]);
     expect(schemaDiff.hasChanges).toBe(true);
-    expect(schemaDiff.toStatements()).toEqual([
-      "DROP INDEX IF EXISTS legacy_by_value",
-    ]);
+    expect(schemaDiff.toStatements()).toEqual([]);
   });
 
   it("recreates an index when its fields change", () => {

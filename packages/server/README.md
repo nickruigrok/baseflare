@@ -32,3 +32,8 @@ default `_id` ordering (UUIDv7 encodes creation time).
 For paginated, field-ordered queries the ordered value must be a scalar
 (`string`, `number`, `boolean`, or `null`/missing); array, object, or bytes
 values throw. Non-paginated `.collect()` has no such restriction.
+
+Pagination cursors are opaque strings that represent a position in a query
+result. They are not signed or encrypted, so callers must not parse them or rely
+on them for access control. Enforce authorization through permissions and query
+filters; treat cursors only as pagination state.

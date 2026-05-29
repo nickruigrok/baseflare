@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { ValidationError } from "./errors";
 import {
   generateId,
   getCreatedAtFromId,
@@ -8,6 +9,8 @@ import {
   maxIdForMs,
   minIdForMs,
 } from "./uuid";
+
+const MAX_UUID_V7_TIMESTAMP_MS = 0xff_ff_ff_ff_ff_ff;
 
 describe("uuid helpers", () => {
   it("generates monotonically increasing UUIDv7 ids", () => {
@@ -52,9 +55,27 @@ describe("uuid helpers", () => {
     expect(getCreatedMsFromId(high)).toBe(ms);
   });
 
+  it("builds valid UUIDv7 sentinels for boundary timestamps", () => {
+    const low = minIdForMs(0);
+    const high = maxIdForMs(MAX_UUID_V7_TIMESTAMP_MS);
+
+    expect(isUuidV7(low)).toBe(true);
+    expect(isUuidV7(high)).toBe(true);
+    expect(getCreatedMsFromId(low)).toBe(0);
+    expect(getCreatedMsFromId(high)).toBe(MAX_UUID_V7_TIMESTAMP_MS);
+  });
+
   it("rejects invalid sentinel timestamps", () => {
-    expect(() => minIdForMs(-1)).toThrow();
-    expect(() => maxIdForMs(1.5)).toThrow();
+    for (const value of [
+      -1,
+      1.5,
+      Number.POSITIVE_INFINITY,
+      Number.NaN,
+      Number.MAX_SAFE_INTEGER,
+    ]) {
+      expect(() => minIdForMs(value)).toThrow(ValidationError);
+      expect(() => maxIdForMs(value)).toThrow(ValidationError);
+    }
   });
 
   it("orders sentinels so a real id for the same ms falls within range", () => {

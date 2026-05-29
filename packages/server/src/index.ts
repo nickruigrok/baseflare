@@ -6,7 +6,6 @@ export type {
   BaseflareWorkerConfig,
 } from "./config";
 export { defineConfig } from "./config";
-export type { CursorPayload, OrderDirection, OrderSpec } from "./db/cursor";
 export { deserialize } from "./db/deserialize";
 export type {
   FieldFilter,

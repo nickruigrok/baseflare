@@ -126,9 +126,6 @@ function collectTableUpdates(
 
     if (!targetTable) {
       orphanedTables.push(tableName);
-      for (const index of table.indexes) {
-        removedIndexes.push({ tableName, index });
-      }
       continue;
     }
 
