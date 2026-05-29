@@ -12,7 +12,7 @@ A Convex → Baseflare migration has three layers:
 
 1. **Code migration** — import path changes + a handful of API differences (this guide)
 2. **Data migration** — export from Convex, remap IDs, import to Baseflare (Section 12)
-3. **Infrastructure** — `bf deploy` to your Cloudflare account instead of Convex Cloud (Section 13)
+3. **Infrastructure** — `npx baseflare deploy` to your Cloudflare account instead of Convex Cloud (Section 13)
 
 Most apps only need Layer 1 for the code to compile and run. Layers 2 and 3 are for moving live data and going to production.
 
@@ -40,10 +40,10 @@ This is the bulk of the migration. A global find-and-replace handles most of it.
 
 | Convex import | Baseflare import |
 |---|---|
-| `from 'convex/server'` | `from '@baseflare/server'` |
-| `from 'convex/values'` | `from '@baseflare/values'` |
+| `from 'convex/server'` | `from 'baseflare/server'` |
+| `from 'convex/values'` | `from 'baseflare/values'` |
 | `from 'convex/react'` | `from '@baseflare/react'` |
-| `from 'convex/browser'` | `from '@baseflare/client'` |
+| `from 'convex/browser'` | `from 'baseflare/client'` |
 | `from './_generated/server'` | `from './_generated/server'` (unchanged) |
 | `from './_generated/api'` | `from './_generated/api'` (unchanged) |
 | `from './_generated/dataModel'` | `from './_generated/data-model'` (**note: kebab-case**) |
@@ -63,8 +63,8 @@ import { defineSchema, defineTable } from 'convex/server'
 import { v } from 'convex/values'
 
 // After (Baseflare)
-import { defineSchema, defineTable } from '@baseflare/server'
-import { v } from '@baseflare/values'
+import { defineSchema, defineTable } from 'baseflare/server'
+import { v } from 'baseflare/values'
 ```
 
 `defineSchema()` and `defineTable()` work the same way.
@@ -127,7 +127,7 @@ export const list = query({
 ```typescript
 // After (Baseflare)
 import { query } from './_generated/server'
-import { v } from '@baseflare/values'
+import { v } from 'baseflare/values'
 
 export const list = query({
   args: { completed: v.boolean() },
@@ -239,10 +239,11 @@ import { httpRouter } from 'convex/server'
 import { httpAction } from './_generated/server'
 
 // After (Baseflare)
-import { httpRouter, httpAction } from '@baseflare/server'
+import { httpRouter } from 'baseflare/server'
+import { httpAction } from './_generated/server'
 ```
 
-`httpRouter()`, `http.route({ path, method, handler })`, and `http.routeWithPrefix({ pathPrefix, method, handler })` all work identically. `httpAction(async (ctx, request) => Response)` is the same.
+`httpRouter()`, `http.route({ path, method, handler })`, and `http.routeWithPrefix({ pathPrefix, method, handler })` all work identically. `httpAction(async (ctx, request) => Response)` remains an app-typed generated helper.
 
 ---
 
@@ -268,7 +269,7 @@ crons.interval('cleanup', { hours: 24 }, internal.cleanup.run)
 export default crons
 
 // After (Baseflare)
-import { defineCrons } from '@baseflare/server'
+import { defineCrons } from 'baseflare/server'
 export default defineCrons({
   cleanup: { schedule: '0 0 * * *', handler: internal.cleanup.run },
 })
@@ -298,7 +299,7 @@ File storage API is identical. Backed by R2 instead of Convex storage. Storage I
 
 ```typescript
 // baseflare/auth.ts
-import { defineAuth } from '@baseflare/server'
+import { defineAuth } from 'baseflare/server'
 
 export default defineAuth({
   emailAndPassword: { enabled: true },
@@ -327,7 +328,7 @@ export default defineAuth({
 
 ```typescript
 // baseflare/rules.ts (optional, but recommended)
-import { defineRules } from '@baseflare/server'
+import { defineRules } from 'baseflare/server'
 
 export default defineRules({
   todos: {
@@ -380,7 +381,7 @@ import { ConvexError } from 'convex/values'
 throw new ConvexError({ code: 'OUT_OF_STOCK' })
 
 // After (Baseflare) — message-first, data second
-import { BaseflareError } from '@baseflare/values'
+import { BaseflareError } from 'baseflare/values'
 throw new BaseflareError('Out of stock', { code: 'OUT_OF_STOCK' })
 ```
 
@@ -408,7 +409,7 @@ Moving existing data from Convex to Baseflare. This is a one-off script.
 
 4. **Import to Baseflare:**
    ```bash
-   bf import data.json --env production
+   npx baseflare import data.json --env production
    ```
    (Where `data.json` is your remapped data in Baseflare's import format.)
 
@@ -422,15 +423,15 @@ Moving existing data from Convex to Baseflare. This is a one-off script.
 
 | Convex | Baseflare |
 |---|---|
-| `npx convex dev` | `bf dev` (local Miniflare) |
-| `npx convex deploy` | `bf deploy --env production` |
+| `npx convex dev` | `npx baseflare dev` (local Miniflare) |
+| `npx convex deploy` | `npx baseflare deploy --env production` |
 | Convex Cloud (managed) | Your Cloudflare account |
 | `CONVEX_URL` env var | `BASEFLARE_URL` env var |
-| `npx convex env set KEY val` | `bf secrets set KEY val --env production` |
+| `npx convex env set KEY val` | `npx baseflare secrets set KEY val --env production` |
 
 **Steps:**
-1. `bf login` — OAuth to your Cloudflare account
-2. `bf deploy --env production` — provisions Workers, D1, DOs, R2, Vectorize; deploys functions + schema
+1. `npx baseflare login` — OAuth to your Cloudflare account
+2. `npx baseflare deploy --env production` — provisions Workers, D1, DOs, R2, Vectorize; deploys functions + schema
 3. Set `BASEFLARE_URL` in your frontend hosting platform's env vars (points to your deployed Worker)
 
 ---
@@ -472,9 +473,9 @@ Things Baseflare has that **Convex does NOT:**
 10. Migrate auth to `defineAuth()` (better-auth)
 11. Replace `ConvexError` → `BaseflareError` (message-first)
 12. Update React provider + client constructor
-13. Run codegen: `bf generate`
-14. `bf dev` — fix any remaining type errors
-15. (Production) migrate data (Section 16), `bf deploy`
+13. Run codegen: `npx baseflare generate`
+14. `npx baseflare dev` — fix any remaining type errors
+15. (Production) migrate data (Section 16), `npx baseflare deploy`
 
 ---
 

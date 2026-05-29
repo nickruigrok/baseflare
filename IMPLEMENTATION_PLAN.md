@@ -121,7 +121,7 @@ CPU time only counts active processing. Waiting on `fetch()`, D1 queries, R2 rea
 **One Worker per environment.** Complete infrastructure isolation.
 
 ```
-bf deploy --env production →
+npx baseflare deploy --env production →
   (first deploy auto-provisions:)
   Worker:    bf-{project}-production
   D1:        bf-{project}-production-db
@@ -130,30 +130,30 @@ bf deploy --env production →
   Vectorize: bf-{project}-production-vectors (if vector search enabled)
 ```
 
-First deploy to a new environment auto-provisions all CF resources. Subsequent deploys update the Worker and schema. `bf env destroy` deletes all resources.
+First deploy to a new environment auto-provisions all CF resources. Subsequent deploys update the Worker and schema. `npx baseflare env destroy` deletes all resources.
 
 ### 1.4 Management Architecture
 
-No hosted control plane. The CLI (`bf`) talks directly to the Cloudflare API for all management operations. The dashboard runs locally.
+No hosted control plane. The CLI (`baseflare`) talks directly to the Cloudflare API for all management operations. The dashboard runs locally.
 
 ```bash
-bf login                              # OAuth login via browser
-bf login --profile client-x           # OAuth login for named profile
-bf logout                             # revoke tokens
-bf whoami                             # show current account
-bf dev                                # local dev (Miniflare)
-bf deploy --env staging               # creates env if new → build → deploy → apply indexes
-bf generate                           # regenerate types (_generated/)
-bf env list                           # CF API: list bf-{project}-* resources
-bf env destroy --env staging          # CF API: delete all resources
-bf secrets list --env staging         # list secrets
-bf secrets set KEY val --env staging  # set secret
-bf secrets rm KEY --env staging       # remove secret
-bf backup list --env staging          # D1 Time Travel: list snapshots
-bf backup restore --env staging       # D1 Time Travel: restore snapshot
-bf import data.json --env staging     # bulk import data
-bf export --env staging               # export data as JSON
-bf dashboard                          # starts local Vite dev server
+npx baseflare login                              # OAuth login via browser
+npx baseflare login --profile client-x           # OAuth login for named profile
+npx baseflare logout                             # revoke tokens
+npx baseflare whoami                             # show current account
+npx baseflare dev                                # local dev (Miniflare)
+npx baseflare deploy --env staging               # creates env if new → build → deploy → apply indexes
+npx baseflare generate                           # regenerate types (_generated/)
+npx baseflare env list                           # CF API: list bf-{project}-* resources
+npx baseflare env destroy --env staging          # CF API: delete all resources
+npx baseflare secrets list --env staging         # list secrets
+npx baseflare secrets set KEY val --env staging  # set secret
+npx baseflare secrets rm KEY --env staging       # remove secret
+npx baseflare backup list --env staging          # D1 Time Travel: list snapshots
+npx baseflare backup restore --env staging       # D1 Time Travel: restore snapshot
+npx baseflare import data.json --env staging     # bulk import data
+npx baseflare export --env staging               # export data as JSON
+npx baseflare dashboard                          # starts local Vite dev server
 ```
 
 Only actual project resources (Workers, D1, R2, DO, Vectorize, KV) are deployed to Cloudflare. No management infrastructure, no system database, no extra Workers.
@@ -161,52 +161,51 @@ Only actual project resources (Workers, D1, R2, DO, Vectorize, KV) are deployed 
 **Authentication:**
 
 ```bash
-bf login     # opens browser → Cloudflare OAuth consent page → authorize → tokens stored
-bf logout    # revokes tokens
-bf whoami    # shows current account + email
+npx baseflare login     # opens browser → Cloudflare OAuth consent page → authorize → tokens stored
+npx baseflare logout    # revokes tokens
+npx baseflare whoami    # shows current account + email
 ```
 
-`bf login` uses OAuth 2.0 Authorization Code Flow with PKCE — same approach as wrangler. Opens the browser, user authorizes, localhost callback receives tokens. Account ID is fetched automatically from the OAuth token via the CF API. Tokens are stored in `~/.baseflare/credentials.json` (global, not per-project).
+`npx baseflare login` uses OAuth 2.0 Authorization Code Flow with PKCE — same approach as wrangler. Opens the browser, user authorizes, localhost callback receives tokens. Account ID is fetched automatically from the OAuth token via the CF API. Tokens are stored in `~/.baseflare/credentials.json` (global, not per-project).
 
 For CI/CD: set `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` environment variables. These override OAuth tokens when present.
 
-**Bootstrap + local CLI flow:**
+**Planned bootstrap + local CLI flow (Phase 4):**
 
-Baseflare uses a two-stage CLI model:
-1. Bootstrap with the full package name: `npx @baseflare/cli init my-app`
-2. `init` generates the project and installs `@baseflare/cli` into the new app's `devDependencies`
-3. Day-to-day usage runs the local CLI via `bf` or `baseflare`
+Baseflare will use a two-stage CLI model:
+1. Bootstrap with the full package name: `npx baseflare new my-app`
+2. `new` generates a new project directory and installs the `baseflare` package
+3. Day-to-day usage runs the local CLI via package scripts or `npx baseflare`
 
-`init` installs direct app dependencies based on the selected stack:
-- Always: `@baseflare/server`, `@baseflare/values`
-- Vanilla JS/TS or direct Node/browser usage: `@baseflare/client`
-- React: `@baseflare/react` (which depends on `@baseflare/client`)
+`new` installs direct app dependencies based on the selected stack:
+- Always: `baseflare` (server, values, client subpaths, and CLI)
+- React: `@baseflare/react` (which depends on `baseflare/client`)
 
-The CLI then prompts for missing runtime configuration on first local `bf dev` or `bf deploy`:
+The CLI will prompt for missing runtime configuration on first local `npx baseflare dev` or `npx baseflare deploy`:
 
 ```bash
-npx @baseflare/cli init my-app
+npx baseflare new my-app
 # → scaffolds project
-# → installs @baseflare/cli in devDependencies
+# → installs baseflare in devDependencies
 # → installs direct app dependencies based on selected frontend/runtime
 
 cd my-app
 
-bf dev
+npx baseflare dev
 # ✗ Not logged in
-# → Run `bf login` first
+# → Run `npx baseflare login` first
 
-bf login
+npx baseflare login
 # → Opens browser → Cloudflare OAuth consent page → authorize
 # → Tokens stored in ~/.baseflare/credentials.json (default profile)
 # → ✓ Logged in as nick@joingrasp.com
 
-bf login --profile client-x
+npx baseflare login --profile client-x
 # → Opens browser → different CF account OAuth → authorize
 # → Stored as "client-x" profile
 # → ✓ Logged in as admin@clientx.com
 
-bf dev
+npx baseflare dev
 # ? Select profile: (only shown if multiple profiles exist)
 #   1. default (nick@joingrasp.com)
 #   2. client-x (admin@clientx.com)
@@ -236,7 +235,7 @@ Project-level configuration is stored in `baseflare.config.ts` (project root, co
 
 ```typescript
 // baseflare.config.ts (project root, committed)
-import { defineConfig } from '@baseflare/server'
+import { defineConfig } from 'baseflare/server'
 
 export default defineConfig({
   // Required
@@ -283,11 +282,11 @@ CLOUDFLARE_ACCOUNT_ID=abc123
 BASEFLARE_URL=http://localhost:4510
 ```
 
-`bf dev` writes `BASEFLARE_URL=http://localhost:4510` to `.env.local`. This is the only command that modifies `.env.local` — deploy commands never touch it, avoiding accidental frontend→staging/production pointing.
+`npx baseflare dev` writes `BASEFLARE_URL=http://localhost:4510` to `.env.local`. This is the only command that modifies `.env.local` — deploy commands never touch it, avoiding accidental frontend→staging/production pointing.
 
-`bf deploy` prints the environment URL after deploy:
+`npx baseflare deploy` prints the environment URL after deploy:
 ```bash
-bf deploy --env staging
+npx baseflare deploy --env staging
 # ✓ Deployed to https://bf-myapp-staging.your-account.workers.dev
 ```
 
@@ -301,21 +300,21 @@ const client = new BaseflareClient({
 
 For non-local environments, set `BASEFLARE_URL` in your hosting platform (Vercel env vars, Cloudflare Pages env vars, CI/CD). Each environment (staging, production) gets its own URL configured where the frontend is deployed — not in `.env.local`.
 
-The CLI checks two things before any CF operation: `project` in config and valid credentials (OAuth tokens in `~/.baseflare/credentials.json` or `CLOUDFLARE_API_TOKEN` env var). If not logged in, it prompts `bf login`.
+The CLI checks two things before any CF operation: `project` in config and valid credentials (OAuth tokens in `~/.baseflare/credentials.json` or `CLOUDFLARE_API_TOKEN` env var). If not logged in, it prompts `npx baseflare login`.
 
 ### 1.5 Deploy Model
 
 ```bash
-bf deploy --env production
+npx baseflare deploy --env production
 ```
 
 1. CLI bundles the `baseflare/` directory via `esbuild` (runtime-agnostic, no Bun dependency)
 2. CLI wraps the bundle into a Worker entry point template:
    ```typescript
-   import { createWorker } from '@baseflare/server'
+   import { createWorker } from 'baseflare/server'
    import * as userCode from './bundle.js'
    export default createWorker(userCode)
-   export { SubscriptionDO } from '@baseflare/server'
+   export { SubscriptionDO } from 'baseflare/server'
    ```
 3. CLI deploys the Worker via Cloudflare Workers API (`PUT /client/v4/accounts/{id}/workers/scripts/{name}`)
 4. CLI applies table/index changes to D1 (create new collection tables, add/drop indexes — field changes are no-ops)
@@ -337,7 +336,7 @@ Baseflare uses a document model — each row stores fields as a JSON blob. Schem
 **Orphaned field handling:** When a field is removed from the schema, old documents still contain it in `_data` JSON. On read, `deserialize()` returns all keys — including fields not in the current schema. The dashboard shows orphaned fields with a count of documents still containing them. When a document is rewritten via `patch` or `replace`, removed fields are stripped from the new version. Fields naturally disappear as documents are updated over time.
 
 **Orphaned table handling:** When a table is removed from the schema but still contains data:
-1. `bf deploy` warns: `⚠ Table "legacy_users" orphaned (142 rows remaining)`
+1. `npx baseflare deploy` warns: `⚠ Table "legacy_users" orphaned (142 rows remaining)`
 2. Table becomes read-only — runtime rejects inserts/updates/deletes to orphaned tables
 3. Dashboard shows orphaned tables with row count and a "Delete table" button
 4. User clicks delete → dashboard calls D1 REST API → `DROP TABLE` → gone immediately
@@ -346,7 +345,7 @@ Schema validation happens at write time in the Worker, not at the database level
 
 ### 1.6 Local Development
 
-`bf dev` starts Miniflare programmatically — full Cloudflare stack locally:
+`npx baseflare dev` starts Miniflare programmatically — full Cloudflare stack locally:
 
 ```typescript
 import { Miniflare } from 'miniflare'
@@ -363,7 +362,7 @@ const mf = new Miniflare({
 
 Hot reload: file watcher detects changes in `baseflare/`, rebuilds the Worker bundle, restarts Miniflare. Codegen runs in the same process.
 
-**Cron emulation:** Miniflare doesn't support automatic cron triggers. `bf dev` runs its own cron loop — parses `defineCrons()`, uses `cron-parser` to calculate next fire times, and calls `worker.scheduled()` on the Miniflare instance when due. Crons fire locally just like in production. SchedulerDO runs locally via Miniflare.
+**Cron emulation:** Miniflare doesn't support automatic cron triggers. `npx baseflare dev` runs its own cron loop — parses `defineCrons()`, uses `cron-parser` to calculate next fire times, and calls `worker.scheduled()` on the Miniflare instance when due. Crons fire locally just like in production. SchedulerDO runs locally via Miniflare.
 
 ### 1.7 ID Format
 
@@ -488,7 +487,7 @@ D1 has built-in Time Travel — point-in-time recovery for the last 30 days. No 
 | Secrets | Worker Secrets | Native CF encryption |
 | Idempotency keys | KV namespace | Fast reads, TTL support |
 | Environment Worker | Worker script | One per environment |
-| Dashboard | Local Vite dev server | `bf dashboard` |
+| Dashboard | Local Vite dev server | `npx baseflare dashboard` |
 
 ---
 
@@ -499,12 +498,14 @@ D1 has built-in Time Travel — point-in-time recovery for the last 30 days. No 
 ```
 baseflare/
 ├── packages/
-│   ├── values/                     → @baseflare/values (validators + shared types)
-│   ├── server/                     → @baseflare/server (schema, functions, db, auth, runtime)
-│   ├── client/                     → @baseflare/client (browser/Node SDK)
+│   ├── baseflare/                  → published package: baseflare
+│   │   └── src/
+│   │       ├── values/             → baseflare/values (validators + shared types)
+│   │       ├── server/             → baseflare/server (schema, functions, db, auth, runtime)
+│   │       ├── client/             → baseflare/client (browser/Node SDK)
+│   │       └── cli/                → baseflare binary
 │   ├── react/                      → @baseflare/react (React hooks)
-│   ├── dashboard/                  → @baseflare/dashboard (local Vite app, not published)
-│   └── cli/                        → @baseflare/cli (CLI, published as `@baseflare/cli`, bins: `bf`, `baseflare`)
+│   ├── dashboard/                  → baseflare-dashboard (local Vite app, not published)
 ├── package.json
 ├── turbo.json
 ├── tsconfig.base.json
@@ -515,28 +516,30 @@ baseflare/
 
 | Package | Responsibility | Runs on |
 |---|---|---|
-| `@baseflare/values` | Validators (`v.string()`, `v.number()`, etc.), shared types (error codes, RPC shapes, WebSocket messages), ID utilities (`generateId()`, `getCreatedAtFromId()`) | Everywhere |
-| `@baseflare/server` | Phase 1 core: `defineConfig()`, `defineSchema()`, `defineTable()`, `query()`, `mutation()`, `action()`, `defineRules()`, HTTP router, query builder, document serialization, schema diffing, write validation, database interfaces. Later phases add auth, crons, middleware, Worker runtime (`createWorker()`), and CF adapters. | CF Worker |
-| `@baseflare/client` | `BaseflareClient`, WebSocket connection manager, subscription state, optimistic updates, auth methods (`signUp`, `signIn`, `signOut`, `getSession`, `onAuthStateChange`) | Browser/Node |
+| `baseflare/values` | Subpath export for validators (`v.string()`, `v.number()`, etc.), shared types (error codes, RPC shapes, WebSocket messages), ID utilities (`generateId()`, `getCreatedAtFromId()`) | Everywhere |
+| `baseflare/server` | Subpath export for Phase 1 core: `defineConfig()`, `defineSchema()`, `defineTable()`, `query()`, `mutation()`, `action()`, `defineRules()`, HTTP router, query builder, document serialization, schema diffing, write validation, database interfaces. Later phases add auth, crons, middleware, Worker runtime (`createWorker()`), and CF adapters. | CF Worker |
+| `baseflare/client` | Subpath export for `BaseflareClient`, WebSocket connection manager, subscription state, optimistic updates, auth methods (`signUp`, `signIn`, `signOut`, `getSession`, `onAuthStateChange`) | Browser/Node |
 | `@baseflare/react` | `BaseflareProvider`, `useQuery()`, `useMutation()`, `useAction()`, `useAuth()` | Browser |
-| `@baseflare/dashboard` | Local Vite React app — data browser, environment management, logs. Dogfoods `@baseflare/react` for data plane, CF API for management. Not published to npm. | Dev machine |
-| `@baseflare/cli` | `bf init/login/dev/deploy/codegen/generate/env/secrets/backup/dashboard`, codegen engine (analyzes `baseflare/` dir, writes `_generated/`), esbuild bundling, CF API client, OAuth client, Miniflare orchestration, cron emulation | Dev machine |
+| `baseflare-dashboard` | Local Vite React app — data browser, environment management, logs. Dogfoods `@baseflare/react` for data plane, CF API for management. Not published to npm. | Dev machine |
+| `baseflare` CLI | Single binary for `new/login/dev/deploy/codegen/generate/env/secrets/backup/dashboard`, codegen engine (analyzes `baseflare/` dir, writes `_generated/`), esbuild bundling, CF API client, OAuth client, Miniflare orchestration, cron emulation | Dev machine |
 
 ### 3.2 Build Order
 
 ```
-Level 0: @baseflare/values          (minimal shared leaf; one tiny zero-transitive runtime dependency for UUIDv7 generation)
-Level 1: @baseflare/server          (depends on values)
-         @baseflare/client          (depends on values)
-Level 2: @baseflare/react           (depends on client)
-         @baseflare/cli             (depends on server — reads schema for codegen + bundling)
-Level 3: @baseflare/dashboard       (depends on client, react)
+Level 0: packages/baseflare/src/values
+Level 1: packages/baseflare/src/server  (depends on values)
+         packages/baseflare/src/client  (depends on values)
+         packages/baseflare/src/cli     (uses server/client paths for codegen and templates)
+Level 2: @baseflare/react               (depends on baseflare/client)
+Level 3: baseflare-dashboard            (depends on baseflare/client, @baseflare/react)
 ```
 
-### 3.3 Internal Structure of `@baseflare/server`
+The `baseflare` package publishes independent subpath exports for `./values`, `./server`, and `./client`, plus the `baseflare` CLI binary. Importing one subpath must not pull in the other subpaths' runtime code.
+
+### 3.3 Internal Structure of `baseflare/server`
 
 ```
-packages/server/src/
+packages/baseflare/src/server/
   config.ts       → defineConfig()
   schema/         → defineSchema(), defineTable(), schema diffing
   functions/      → query(), mutation(), action(), internal wrappers
@@ -553,12 +556,12 @@ Pure logic (schema, db, permissions) can be tested with plain `vitest`. Runtime 
 
 ```typescript
 // baseflare/schema.ts
-import { defineSchema, defineTable } from '@baseflare/server'
-import { v } from '@baseflare/values'
+import { defineSchema, defineTable } from 'baseflare/server'
+import { v } from 'baseflare/values'
 
 // baseflare/todos.ts — public functions (callable from client)
 import { query, mutation, action } from './_generated/server'
-import { v } from '@baseflare/values'
+import { v } from 'baseflare/values'
 import { api } from './_generated/api'            // reference public functions
 import { internal } from './_generated/internal'   // reference internal functions
 
@@ -566,14 +569,15 @@ import { internal } from './_generated/internal'   // reference internal functio
 import { internalQuery, internalMutation, internalAction } from './_generated/server'
 
 // baseflare/http.ts — custom HTTP endpoints
-import { httpRouter, httpAction } from '@baseflare/server'
+import { httpRouter } from 'baseflare/server'
+import { httpAction } from './_generated/server'
 import { internal } from './_generated/internal'
 
 // baseflare/auth.ts
-import { defineAuth } from '@baseflare/server'
+import { defineAuth } from 'baseflare/server'
 
 // baseflare/crons.ts
-import { defineCrons } from '@baseflare/server'
+import { defineCrons } from 'baseflare/server'
 import { internal } from './_generated/internal'
 
 // src/App.tsx (frontend)
@@ -615,10 +619,10 @@ const post2 = await ctx.db.insert('posts', { authorId: postId }) // ✗ TypeScri
 
 **Goal:** Pure TypeScript logic works in isolation. Validators, schema parsing, permissions, query building, ID generation — all testable without Cloudflare.
 
-**Packages:** `@baseflare/values`, `@baseflare/server` (core logic only, no runtime)
+**Packages:** `baseflare/values`, `baseflare/server` (core logic only, no runtime)
 
 **Deliverables:**
-1. `@baseflare/values`:
+1. `baseflare/values`:
    - Full validator suite: `v.string()`, `v.number()`, `v.boolean()`, `v.bytes()`, `v.null()`, `v.id()`, `v.array()`, `v.object()`, `v.record()`, `v.union()`, `v.literal()`, `v.enum()`, `v.vector()`, `v.any()`, `v.optional()`
    - Validator chains: `.min()`, `.max()`, `.default()`, `.optional()`, `.searchable()`
    - Return value validators (same validators, used in function definitions to validate output)
@@ -626,7 +630,7 @@ const post2 = await ctx.db.insert('posts', { authorId: postId }) // ✗ TypeScri
    - Shared types (RPC request/response shapes, WebSocket messages, error codes)
    - Pagination types (`PaginationOptions`, `PaginationResult`, `paginationOptsValidator`)
    - ID utilities (`generateId()`, `getCreatedAtFromId()`)
-2. `@baseflare/server` (core logic — no CF runtime code yet):
+2. `baseflare/server` (core logic — no CF runtime code yet):
    - Project configuration (`defineConfig`, `BaseflareConfig`)
    - Schema parser (`defineSchema`, `defineTable`)
    - Document serialization/deserialization (plain object ↔ JSON `_data` column, `_createdAt` derived from UUIDv7 in `_id`)
@@ -637,7 +641,7 @@ const post2 = await ctx.db.insert('posts', { authorId: postId }) // ✗ TypeScri
    - Write-time schema validation helpers (`validateInsertData`, `validateReplaceData`, `validatePatchData`) + return value validation
    - Public function wrappers (`query()`, `mutation()`, `action()`)
    - Internal function wrappers (`internalQuery()`, `internalMutation()`, `internalAction()`)
-   - HTTP action wrappers (`httpAction()`, `httpRouter()`)
+   - Generic HTTP router (`httpRouter()`) and Phase 1 HTTP action wrapper (`httpAction()`) until codegen emits the app-typed helper
    - Database interfaces (`DatabaseReader`, `DatabaseWriter` with `get`, `insert`, `patch`, `replace`, `delete`, `query`)
    - Abstract adapter interfaces (implemented by runtime in Phase 2)
 
@@ -701,7 +705,7 @@ const createdAt = getCreatedAtFromId(id)
 
 **Goal:** An environment Worker can receive HTTP requests, execute queries and mutations against D1, and enforce permissions.
 
-**Package:** `@baseflare/server` (runtime layer added on top of Phase 1 core logic)
+**Package:** `baseflare/server` (runtime layer added on top of Phase 1 core logic)
 
 **Deliverables:**
 1. D1 database adapter — implements `DatabaseReader` and `DatabaseWriter` using `env.DB.prepare()`
@@ -728,7 +732,7 @@ const createdAt = getCreatedAtFromId(id)
 **"Done" criteria:**
 ```bash
 # Start local dev (Miniflare)
-bf dev
+npx baseflare dev
 
 # Call a mutation
 curl -X POST http://localhost:4510/api/mutation/todos:create \
@@ -807,11 +811,11 @@ Each environment has one `SubscriptionDO` instance (singleton per environment, a
 
 **Goal:** Full CLI manages environments and deploys code. CLI talks directly to Cloudflare API — no control plane Worker.
 
-**Package:** `@baseflare/cli` (CLI, aliased as `bf` and `baseflare`)
+**Package:** `baseflare` (single CLI binary: `baseflare`)
 
 **Deliverables:**
-1. `@baseflare/cli` (aliased as `bf` and `baseflare`):
-   - `init` — scaffold a new app, ask backend/frontend questions, install `@baseflare/cli` in `devDependencies`, and install direct app dependencies
+1. `baseflare`:
+   - `new <name> [--template minimal|backend|todo] [--no-git]` — scaffold a new app in a new directory, install `baseflare`, install direct app dependencies, and initialize Git unless already inside a Git repo or `--no-git` is passed
    - `login` — OAuth 2.0 Authorization Code Flow with PKCE, opens browser, stores tokens in `~/.baseflare/credentials.json`
    - `login --profile <name>` — same flow, stores under named profile for multi-account/multi-email use
    - `logout` — revokes OAuth tokens for current or specified profile
@@ -833,7 +837,7 @@ Each environment has one `SubscriptionDO` instance (singleton per environment, a
 2. Codegen engine — analyzes functions directory (from `baseflare.config.ts` `functions` path, default `baseflare/`, supports nested folders as namespaces), generates:
    - `_generated/api.ts` — typed references to all public functions (`api.module.fn` or `api.folder.module.fn` for nested)
    - `_generated/internal.ts` — typed references to all internal functions (`internal.module.fn`)
-   - `_generated/server.ts` — typed `query()`, `mutation()`, `action()`, `internalQuery()`, `internalMutation()`, `internalAction()` wrappers
+   - `_generated/server.ts` — typed `query()`, `mutation()`, `action()`, `httpAction()`, `internalQuery()`, `internalMutation()`, `internalAction()` wrappers
    - `_generated/data-model.ts` — TypeScript types per table from schema, branded `Id<"tableName">` types for compile-time relationship safety
    - `_generated/http.ts` — HTTP router wiring if `baseflare/http.ts` exists
 3. OAuth client — PKCE flow, localhost callback server (port 8976), token refresh, named profiles in `~/.baseflare/credentials.json`
@@ -846,19 +850,18 @@ Each environment has one `SubscriptionDO` instance (singleton per environment, a
 
 Bootstrap flow:
 ```bash
-npx @baseflare/cli init my-app
-# → prompts for framework/runtime
-# → installs @baseflare/server and @baseflare/values
-# → installs @baseflare/client for vanilla JS/TS, or @baseflare/react for React
-# → installs @baseflare/cli in devDependencies
+npx baseflare new my-app
+# → creates my-app/
+# → installs baseflare
+# → installs @baseflare/react only for the todo template
 
 cd my-app
-pnpm bf dev
+pnpm baseflare dev
 ```
 
 Login flow:
 ```bash
-bf login
+npx baseflare login
 # → Opens browser to Cloudflare OAuth consent page
 # → User authorizes
 # → ✓ Logged in as nick@example.com (Account: Traece B.V.)
@@ -867,7 +870,7 @@ bf login
 
 First deploy (prompts for project name, auto-creates environment):
 ```bash
-bf deploy --env production
+npx baseflare deploy --env production
 
 ? Project name: (my-app)
 > my-app
@@ -877,7 +880,7 @@ bf deploy --env production
 
 First deploy (auto-creates environment):
 ```bash
-bf deploy --env production
+npx baseflare deploy --env production
 # ✓ Environment 'production' not found — creating...
 # ✓ Created Worker: bf-myapp-production
 # ✓ Created D1: bf-myapp-production-db
@@ -891,13 +894,13 @@ bf deploy --env production
 
 Secrets:
 ```bash
-bf secrets set production STRIPE_KEY sk_live_xxx
+npx baseflare secrets set production STRIPE_KEY sk_live_xxx
 # ✓ Secret set on Worker bf-myapp-production
 ```
 
 Second deploy (environment exists, update only):
 ```bash
-bf deploy --env production
+npx baseflare deploy --env production
 # ✓ Bundle compiled (142kb, 12 functions)
 # ✓ Schema applied to D1 (1 index added)
 # ✓ Worker deployed
@@ -905,7 +908,7 @@ bf deploy --env production
 
 Orphaned table detection:
 ```bash
-bf deploy --env production
+npx baseflare deploy --env production
 # ✓ Worker deployed
 # ✓ Schema applied to D1
 # ⚠ Table "old_feature" orphaned (38 rows remaining) — delete via dashboard
@@ -913,14 +916,14 @@ bf deploy --env production
 
 Dashboard orphaned table management:
 ```bash
-bf dashboard
+npx baseflare dashboard
 # → Shows "old_feature" with red "Orphaned" badge, row count, "Delete table" button
 # → User clicks delete → D1 API DROP TABLE → table gone immediately
 ```
 
 Local dashboard:
 ```bash
-bf dashboard
+npx baseflare dashboard
 # ✓ Dashboard running at http://localhost:4511
 ```
 
@@ -932,7 +935,7 @@ bf dashboard
 1. `defineAuth()` function — developer defines auth config in `baseflare/auth.ts`:
    ```typescript
    // baseflare/auth.ts
-   import { defineAuth } from '@baseflare/server'
+   import { defineAuth } from 'baseflare/server'
 
    export default defineAuth({
      emailAndPassword: { enabled: true },
@@ -975,10 +978,10 @@ curl .../api/query/todos:list -H "Authorization: Bearer $TOKEN"
 
 **Goal:** Frontend apps can connect to Baseflare with full type safety, real-time subscriptions, and React hooks.
 
-**Packages:** `@baseflare/client`, `@baseflare/react`
+**Packages:** `baseflare/client`, `@baseflare/react`
 
 **Deliverables:**
-1. `@baseflare/client`:
+1. `baseflare/client`:
    - `BaseflareClient` class (URL config, auth token management)
    - `client.query()`, `client.mutation()`, `client.action()`
    - WebSocket connection manager (auto-reconnect, exponential backoff)
@@ -1208,7 +1211,7 @@ const results = await ctx.db.query('posts')
 
 ```typescript
 // baseflare/middleware.ts
-import { defineMiddleware } from '@baseflare/server'
+import { defineMiddleware } from 'baseflare/server'
 
 export const audit = defineMiddleware({
   name: 'audit',
@@ -1251,7 +1254,7 @@ export const softDelete = defineMiddleware({
 
 ```typescript
 // baseflare.config.ts
-import { defineConfig } from '@baseflare/server'
+import { defineConfig } from 'baseflare/server'
 import { audit, softDelete } from './baseflare/middleware'
 
 export default defineConfig({
@@ -1264,11 +1267,11 @@ export default defineConfig({
 
 **Goal:** Full local dashboard for inspecting and managing environments.
 
-**Package:** `@baseflare/dashboard`
+**Package:** `baseflare-dashboard`
 
 **Tech:** React + Vite + TanStack Router + shadcn/ui
 
-**Architecture:** Runs locally via `bf dashboard`. Two data sources:
+**Architecture:** Runs locally via `npx baseflare dashboard`. Two data sources:
 - Data plane screens use `@baseflare/react` with `useQuery()`/`useMutation()` to connect to the selected environment Worker (dogfooding)
 - Management screens use CF API directly (via CLI's CF client) for env settings, secrets, deploys
 
@@ -1287,11 +1290,11 @@ export default defineConfig({
 8. Logs viewer (real-time stream, filtering)
 9. Backups (D1 Time Travel — list restore points, restore)
 
-**"Done" criteria:** `bf dashboard` starts local Vite server, all screens functional against a running environment.
+**"Done" criteria:** `npx baseflare dashboard` starts local Vite server, all screens functional against a running environment.
 
 ### Phase 9: Testing Harness (future — post-v1)
 
-**Package:** `@baseflare/test`
+**Package:** `baseflare/test`
 
 Deferred to post-v1. Includes `createTestCtx()`, mock utilities, subscription tracking, and Miniflare-backed test environments. Internal integration tests will use `vitest` + `vitest-pool-workers` directly during v1 development.
 
@@ -1299,8 +1302,25 @@ Deferred to post-v1. Includes `createTestCtx()`, mock utilities, subscription tr
 
 ## 5. Package Specifications
 
+### 5.0 baseflare
 
-### 5.0 @baseflare/values
+**Purpose:** The single published core package. It exposes `baseflare/values`, `baseflare/server`, and `baseflare/client` as independent subpath exports, plus the `baseflare` CLI binary. There is no broad root API; users import the subpath that matches their runtime surface.
+
+```json
+{
+  "name": "baseflare",
+  "bin": {
+    "baseflare": "./bin/baseflare.js"
+  },
+  "exports": {
+    "./values": "./dist/values/index.js",
+    "./server": "./dist/server/index.js",
+    "./client": "./dist/client/index.js"
+  }
+}
+```
+
+### 5.0.1 baseflare/values
 
 **Purpose:** Validators, shared types, ID utilities, typed errors. The minimal shared leaf — imported by both server and client. Uses `uuidv7` (Apache-2.0, zero transitive dependencies) for UUIDv7 generation.
 
@@ -1377,9 +1397,9 @@ export function generateId(): string  // UUIDv7 string
 export function getCreatedAtFromId(id: string): Date  // extracts timestamp from UUIDv7
 ```
 
-### 5.1 @baseflare/server
+### 5.0.2 baseflare/server
 
-**Purpose:** Everything server-side — schema API, function wrappers, database, permissions, auth, HTTP actions, and CF Worker runtime. Depends on `@baseflare/values`.
+**Purpose:** Everything server-side — schema API, function wrappers, database, permissions, auth, HTTP actions, and CF Worker runtime. Depends on `baseflare/values`.
 
 ```typescript
 // Project configuration
@@ -1399,7 +1419,7 @@ export function internalQuery(def): InternalQueryDef
 export function internalMutation(def): InternalMutationDef
 export function internalAction(def): InternalActionDef
 
-// HTTP actions
+// HTTP actions (generic Phase 1/bootstrap helper; app code uses the generated helper)
 export function httpAction(handler: (ctx: ActionCtx, request: Request) => Promise<Response>): HttpAction
 export function httpRouter(): HttpRouter
 
@@ -1539,7 +1559,7 @@ export class SubscriptionDO implements DurableObject { ... }
 }
 ```
 
-### 5.2 @baseflare/client
+### 5.0.3 baseflare/client
 
 **Purpose:** Browser/Node SDK. Connects to a Baseflare environment Worker via HTTP + WebSocket.
 
@@ -1565,7 +1585,7 @@ export class BaseflareClient {
 
 **Internal:** WebSocket connection manager with auto-reconnect and exponential backoff. Subscription state tracked client-side. Auth token stored and sent with every request.
 
-### 5.3 @baseflare/react
+### 5.1 @baseflare/react
 
 **Purpose:** React hooks wrapping the client SDK.
 
@@ -1610,7 +1630,7 @@ export function useAuth(): {
 - `useQueries` batches multiple query subscriptions into one hook call. Useful for dashboards with many data sources.
 - `preloadQuery` / `usePreloadedQuery` enables SSR — preload data server-side, hydrate on client without loading flash.
 
-### 5.4 @baseflare/test (future — post-v1)
+### 5.4 baseflare/test (future — post-v1)
 
 Deferred. Will provide `createTestCtx()`, mock utilities, and subscription tracking for developer-facing testing. See Phase 9.
 
@@ -1752,7 +1772,7 @@ These tests span multiple packages and define end-to-end correctness. They must 
 11. Dashboard shows "Orphaned" badge with row count, "Delete table" button works
 
 ### 7.5 Deploy Pipeline
-1. Run `bf deploy --env staging` (first time)
+1. Run `npx baseflare deploy --env staging` (first time)
 2. Verify CF resources created (Worker, D1, R2, DO namespaces)
 3. Call todos.create via HTTP — works
 4. Deploy updated code with new "archive" function
@@ -1874,7 +1894,7 @@ These tests span multiple packages and define end-to-end correctness. They must 
 - Prefer `interface` over `type` for object shapes
 - Prefer `const` over `let`
 - No classes unless state management requires it (prefer functions)
-- Error handling: throw typed errors from `@baseflare/values`
+- Error handling: throw typed errors from `baseflare/values`
 
 ### 8.3 Import Order
 
@@ -1882,8 +1902,8 @@ These tests span multiple packages and define end-to-end correctness. They must 
 // 1. External packages
 import { betterAuth } from 'better-auth'
 
-// 2. Internal packages (@baseflare/*)
-import { ErrorCode } from '@baseflare/values'
+// 2. Internal package subpaths
+import { ErrorCode } from 'baseflare/values'
 
 // 3. Relative imports
 import { createQueryBuilder } from './query-builder'
@@ -1891,10 +1911,10 @@ import { createQueryBuilder } from './query-builder'
 
 ### 8.4 Error Handling
 
-All user-facing errors use the `BaseflareError<T>` class from `@baseflare/values`:
+All user-facing errors use the `BaseflareError<T>` class from `baseflare/values`:
 
 ```typescript
-import { BaseflareError } from '@baseflare/values'
+import { BaseflareError } from 'baseflare/values'
 
 // Developer throws typed errors in functions:
 throw new BaseflareError({ code: 'OUT_OF_STOCK', remaining: 0 })
@@ -1917,8 +1937,8 @@ Internal system errors (permission denied, validation, schema errors) use `Error
 - Tests are co-located: `src/db/query-builder.ts` → `src/db/query-builder.test.ts`
 - Use `describe`/`it` blocks with clear names
 - No mocking unless testing external boundaries (HTTP, CF bindings)
-- Unit tests (`@baseflare/server` pure logic): plain `vitest`, no Miniflare
-- Integration tests (`@baseflare/server` runtime): `vitest-pool-workers` (runs tests inside Workers runtime with Miniflare)
+- Unit tests (`baseflare/server` pure logic): plain `vitest`, no Miniflare
+- Integration tests (`baseflare/server` runtime): `vitest-pool-workers` (runs tests inside Workers runtime with Miniflare)
 - E2E tests: full CLI → Miniflare flow
 - Integration tests go in `tests/integration/` at the package root
 
@@ -1962,11 +1982,14 @@ Internal system errors (permission denied, validation, schema errors) use `Error
 | Deploy | CF Workers API | No wrangler CLI dependency |
 | Backups | D1 Time Travel | Built-in, 30-day retention |
 | One Worker per env | Yes | True isolation, independent scaling |
-| Dashboard | Local only (`bf dashboard`) | No hosted management infrastructure |
+| Dashboard | Local only (`npx baseflare dashboard`) | No hosted management infrastructure |
 | License | MIT | Maximally permissive, encourages adoption |
 | Data model | Document (JSON `_data` column) | Field changes are no-ops, same model as Convex-style document databases |
 | Query API | `.filter()` only, no `.withIndex()` | SQLite query planner selects indexes automatically |
 | Schema diffing | Tables + indexes only, orphaned tables kept read-only until deleted via dashboard | No data loss on deploy, fields naturally clean up on rewrite |
 | ID format | Plain UUIDv7 strings | Time-sortable, universally parseable, no custom encoding, `get('table', id)` |
 | File naming | kebab-case | Consistent, ecosystem standard |
-| Package split | `values` (shared leaf) + `server` (all server-side) + `client` + `react` + `test` + CLI | Matches Convex-style patterns, clean dependency graph |
+| Core package | Single `baseflare` package with `./values`, `./server`, `./client`, and CLI subpaths | Eliminates version skew between core APIs while keeping imports tree-shakeable |
+| Framework adapters | Separate packages such as `@baseflare/react` | Framework adapters carry mutually exclusive peer dependencies and should version independently |
+| CLI command | One binary: `baseflare` | Simple install story through `npx baseflare` or package scripts; no short alias |
+| Scaffolding | Future `baseflare new` command | Fresh projects get a new directory, existing projects use lazy prompts in `dev`/`deploy` |
