@@ -170,8 +170,13 @@ function compileNullEquality(
   }
 
   const jsonType = fieldTypeExpression(fieldName);
+  const nullCheck =
+    operator === "eq"
+      ? `${jsonType} IS NULL OR ${jsonType} IS 'null'`
+      : `${jsonType} IS NOT NULL AND ${jsonType} IS NOT 'null'`;
+
   return {
-    sql: `${jsonType} IS ${operator === "eq" ? "" : "NOT "}'null'`,
+    sql: `(${nullCheck})`,
     params: [],
   };
 }

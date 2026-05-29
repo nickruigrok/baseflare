@@ -57,7 +57,7 @@ describe("createQueryBuilder", () => {
     });
   });
 
-  it("uses Convex-like null and missing semantics", () => {
+  it("treats null filters as nullish for optional fields", () => {
     const explicitNull = createQueryBuilder("todos").filter({
       deletedAt: null,
     }) as ReturnType<typeof createQueryBuilder>;
@@ -72,11 +72,11 @@ describe("createQueryBuilder", () => {
     }) as ReturnType<typeof createQueryBuilder>;
 
     expect(explicitNull.toSQL()).toEqual({
-      sql: "SELECT _id, _data FROM todos WHERE json_type(_data, '$.deletedAt') IS 'null' ORDER BY _id ASC",
+      sql: "SELECT _id, _data FROM todos WHERE (json_type(_data, '$.deletedAt') IS NULL OR json_type(_data, '$.deletedAt') IS 'null') ORDER BY _id ASC",
       params: [],
     });
     expect(notNull.toSQL()).toEqual({
-      sql: "SELECT _id, _data FROM todos WHERE json_type(_data, '$.deletedAt') IS NOT 'null' ORDER BY _id ASC",
+      sql: "SELECT _id, _data FROM todos WHERE (json_type(_data, '$.deletedAt') IS NOT NULL AND json_type(_data, '$.deletedAt') IS NOT 'null') ORDER BY _id ASC",
       params: [],
     });
     expect(notDone.toSQL()).toEqual({
@@ -84,7 +84,7 @@ describe("createQueryBuilder", () => {
       params: [1],
     });
     expect(inWithNull.toSQL()).toEqual({
-      sql: "SELECT _id, _data FROM todos WHERE (json_type(_data, '$.status') IS 'null' OR json_extract(_data, '$.status') IN (?)) ORDER BY _id ASC",
+      sql: "SELECT _id, _data FROM todos WHERE ((json_type(_data, '$.status') IS NULL OR json_type(_data, '$.status') IS 'null') OR json_extract(_data, '$.status') IN (?)) ORDER BY _id ASC",
       params: ["active"],
     });
   });

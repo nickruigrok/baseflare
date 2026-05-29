@@ -19,6 +19,15 @@ mutation/action that pages through the table and `patch`es each document. A
 dedicated migrations primitive may come later; for now the patch-on-rewrite
 pattern covers the common cases.
 
+## Query filter semantics
+
+Object filters treat `null` as the JSON-safe nullish query value for document
+fields. `{ field: null }` and `{ field: { eq: null } }` match explicit JSON
+`null` and absent optional fields. `{ field: { neq: null } }` matches only
+present non-null values, while `{ field: { in: [null, ...] } }` includes
+explicit `null` and absent fields. Do not use `undefined` in filters; it is not
+JSON/RPC-safe.
+
 ## Query ordering semantics
 
 `.order(field, direction)` sorts by `json_extract(_data, '$.field')` with `_id`

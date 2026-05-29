@@ -152,6 +152,8 @@ export const list = query({
 - AND callback for active adult users → `{ AND: [{ status: "active" }, { age: { gt: 18 } }] }`
 - NOT callback for archived rows → `{ NOT: { archived: true } }`
 
+**⚠ BEHAVIOR CHANGE — Missing fields:** Convex treats missing fields as `undefined` in filters. Baseflare does not use `undefined` in object filters because it is lossy over JSON/RPC/codegen. Instead, Baseflare uses `null` as the portable nullish filter value: `{ field: null }` and `{ field: { eq: null } }` match explicit JSON `null` and absent optional fields. Do not use `undefined` in filters.
+
 **Action:** Rewrite all filter predicates from Convex callbacks to Baseflare object filters.
 
 **System field names:**
