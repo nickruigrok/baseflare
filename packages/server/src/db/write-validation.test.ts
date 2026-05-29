@@ -56,7 +56,7 @@ describe("write validation", () => {
       todos,
       {
         _id: generateId(),
-        _createdAt: new Date(),
+        _createdAt: Date.now(),
         text: "draft",
         completed: true,
         assignee,
@@ -72,5 +72,41 @@ describe("write validation", () => {
       text: "published",
       completed: true,
     });
+  });
+
+  it("patches unrelated fields on documents missing a newly-required field", () => {
+    const todos = defineTable({
+      text: v.string(),
+      priority: v.string(),
+    });
+
+    // `priority` was added later; this old document predates it.
+    const patched = validatePatchData(
+      todos,
+      { _id: generateId(), _createdAt: Date.now(), text: "old" },
+      { text: "updated" }
+    );
+
+    expect(patched).toEqual({ text: "updated" });
+  });
+
+  it("rejects patch fields not in the schema", () => {
+    const todos = defineTable({ text: v.string() });
+
+    expect(() =>
+      validatePatchData(
+        todos,
+        { _id: generateId(), _createdAt: Date.now(), text: "old" },
+        { nope: 1 }
+      )
+    ).toThrow(/not allowed by the schema/);
+
+    expect(() =>
+      validatePatchData(
+        todos,
+        { _id: generateId(), _createdAt: Date.now(), text: "old" },
+        { nope: undefined }
+      )
+    ).toThrow(/not allowed by the schema/);
   });
 });

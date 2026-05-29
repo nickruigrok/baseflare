@@ -1,8 +1,14 @@
-const BYTE_ARRAY_MARKER = "__baseflare_bytes";
+const BYTES_MARKER = "$bytes";
+const RESERVED_DOCUMENT_FIELDS = new Set(["_id", "_createdAt"]);
+
+/** User keys starting with `$` are escaped (doubled) to avoid colliding with reserved markers. */
+function escapeKey(key: string): string {
+  return key.startsWith("$") ? `$${key}` : key;
+}
 
 function toStorageValue(value: unknown): unknown {
   if (value instanceof Uint8Array) {
-    return { [BYTE_ARRAY_MARKER]: Buffer.from(value).toString("base64") };
+    return { [BYTES_MARKER]: Buffer.from(value).toString("base64") };
   }
 
   if (Array.isArray(value)) {
@@ -11,7 +17,10 @@ function toStorageValue(value: unknown): unknown {
 
   if (typeof value === "object" && value !== null) {
     return Object.fromEntries(
-      Object.entries(value).map(([key, entry]) => [key, toStorageValue(entry)])
+      Object.entries(value).map(([key, entry]) => [
+        escapeKey(key),
+        toStorageValue(entry),
+      ])
     );
   }
 
@@ -22,11 +31,11 @@ export function serialize(doc: Record<string, unknown>): { _data: string } {
   const payload: Record<string, unknown> = {};
 
   for (const [key, value] of Object.entries(doc)) {
-    if (key === "_id" || key === "_createdAt") {
+    if (RESERVED_DOCUMENT_FIELDS.has(key)) {
       continue;
     }
 
-    payload[key] = toStorageValue(value);
+    payload[escapeKey(key)] = toStorageValue(value);
   }
 
   return { _data: JSON.stringify(payload) };

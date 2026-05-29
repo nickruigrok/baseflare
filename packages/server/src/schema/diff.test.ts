@@ -26,7 +26,7 @@ describe("diff", () => {
     const schemaDiff = diff(current, target);
 
     expect(Object.keys(schemaDiff.addedTables)).toEqual(["users"]);
-    expect(schemaDiff.removedTables).toEqual([]);
+    expect(schemaDiff.orphanedTables).toEqual([]);
     expect(schemaDiff.addedIndexes).toEqual([
       {
         tableName: "todos",
@@ -35,6 +35,60 @@ describe("diff", () => {
     ]);
     expect(schemaDiff.removedIndexes).toEqual([
       { tableName: "todos", index: { name: "by_text", fields: ["text"] } },
+    ]);
+  });
+
+  it("reports orphaned tables but never emits DROP TABLE", () => {
+    const current = defineSchema({
+      todos: defineTable({ text: v.string() }).index("by_text", ["text"]),
+      legacy: defineTable({ value: v.string() }).index("by_value", ["value"]),
+    });
+
+    const target = defineSchema({
+      todos: defineTable({ text: v.string() }).index("by_text", ["text"]),
+    });
+
+    const schemaDiff = diff(current, target);
+
+    expect(schemaDiff.orphanedTables).toEqual(["legacy"]);
+    expect(schemaDiff.removedIndexes).toEqual([
+      { tableName: "legacy", index: { name: "by_value", fields: ["value"] } },
+    ]);
+    expect(schemaDiff.hasChanges).toBe(true);
+    expect(schemaDiff.toStatements()).toEqual([
+      "DROP INDEX IF EXISTS legacy_by_value",
+    ]);
+  });
+
+  it("recreates an index when its fields change", () => {
+    const current = defineSchema({
+      todos: defineTable({
+        orgId: v.string(),
+        status: v.string(),
+      }).index("by_org", ["orgId"]),
+    });
+
+    const target = defineSchema({
+      todos: defineTable({
+        orgId: v.string(),
+        status: v.string(),
+      }).index("by_org", ["orgId", "status"]),
+    });
+
+    const schemaDiff = diff(current, target);
+
+    expect(schemaDiff.removedIndexes).toEqual([
+      { tableName: "todos", index: { name: "by_org", fields: ["orgId"] } },
+    ]);
+    expect(schemaDiff.addedIndexes).toEqual([
+      {
+        tableName: "todos",
+        index: { name: "by_org", fields: ["orgId", "status"] },
+      },
+    ]);
+    expect(schemaDiff.toStatements()).toEqual([
+      "DROP INDEX IF EXISTS todos_by_org",
+      "CREATE INDEX todos_by_org ON todos (json_extract(_data, '$.orgId'), json_extract(_data, '$.status'))",
     ]);
   });
 });

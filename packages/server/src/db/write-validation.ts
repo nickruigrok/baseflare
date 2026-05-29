@@ -1,4 +1,4 @@
-import { v } from "@baseflare/values";
+import { ValidationError, v } from "@baseflare/values";
 
 import type { TableDefinition } from "../schema/types";
 
@@ -12,7 +12,7 @@ function assertPlainObject(
   label: string
 ): asserts value is Record<string, unknown> {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    throw new Error(`${label} must be an object`);
+    throw new ValidationError(label, `${label} must be an object`);
   }
 }
 
@@ -22,7 +22,10 @@ function assertNoReservedFields(
 ): void {
   for (const key of Object.keys(value)) {
     if (RESERVED_DOCUMENT_FIELDS.has(key)) {
-      throw new Error(`${label} cannot include reserved field "${key}"`);
+      throw new ValidationError(
+        key,
+        `${label} cannot include reserved field "${key}"`
+      );
     }
   }
 }
@@ -70,6 +73,13 @@ export function validateReplaceData(
   ) as DocumentData;
 }
 
+/**
+ * Applies a shallow patch, validating ONLY the changed fields against their
+ * individual validators. Untouched fields are preserved as-is and never
+ * re-validated, so a document missing a newly-required field can still be
+ * patched on unrelated fields (schema evolution). Fields not in the current
+ * schema are stripped on rewrite; defaults are not applied on patch.
+ */
 export function validatePatchData(
   table: TableDefinition,
   current: DocumentData,
@@ -82,16 +92,21 @@ export function validatePatchData(
   const next = pickSchemaFields(table, current);
 
   for (const [key, value] of Object.entries(patch)) {
+    const fieldValidator = table.fields[key];
+    if (!fieldValidator) {
+      throw new ValidationError(
+        `document.${key}`,
+        `document.${key} is not allowed by the schema`
+      );
+    }
+
     if (value === undefined) {
       delete next[key];
       continue;
     }
 
-    next[key] = value;
+    next[key] = fieldValidator.validate(value, `document.${key}`);
   }
 
-  return createDocumentValidator(table).validate(
-    next,
-    "document"
-  ) as DocumentData;
+  return next;
 }

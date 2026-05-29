@@ -1,8 +1,10 @@
+import type { Id } from "@baseflare/values";
 import { v } from "@baseflare/values";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { defineSchema } from "./define-schema";
 import { defineTable } from "./define-table";
+import type { DataModelFromSchema, Doc } from "./types";
 
 const RESERVED_TABLE_NAME_ERROR_PATTERN = /cannot start with "_"/;
 
@@ -33,5 +35,46 @@ describe("defineSchema", () => {
         _todos: defineTable({ text: v.string() }),
       })
     ).toThrow(RESERVED_TABLE_NAME_ERROR_PATTERN);
+
+    for (const name of ["AND", "OR", "NOT"]) {
+      expect(() => defineTable({ [name]: v.boolean() })).toThrow(
+        /reserved for query filter logic/
+      );
+    }
+
+    expect(() =>
+      defineTable({
+        and: v.boolean(),
+        or: v.boolean(),
+        not: v.boolean(),
+      })
+    ).not.toThrow();
+  });
+
+  it("derives document types from the schema without codegen", () => {
+    const schema = defineSchema({
+      todos: defineTable({
+        text: v.string(),
+        completed: v.boolean().default(false),
+        assignee: v.optional(v.id("users")),
+      }).index("by_completed", ["completed"]),
+    });
+
+    type Schema = typeof schema;
+    type TodoDoc = Doc<Schema, "todos">;
+    type SchemaTableHasIndexBuilder =
+      "index" extends keyof (typeof schema)["tables"]["todos"] ? true : false;
+
+    expectTypeOf<TodoDoc["_id"]>().toEqualTypeOf<Id<"todos">>();
+    expectTypeOf<TodoDoc["_createdAt"]>().toEqualTypeOf<number>();
+    expectTypeOf<TodoDoc["text"]>().toEqualTypeOf<string>();
+    expectTypeOf<TodoDoc["completed"]>().toEqualTypeOf<boolean>();
+    expectTypeOf<TodoDoc["assignee"]>().toEqualTypeOf<
+      Id<"users"> | undefined
+    >();
+
+    type Model = DataModelFromSchema<Schema>;
+    expectTypeOf<Model["todos"]>().toEqualTypeOf<TodoDoc>();
+    expectTypeOf<SchemaTableHasIndexBuilder>().toEqualTypeOf<false>();
   });
 });

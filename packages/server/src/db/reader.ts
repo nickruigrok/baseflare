@@ -1,14 +1,17 @@
 import type { PaginationOptions, PaginationResult } from "@baseflare/values";
 
-import type { FilterPredicate } from "./filters";
+import type { FilterObject } from "./filters";
+
+export type QueryOrderDirection = "asc" | "desc";
 
 export interface QueryBuilder<TDocument = Record<string, unknown>> {
   collect(): Promise<TDocument[]>;
   count(): Promise<number>;
-  filter(predicate: FilterPredicate): QueryBuilder<TDocument>;
+  filter(filter: FilterObject): QueryBuilder<TDocument>;
   first(): Promise<TDocument | null>;
   limit(limit: number): QueryBuilder<TDocument>;
-  order(direction: "asc" | "desc"): QueryBuilder<TDocument>;
+  order(direction: QueryOrderDirection): QueryBuilder<TDocument>;
+  order(field: string, direction: QueryOrderDirection): QueryBuilder<TDocument>;
   paginate(options: PaginationOptions): Promise<PaginationResult<TDocument>>;
   take(count: number): Promise<TDocument[]>;
   unique(): Promise<TDocument>;

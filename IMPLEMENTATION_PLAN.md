@@ -525,7 +525,7 @@ baseflare/
 ### 3.2 Build Order
 
 ```
-Level 0: @baseflare/values          (zero dependencies — shared leaf)
+Level 0: @baseflare/values          (minimal shared leaf; one tiny zero-transitive runtime dependency for UUIDv7 generation)
 Level 1: @baseflare/server          (depends on values)
          @baseflare/client          (depends on values)
 Level 2: @baseflare/react           (depends on client)
@@ -619,7 +619,7 @@ const post2 = await ctx.db.insert('posts', { authorId: postId }) // ✗ TypeScri
 
 **Deliverables:**
 1. `@baseflare/values`:
-   - Full validator suite: `v.string()`, `v.number()`, `v.float64()`, `v.int64()`, `v.boolean()`, `v.bytes()`, `v.null()`, `v.id()`, `v.array()`, `v.object()`, `v.record()`, `v.union()`, `v.literal()`, `v.enum()`, `v.vector()`, `v.any()`, `v.optional()`
+   - Full validator suite: `v.string()`, `v.number()`, `v.boolean()`, `v.bytes()`, `v.null()`, `v.id()`, `v.array()`, `v.object()`, `v.record()`, `v.union()`, `v.literal()`, `v.enum()`, `v.vector()`, `v.any()`, `v.optional()`
    - Validator chains: `.min()`, `.max()`, `.default()`, `.optional()`, `.searchable()`
    - Return value validators (same validators, used in function definitions to validate output)
    - `BaseflareError<T>` — typed application errors with structured data payload
@@ -658,11 +658,11 @@ const sql = schema.toCreateStatements()
 
 // Query builder produces json_extract() SQL
 const { sql, params } = createQueryBuilder('todos')
-  .filter({ completed: false })
+  .filter({ completed: false, status: { in: ['active', 'pending'] } })
   .order('desc')
   .limit(10)
   .toSQL()
-// → { sql: 'SELECT _id, _data FROM todos WHERE json_extract(_data, \'$.completed\') = ? ORDER BY _id DESC LIMIT ?', params: [0, 10] }
+// → { sql: 'SELECT _id, _data FROM todos WHERE (...) ORDER BY _id DESC LIMIT ?', params: [0, 'active', 'pending', 10] }
 
 // .unique() throws if 0 or 2+ results
 // .take(5) returns first 5 results
@@ -1302,7 +1302,7 @@ Deferred to post-v1. Includes `createTestCtx()`, mock utilities, subscription tr
 
 ### 5.0 @baseflare/values
 
-**Purpose:** Validators, shared types, ID utilities, typed errors. The shared leaf — imported by both server and client. Zero dependencies.
+**Purpose:** Validators, shared types, ID utilities, typed errors. The minimal shared leaf — imported by both server and client. Uses `uuidv7` (Apache-2.0, zero transitive dependencies) for UUIDv7 generation.
 
 ```typescript
 // Validators (Convex-compatible API)
@@ -1310,8 +1310,6 @@ export const v: {
   // Primitives
   string(): StringValidator;      // .min(), .max(), .default(), .optional(), .searchable()
   number(): NumberValidator;      // .min(), .max(), .default(), .optional()
-  float64(): Float64Validator;    // explicit 64-bit float
-  int64(): Int64Validator;        // explicit 64-bit integer
   boolean(): BooleanValidator;    // .default(), .optional()
   bytes(): BytesValidator;        // Uint8Array, .optional()
   null(): NullValidator;          // null literal
@@ -1469,8 +1467,9 @@ export function createQueryBuilder(table: string): QueryBuilder
 
 // QueryBuilder
 interface QueryBuilder {
-  filter(predicate: FilterPredicate): QueryBuilder;
+  filter(filter: FilterObject): QueryBuilder;
   order(direction: 'asc' | 'desc'): QueryBuilder;
+  order(field: string, direction: 'asc' | 'desc'): QueryBuilder;
   limit(n: number): QueryBuilder;
   collect(): Promise<Doc[]>;
   first(): Promise<Doc | null>;

@@ -81,7 +81,11 @@ importers:
         specifier: workspace:*
         version: link:../values
 
-  packages/values: {}
+  packages/values:
+    dependencies:
+      uuidv7:
+        specifier: ^1.2.1
+        version: 1.2.1
 
 packages:
 
@@ -1565,6 +1569,10 @@ packages:
   universalify@0.1.2:
     resolution: {integrity: sha512-rBJeI5CXAlmy1pV+617WB9J63U6XcazHHF2f2dbJix4XzpUF0RS3Zbj0FGIOCAva5P/d/GBOYaACQ1w+0azUkg==}
     engines: {node: '>= 4.0.0'}
+
+  uuidv7@1.2.1:
+    resolution: {integrity: sha512-4kPkK3/XTQW9Hbm4CaqfICn+kY9LJtDVEOfgsRRra/+n2Ofg4NqzRFceAkxvQ/Ud/6BpHOPzj8cirqM7TzTN5Q==}
+    hasBin: true
 
   vite-node@3.2.4:
     resolution: {integrity: sha512-EbKSKh+bh1E1IFxeO0pg1n4dvoOTt0UDiXMd/qn++r98+jPO1xtJilvXldeuQ8giIB5IkpjCgMleHMNEsGH6pg==}
@@ -3058,6 +3066,8 @@ snapshots:
   undici-types@6.21.0: {}
 
   universalify@0.1.2: {}
+
+  uuidv7@1.2.1: {}
 
   vite-node@3.2.4(@types/node@22.19.17)(jiti@2.6.1)(yaml@2.8.3):
     dependencies:

@@ -1,20 +1,188 @@
+import { minIdForMs } from "@baseflare/values";
 import { describe, expect, it } from "vitest";
 
+import { decodeCursor } from "./cursor";
 import { createQueryBuilder } from "./query-builder";
 
 const UNIQUE_DOCUMENT_ERROR_PATTERN = /Expected exactly one document/;
 
 describe("createQueryBuilder", () => {
-  it("produces json_extract SQL for equality filters", () => {
+  it("compiles equality shorthand filters", () => {
     const query = createQueryBuilder("todos")
-      .filter({ completed: false })
+      .filter({ completed: false, status: "active" })
       .order("desc")
       .limit(10) as ReturnType<typeof createQueryBuilder>;
 
     expect(query.toSQL()).toEqual({
-      sql: "SELECT _id, _data FROM todos WHERE json_extract(_data, '$.completed') = ? ORDER BY _id DESC LIMIT ?",
-      params: [0, 10],
+      sql: "SELECT _id, _data FROM todos WHERE (json_extract(_data, '$.completed') IS ? AND json_extract(_data, '$.status') IS ?) ORDER BY _id DESC LIMIT ?",
+      params: [0, "active", 10],
     });
+  });
+
+  it("compiles field operators", () => {
+    const query = createQueryBuilder("users").filter({
+      age: { gt: 18, lte: 65 },
+      status: { in: ["active", "pending"] },
+    }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM users WHERE ((COALESCE(json_extract(_data, '$.age') > ?, 0) AND COALESCE(json_extract(_data, '$.age') <= ?, 0)) AND json_extract(_data, '$.status') IN (?, ?)) ORDER BY _id ASC",
+      params: [18, 65, "active", "pending"],
+    });
+  });
+
+  it("compiles logical filters", () => {
+    const query = createQueryBuilder("users").filter({
+      AND: [
+        { status: "active" },
+        { OR: [{ age: { gt: 18 } }, { verified: true }] },
+      ],
+      NOT: { archived: true },
+    }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM users WHERE ((json_extract(_data, '$.status') IS ? AND (COALESCE(json_extract(_data, '$.age') > ?, 0) OR json_extract(_data, '$.verified') IS ?)) AND (NOT (json_extract(_data, '$.archived') IS ?))) ORDER BY _id ASC",
+      params: ["active", 18, 1, 1],
+    });
+  });
+
+  it("ANDs multiple filter calls together", () => {
+    const query = createQueryBuilder("todos")
+      .filter({ a: 1 })
+      .filter({ b: 2 }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM todos WHERE (json_extract(_data, '$.a') IS ? AND json_extract(_data, '$.b') IS ?) ORDER BY _id ASC",
+      params: [1, 2],
+    });
+  });
+
+  it("uses Convex-like null and missing semantics", () => {
+    const explicitNull = createQueryBuilder("todos").filter({
+      deletedAt: null,
+    }) as ReturnType<typeof createQueryBuilder>;
+    const notNull = createQueryBuilder("todos").filter({
+      deletedAt: { neq: null },
+    }) as ReturnType<typeof createQueryBuilder>;
+    const notDone = createQueryBuilder("todos").filter({
+      completed: { neq: true },
+    }) as ReturnType<typeof createQueryBuilder>;
+    const inWithNull = createQueryBuilder("todos").filter({
+      status: { in: [null, "active"] },
+    }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(explicitNull.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM todos WHERE json_type(_data, '$.deletedAt') IS 'null' ORDER BY _id ASC",
+      params: [],
+    });
+    expect(notNull.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM todos WHERE json_type(_data, '$.deletedAt') IS NOT 'null' ORDER BY _id ASC",
+      params: [],
+    });
+    expect(notDone.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM todos WHERE json_extract(_data, '$.completed') IS NOT ? ORDER BY _id ASC",
+      params: [1],
+    });
+    expect(inWithNull.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM todos WHERE (json_type(_data, '$.status') IS 'null' OR json_extract(_data, '$.status') IN (?)) ORDER BY _id ASC",
+      params: ["active"],
+    });
+  });
+
+  it("orders by a json field with a stable _id tiebreak", () => {
+    const query = createQueryBuilder("todos").order(
+      "priority",
+      "desc"
+    ) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL().sql).toBe(
+      "SELECT _id, _data FROM todos ORDER BY json_extract(_data, '$.priority') DESC, _id DESC"
+    );
+  });
+
+  it("collapses _createdAt ordering to _id", () => {
+    const query = createQueryBuilder("todos").order(
+      "_createdAt",
+      "asc"
+    ) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL().sql).toBe(
+      "SELECT _id, _data FROM todos ORDER BY _id ASC"
+    );
+  });
+
+  it("filters _id directly", () => {
+    const query = createQueryBuilder("todos").filter({
+      _id: { in: ["id-1", "id-2"] },
+    }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM todos WHERE _id IN (?, ?) ORDER BY _id ASC",
+      params: ["id-1", "id-2"],
+    });
+  });
+
+  it("translates _createdAt range filters to _id boundaries", () => {
+    const query = createQueryBuilder("todos").filter({
+      _createdAt: { gte: 1000 },
+    }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL()).toEqual({
+      sql: "SELECT _id, _data FROM todos WHERE _id >= ? ORDER BY _id ASC",
+      params: [minIdForMs(1000)],
+    });
+  });
+
+  it("rejects unsupported _createdAt operators", () => {
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({ _createdAt: 5 }) as ReturnType<
+          typeof createQueryBuilder
+        >
+      ).toSQL()
+    ).toThrow(/does not support equality/);
+
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({
+          _createdAt: { in: [5] },
+        }) as ReturnType<typeof createQueryBuilder>
+      ).toSQL()
+    ).toThrow(/does not support in/);
+  });
+
+  it("rejects invalid filter shapes", () => {
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({
+          status: { contains: "active" },
+        } as never) as ReturnType<typeof createQueryBuilder>
+      ).toSQL()
+    ).toThrow(/not a supported filter operator/);
+
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({
+          status: { in: [] },
+        }) as ReturnType<typeof createQueryBuilder>
+      ).toSQL()
+    ).toThrow(/must not be empty/);
+
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({ OR: [] }) as ReturnType<
+          typeof createQueryBuilder
+        >
+      ).toSQL()
+    ).toThrow(/non-empty array/);
+
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({ "bad name": 1 }) as ReturnType<
+          typeof createQueryBuilder
+        >
+      ).toSQL()
+    ).toThrow(/must be "_id"/);
   });
 
   it("supports unique, count, and pagination against an executor", async () => {
@@ -36,18 +204,31 @@ describe("createQueryBuilder", () => {
       },
     });
 
-    const secondDocument = documents[1];
-    expect(secondDocument).toBeDefined();
-
     await expect(query.unique()).rejects.toThrow(UNIQUE_DOCUMENT_ERROR_PATTERN);
     await expect(query.count()).resolves.toBe(3);
     await expect(query.take(2)).resolves.toHaveLength(2);
-    await expect(
-      query.paginate({ numItems: 2, cursor: null })
-    ).resolves.toEqual({
-      page: documents.slice(0, 2),
-      isDone: false,
-      continueCursor: secondDocument?._id,
+
+    const firstPage = await query.paginate({ numItems: 2, cursor: null });
+    expect(firstPage.page).toEqual(documents.slice(0, 2));
+    expect(firstPage.isDone).toBe(false);
+
+    const decoded = decodeCursor(firstPage.continueCursor, {
+      field: "_id",
+      direction: "asc",
     });
+    expect(decoded.id).toBe(documents[1]?._id);
+  });
+
+  it("echoes the incoming cursor and marks done on an empty final page", async () => {
+    const query = createQueryBuilder("todos", {
+      collect() {
+        return Promise.resolve([]);
+      },
+    });
+
+    const result = await query.paginate({ numItems: 2, cursor: null });
+    expect(result.page).toEqual([]);
+    expect(result.isDone).toBe(true);
+    expect(result.continueCursor).toBe("");
   });
 });

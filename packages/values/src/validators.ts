@@ -1,3 +1,4 @@
+import { ValidationError } from "./errors";
 import type {
   AnyValidator,
   Id,
@@ -8,16 +9,16 @@ import type {
   ValidatorKind,
   ValidatorShape,
 } from "./types";
-import { getCreatedAtFromId, isUuidV7 } from "./uuid";
+import { getCreatedMsFromId, isUuidV7 } from "./uuid";
 
-type MinMaxSupportedKind =
-  | "string"
-  | "number"
-  | "float64"
-  | "int64"
-  | "array"
-  | "bytes"
-  | "vector";
+type MinMaxSupportedKind = "string" | "number" | "array" | "bytes" | "vector";
+
+const LENGTH_BOUNDED_KINDS = new Set<ValidatorKind>([
+  "string",
+  "array",
+  "bytes",
+  "vector",
+]);
 
 type FullValidatorDefinition<
   TKind extends ValidatorKind,
@@ -58,9 +59,15 @@ export interface Validator<
   TOptional extends boolean = false,
   THasDefault extends boolean = false,
 > {
-  default<TDefault extends Exclude<TOutput, undefined>>(
-    defaultValue: TDefault
-  ): Validator<TInput | undefined, TDefault, TKind, false, true>;
+  default(
+    defaultValue: Exclude<TOutput, undefined>
+  ): Validator<
+    TInput | undefined,
+    Exclude<TOutput, undefined>,
+    TKind,
+    false,
+    true
+  >;
   readonly definition: FullValidatorDefinition<TKind, TOptional, THasDefault>;
   max(limit: number): Validator<TInput, TOutput, TKind, TOptional, THasDefault>;
   min(limit: number): Validator<TInput, TOutput, TKind, TOptional, THasDefault>;
@@ -83,13 +90,25 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function createValidationError(path: string, message: string): Error {
-  return new Error(`${formatPath(path)} ${message}`);
+function createValidationError(path: string, message: string): ValidationError {
+  return new ValidationError(path, `${formatPath(path)} ${message}`);
+}
+
+function boundMessage(
+  definition: ValidatorDefinition,
+  kind: "min" | "max",
+  limit: number
+): string {
+  const comparator = kind === "min" ? "at least" : "at most";
+  if (LENGTH_BOUNDED_KINDS.has(definition.kind)) {
+    return `must have length ${comparator} ${limit}`;
+  }
+  return `must be ${comparator} ${limit}`;
 }
 
 function withConstraint<TOutput>(
   validator: (value: unknown, path: string) => TOutput,
-  _definition: ValidatorDefinition,
+  definition: ValidatorDefinition,
   kind: "min" | "max",
   limit: number
 ): (value: unknown, path: string) => TOutput {
@@ -110,11 +129,11 @@ function withConstraint<TOutput>(
     }
 
     if (kind === "min" && size < limit) {
-      throw createValidationError(path, `must be at least ${limit}`);
+      throw createValidationError(path, boundMessage(definition, kind, limit));
     }
 
     if (kind === "max" && size > limit) {
-      throw createValidationError(path, `must be at most ${limit}`);
+      throw createValidationError(path, boundMessage(definition, kind, limit));
     }
 
     return result;
@@ -125,8 +144,6 @@ function assertSupportsMinMax(definition: ValidatorDefinition): void {
   const supportedKinds: MinMaxSupportedKind[] = [
     "string",
     "number",
-    "float64",
-    "int64",
     "array",
     "bytes",
     "vector",
@@ -179,9 +196,7 @@ function createValidatorApi<
         THasDefault
       >;
     },
-    default<TDefault extends Exclude<TOutput, undefined>>(
-      defaultValue: TDefault
-    ) {
+    default(defaultValue: Exclude<TOutput, undefined>) {
       return createValidatorApi(
         {
           ...api.definition,
@@ -193,9 +208,15 @@ function createValidatorApi<
             return defaultValue;
           }
 
-          return api.validate(value, path) as unknown as TDefault;
+          return api.validate(value, path) as Exclude<TOutput, undefined>;
         }
-      ) as Validator<TInput | undefined, TDefault, TKind, false, true>;
+      ) as Validator<
+        TInput | undefined,
+        Exclude<TOutput, undefined>,
+        TKind,
+        false,
+        true
+      >;
     },
     searchable() {
       return createValidatorApi(
@@ -275,24 +296,21 @@ function stringValidator(): Validator<string, string, "string"> {
   );
 }
 
-function numberValidator(
-  kind: "number" | "float64" | "int64"
-): Validator<number, number, typeof kind> {
-  return createValidator({ kind, searchable: false }, (value, path) => {
-    if (
-      typeof value !== "number" ||
-      Number.isNaN(value) ||
-      !Number.isFinite(value)
-    ) {
-      throw createValidationError(path, "must be a finite number");
-    }
+function numberValidator(): Validator<number, number, "number"> {
+  return createValidator(
+    { kind: "number", searchable: false },
+    (value, path) => {
+      if (
+        typeof value !== "number" ||
+        Number.isNaN(value) ||
+        !Number.isFinite(value)
+      ) {
+        throw createValidationError(path, "must be a finite number");
+      }
 
-    if (kind === "int64" && !Number.isSafeInteger(value)) {
-      throw createValidationError(path, "must be a safe integer");
+      return value;
     }
-
-    return value;
-  });
+  );
 }
 
 function booleanValidator(): Validator<boolean, boolean, "boolean"> {
@@ -345,7 +363,7 @@ function idValidator<TTableName extends string>(
         throw createValidationError(path, "must be a valid UUIDv7 id");
       }
 
-      getCreatedAtFromId(value);
+      getCreatedMsFromId(value);
       return value as Id<TTableName>;
     }
   );
@@ -534,11 +552,26 @@ function anyValidator(): Validator<unknown, unknown, "any"> {
   return createValidator({ kind: "any", searchable: false }, (value) => value);
 }
 
+function optionalValidator<
+  TInput,
+  TOutput,
+  TKind extends ValidatorKind,
+  THasDefault extends boolean,
+>(
+  validator: Validator<TInput, TOutput, TKind, boolean, THasDefault>
+): Validator<
+  TInput | undefined,
+  TOutput | undefined,
+  TKind,
+  true,
+  THasDefault
+> {
+  return validator.optional();
+}
+
 export const v = {
   string: stringValidator,
-  number: () => numberValidator("number"),
-  float64: () => numberValidator("float64"),
-  int64: () => numberValidator("int64"),
+  number: numberValidator,
   boolean: booleanValidator,
   bytes: bytesValidator,
   null: nullValidator,
@@ -553,8 +586,7 @@ export const v = {
   enum: enumValidator,
   vector: vectorValidator,
   any: anyValidator,
-  optional: <TValidator extends AnyValidator>(validator: TValidator) =>
-    validator.optional(),
+  optional: optionalValidator,
 };
 
 export type {

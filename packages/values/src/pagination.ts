@@ -12,6 +12,6 @@ export interface PaginationResult<TValue> {
 }
 
 export const paginationOptsValidator = v.object({
-  numItems: v.int64().min(1),
+  numItems: v.number().min(1),
   cursor: v.union(v.string(), v.null()).default(null),
 });

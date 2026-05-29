@@ -10,8 +10,6 @@ export type Id<TableName extends string = string> = string & {
 export type ValidatorKind =
   | "string"
   | "number"
-  | "float64"
-  | "int64"
   | "boolean"
   | "bytes"
   | "null"

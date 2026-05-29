@@ -1,4 +1,9 @@
-export { BaseflareError, ErrorCode } from "./errors";
+export {
+  BaseflareError,
+  ErrorCode,
+  SchemaError,
+  ValidationError,
+} from "./errors";
 export {
   type PaginationOptions,
   type PaginationResult,
@@ -29,6 +34,13 @@ export type {
   ValidatorKind,
   ValidatorShape,
 } from "./types";
-export { generateId, getCreatedAtFromId, isUuidV7 } from "./uuid";
+export {
+  generateId,
+  getCreatedAtFromId,
+  getCreatedMsFromId,
+  isUuidV7,
+  maxIdForMs,
+  minIdForMs,
+} from "./uuid";
 export type { Validator } from "./validators";
 export { v } from "./validators";
