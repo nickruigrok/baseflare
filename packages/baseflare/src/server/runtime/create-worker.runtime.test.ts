@@ -338,6 +338,20 @@ const countLimitedTodos = mutation({
   },
 });
 
+const firstTodoText = mutation({
+  args: { ownerToken: v.string() },
+  returns: v.union(v.string(), v.null()),
+  async handler(ctx, args) {
+    return (
+      await ctx.db
+        .query("todos")
+        .filter({ ownerToken: args.ownerToken })
+        .order("text", "asc")
+        .first()
+    )?.text as string | null;
+  },
+});
+
 const patchWithOneRowConflict = mutation({
   args: { id: v.id("todos"), text: v.string() },
   returns: v.number(),
@@ -388,6 +402,28 @@ const insertWithOneTableConflict = mutation({
     });
 
     return tableConflictAttempts;
+  },
+});
+
+const patchAfterMissingTableVersion = mutation({
+  args: { id: v.id("todos"), text: v.string() },
+  async handler(ctx, args) {
+    await ctx.db.get("todos", args.id);
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_table_versions WHERE table_name = 'todos'"
+    ).run();
+    await ctx.db.patch("todos", args.id, { text: args.text });
+  },
+});
+
+const insertAfterMissingTableVersion = mutation({
+  args: { ownerToken: v.string(), text: v.string() },
+  async handler(ctx, args) {
+    await ctx.db.query("todos").filter({ ownerToken: args.ownerToken }).count();
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_table_versions WHERE table_name = 'todos'"
+    ).run();
+    await ctx.db.insert("todos", args);
   },
 });
 
@@ -511,6 +547,11 @@ function createManifest(
         modulePath: "todos",
       },
       {
+        definition: firstTodoText,
+        exportName: "firstTodoText",
+        modulePath: "todos",
+      },
+      {
         definition: patchWithOneRowConflict,
         exportName: "patchWithOneRowConflict",
         modulePath: "todos",
@@ -523,6 +564,16 @@ function createManifest(
       {
         definition: insertWithOneTableConflict,
         exportName: "insertWithOneTableConflict",
+        modulePath: "todos",
+      },
+      {
+        definition: patchAfterMissingTableVersion,
+        exportName: "patchAfterMissingTableVersion",
+        modulePath: "todos",
+      },
+      {
+        definition: insertAfterMissingTableVersion,
+        exportName: "insertAfterMissingTableVersion",
         modulePath: "todos",
       },
     ],
@@ -629,6 +680,17 @@ async function insertStoredTodo(doc: {
   return id;
 }
 
+async function insertMalformedStoredTodo(text: string): Promise<void> {
+  const bump = createTableVersionBump("todos");
+
+  await env.APP_DB.batch([
+    env.APP_DB.prepare(
+      "INSERT INTO todos (_id, _data, _rev) VALUES (?, ?, 0)"
+    ).bind("not-a-uuid-v7", JSON.stringify({ ownerToken: "owner-a", text })),
+    env.APP_DB.prepare(bump.sql).bind(...bump.params),
+  ]);
+}
+
 describe("worker runtime", () => {
   beforeAll(async () => {
     await applyRuntimeSchema(env.APP_DB, schema);
@@ -641,6 +703,9 @@ describe("worker runtime", () => {
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await env.APP_DB.prepare("DELETE FROM todos").run();
+    await env.APP_DB.prepare(
+      "INSERT OR IGNORE INTO _bf_table_versions (table_name, version) VALUES ('todos', 0)"
+    ).run();
     await env.APP_DB.prepare(
       "UPDATE _bf_table_versions SET version = 0 WHERE table_name = 'todos'"
     ).run();
@@ -896,6 +961,21 @@ describe("worker runtime", () => {
     expect(body.result).toBe(2);
   });
 
+  it("stops limited mutation reads before later malformed rows", async () => {
+    await createTodoViaRpc("owner-a", "alpha");
+    await insertMalformedStoredTodo("z-malformed");
+
+    const response = await invoke("/api/mutation/todos:firstTodoText", {
+      body: rpcBody({ ownerToken: "owner-a" }),
+      headers: { authorization: "Bearer owner-a" },
+      method: "POST",
+    });
+    const body = (await response.json()) as { result: string | null };
+
+    expect(response.status).toBe(200);
+    expect(body.result).toBe("alpha");
+  });
+
   it("rolls back writes when return validation fails", async () => {
     const response = await invoke(
       "/api/mutation/todos:createThenInvalidReturn",
@@ -985,6 +1065,51 @@ describe("worker runtime", () => {
     expect(body.error.code).toBe(ErrorCode.Conflict);
     expect(body.error.message).toBe("Mutation conflict retry limit exceeded");
     expect(exhaustedConflictAttempts).toBe(3);
+  });
+
+  it("fails clearly when row-read table-version metadata is missing", async () => {
+    const id = await createTodoViaRpc("owner-a", "before-missing-row-version");
+
+    const response = await invoke(
+      "/api/mutation/todos:patchAfterMissingTableVersion",
+      {
+        body: rpcBody({ id, text: "after-missing-row-version" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      }
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(500);
+    expect(body.error.code).toBe(ErrorCode.InternalError);
+    expect(body.error.message).toContain(
+      'Missing internal table version row for "todos"'
+    );
+  });
+
+  it("fails clearly when query-read table-version metadata is missing", async () => {
+    const response = await invoke(
+      "/api/mutation/todos:insertAfterMissingTableVersion",
+      {
+        body: rpcBody({
+          ownerToken: "owner-a",
+          text: "after-missing-table-version",
+        }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      }
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(500);
+    expect(body.error.code).toBe(ErrorCode.InternalError);
+    expect(body.error.message).toContain(
+      'Missing internal table version row for "todos"'
+    );
   });
 
   it("keeps permission-filtered query terminals complete", async () => {

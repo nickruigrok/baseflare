@@ -61,6 +61,7 @@ type CommitOperation =
   | {
       readonly params: readonly (string | number | null)[];
       readonly sql: string;
+      validateResult(result: D1Result): void;
       readonly type: "assert-row-revision" | "assert-table-version";
     }
   | {
@@ -70,7 +71,6 @@ type CommitOperation =
     };
 
 const MUTATION_QUERY_CHUNK_SIZE = 256;
-const TABLE_VERSION_UNIQUE_CONSTRAINT_MESSAGE = `UNIQUE constraint failed: ${TABLE_VERSION_TABLE_NAME}.table_name`;
 
 function createBaseQueryState(): QueryState {
   return { order: { field: "_id", direction: "asc" } };
@@ -159,12 +159,7 @@ function getRetryDelayMs(attempt: number): number {
 }
 
 function isRetryableConflict(error: unknown): boolean {
-  return (
-    error instanceof RetryableMutationConflictError ||
-    (error instanceof Error &&
-      // D1 currently exposes table-version assertion conflicts through this SQLite message.
-      error.message.includes(TABLE_VERSION_UNIQUE_CONSTRAINT_MESSAGE))
-  );
+  return error instanceof RetryableMutationConflictError;
 }
 
 class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
@@ -485,13 +480,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     cursor: CursorPayload | null
   ): Promise<RuntimeDocument[]> {
     await this.recordTableRead(tableName);
+    const shadowedIds = this.getShadowedIds(tableName);
     const baseDocuments = await this.collectBaseDocuments(
       tableName,
       state,
-      cursor
+      cursor,
+      shadowedIds
     );
-    const shadowedIds = this.getShadowedIds(tableName);
-    const documents = baseDocuments.filter((doc) => !shadowedIds.has(doc._id));
+    const documents = [...baseDocuments];
 
     for (const document of await this.getReadableOverlayDocuments(
       tableName,
@@ -510,7 +506,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   private async collectBaseDocuments(
     tableName: string,
     state: QueryState,
-    cursor: CursorPayload | null
+    cursor: CursorPayload | null,
+    shadowedIds: Set<string>
   ): Promise<RuntimeDocument[]> {
     const documents: RuntimeDocument[] = [];
     let offset = 0;
@@ -536,9 +533,17 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         scannedBytes += row._data.length;
         assertWithinScanBudget(scannedRows, scannedBytes);
 
+        if (shadowedIds.has(row._id)) {
+          continue;
+        }
+
         const document = deserializeRuntimeDocument(tableName, row);
         if (await this.canRead(tableName, document)) {
           documents.push(document);
+        }
+
+        if (state.limit !== undefined && documents.length >= state.limit) {
+          return documents;
         }
       }
 
@@ -734,13 +739,20 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     for (const [tableName, expectedVersion] of this.tableReadVersions) {
       operations.push({
         type: "assert-table-version",
-        sql: `INSERT INTO ${TABLE_VERSION_TABLE_NAME} (table_name, version)
-              SELECT ?, 0
-              WHERE COALESCE(
-                (SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ?),
-                -1
-              ) <> ?`,
-        params: [tableName, tableName, expectedVersion],
+        sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
+        params: [tableName],
+        validateResult(result) {
+          const version = result.results?.[0]?.version;
+          if (typeof version !== "number") {
+            throw new InternalRuntimeError(
+              `Missing internal table version row for "${tableName}"`
+            );
+          }
+
+          if (version !== expectedVersion) {
+            throw new RetryableMutationConflictError();
+          }
+        },
       });
     }
   }
@@ -750,12 +762,25 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       for (const [id, rev] of reads) {
         operations.push({
           type: "assert-row-revision",
-          sql: `INSERT INTO ${TABLE_VERSION_TABLE_NAME} (table_name, version)
-                SELECT ?, 0
-                WHERE NOT EXISTS (
-                  SELECT 1 FROM ${tableName} WHERE _id = ? AND _rev = ?
-                )`,
-          params: [tableName, id, rev],
+          sql: `SELECT
+                  (SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1) AS tableVersion,
+                  (SELECT _rev FROM ${tableName} WHERE _id = ? LIMIT 1) AS rowRev`,
+          params: [tableName, id],
+          validateResult(result) {
+            const row = result.results?.[0];
+            const tableVersion = row?.tableVersion;
+            const rowRev = row?.rowRev;
+
+            if (typeof tableVersion !== "number") {
+              throw new InternalRuntimeError(
+                `Missing internal table version row for "${tableName}"`
+              );
+            }
+
+            if (rowRev !== rev) {
+              throw new RetryableMutationConflictError();
+            }
+          },
         });
       }
     }
@@ -839,6 +864,12 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
       const changes = result.meta?.changes;
       if (changes === undefined) {
+        if (
+          operation.type === "assert-row-revision" ||
+          operation.type === "assert-table-version"
+        ) {
+          operation.validateResult(result);
+        }
         continue;
       }
 
@@ -852,11 +883,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       }
 
       if (
-        (operation.type === "assert-row-revision" ||
-          operation.type === "assert-table-version") &&
-        changes > 0
+        operation.type === "assert-row-revision" ||
+        operation.type === "assert-table-version"
       ) {
-        throw new RetryableMutationConflictError();
+        operation.validateResult(result);
       }
     }
   }
