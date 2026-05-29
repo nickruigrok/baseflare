@@ -162,6 +162,15 @@ function isRetryableConflict(error: unknown): boolean {
   return error instanceof RetryableMutationConflictError;
 }
 
+function requiresChangeCount(operation: CommitOperation): boolean {
+  return (
+    operation.type === "bump-table-version" ||
+    operation.type === "delete" ||
+    operation.type === "insert" ||
+    operation.type === "update"
+  );
+}
+
 class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
   private readonly database: MutationDatabase;
   private readonly state: QueryState;
@@ -864,6 +873,12 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
       const changes = result.meta?.changes;
       if (changes === undefined) {
+        if (requiresChangeCount(operation)) {
+          throw new InternalRuntimeError(
+            `Mutation commit operation "${operation.type}" did not report a D1 change count`
+          );
+        }
+
         if (
           operation.type === "assert-row-revision" ||
           operation.type === "assert-table-version"
@@ -873,12 +888,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         continue;
       }
 
-      if (
-        (operation.type === "update" ||
-          operation.type === "delete" ||
-          operation.type === "bump-table-version") &&
-        changes !== 1
-      ) {
+      if (requiresChangeCount(operation) && changes !== 1) {
         throw new RetryableMutationConflictError();
       }
 
