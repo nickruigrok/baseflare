@@ -52,6 +52,13 @@ type OutputValue<TValidator extends AnyValidator> =
     ? TOutput
     : never;
 
+type NumberValidatorApi<
+  TInput,
+  TOutput,
+  TOptional extends boolean,
+  THasDefault extends boolean,
+> = Validator<TInput, TOutput, "number", TOptional, THasDefault>;
+
 export interface Validator<
   TInput,
   TOutput,
@@ -80,6 +87,32 @@ export interface Validator<
   >;
   searchable(): Validator<TInput, TOutput, TKind, TOptional, THasDefault>;
   validate(value: unknown, path?: string): TOutput;
+}
+
+export interface NumberValidator<
+  TInput = number,
+  TOutput = number,
+  TOptional extends boolean = false,
+  THasDefault extends boolean = false,
+> extends Validator<TInput, TOutput, "number", TOptional, THasDefault> {
+  default(
+    defaultValue: Exclude<TOutput, undefined>
+  ): NumberValidator<
+    TInput | undefined,
+    Exclude<TOutput, undefined>,
+    false,
+    true
+  >;
+  integer(): NumberValidator<TInput, TOutput, TOptional, THasDefault>;
+  max(limit: number): NumberValidator<TInput, TOutput, TOptional, THasDefault>;
+  min(limit: number): NumberValidator<TInput, TOutput, TOptional, THasDefault>;
+  optional(): NumberValidator<
+    TInput | undefined,
+    TOutput | undefined,
+    true,
+    THasDefault
+  >;
+  searchable(): NumberValidator<TInput, TOutput, TOptional, THasDefault>;
 }
 
 function formatPath(path: string): string {
@@ -134,6 +167,25 @@ function withConstraint<TOutput>(
 
     if (kind === "max" && size > limit) {
       throw createValidationError(path, boundMessage(definition, kind, limit));
+    }
+
+    return result;
+  };
+}
+
+function withIntegerConstraint<TOutput>(
+  validator: (value: unknown, path: string) => TOutput,
+  definition: ValidatorDefinition
+): (value: unknown, path: string) => TOutput {
+  return (value, path) => {
+    const result = validator(value, path);
+
+    if (definition.kind !== "number" || typeof result !== "number") {
+      throw createValidationError(path, "does not support .integer()");
+    }
+
+    if (!Number.isSafeInteger(result)) {
+      throw createValidationError(path, "must be a safe integer");
     }
 
     return result;
@@ -262,6 +314,88 @@ function createValidatorApi<
   return api;
 }
 
+function asNumberValidator<
+  TInput,
+  TOutput,
+  TOptional extends boolean,
+  THasDefault extends boolean,
+>(
+  validator: NumberValidatorApi<TInput, TOutput, TOptional, THasDefault>
+): NumberValidator<TInput, TOutput, TOptional, THasDefault> {
+  const numberApi = validator as NumberValidator<
+    TInput,
+    TOutput,
+    TOptional,
+    THasDefault
+  >;
+  const defaultValidator = validator.default.bind(validator);
+  const maxValidator = validator.max.bind(validator);
+  const minValidator = validator.min.bind(validator);
+  const optionalValidator = validator.optional.bind(validator);
+  const searchableValidator = validator.searchable.bind(validator);
+
+  numberApi.default = (defaultValue) =>
+    asNumberValidator(
+      defaultValidator(defaultValue) as NumberValidatorApi<
+        TInput | undefined,
+        Exclude<TOutput, undefined>,
+        false,
+        true
+      >
+    );
+  numberApi.integer = () =>
+    asNumberValidator(
+      createValidatorApi(
+        {
+          ...validator.definition,
+          integer: true,
+        },
+        withIntegerConstraint(
+          (value, path) => validator.validate(value, path),
+          validator.definition
+        )
+      )
+    );
+  numberApi.max = (limit) =>
+    asNumberValidator(
+      maxValidator(limit) as NumberValidatorApi<
+        TInput,
+        TOutput,
+        TOptional,
+        THasDefault
+      >
+    );
+  numberApi.min = (limit) =>
+    asNumberValidator(
+      minValidator(limit) as NumberValidatorApi<
+        TInput,
+        TOutput,
+        TOptional,
+        THasDefault
+      >
+    );
+  numberApi.optional = () =>
+    asNumberValidator(
+      optionalValidator() as NumberValidatorApi<
+        TInput | undefined,
+        TOutput | undefined,
+        true,
+        THasDefault
+      >
+    );
+  numberApi.searchable = () =>
+    asNumberValidator(
+      searchableValidator() as NumberValidatorApi<
+        TInput,
+        TOutput,
+        TOptional,
+        THasDefault
+      >
+    );
+
+  return numberApi;
+}
+
 function createValidator<TInput, TOutput, TKind extends ValidatorKind>(
   definition: Omit<
     ValidatorDefinition,
@@ -296,10 +430,9 @@ function stringValidator(): Validator<string, string, "string"> {
   );
 }
 
-function numberValidator(): Validator<number, number, "number"> {
-  return createValidator(
-    { kind: "number", searchable: false },
-    (value, path) => {
+function numberValidator(): NumberValidator {
+  return asNumberValidator(
+    createValidator({ kind: "number", searchable: false }, (value, path) => {
       if (
         typeof value !== "number" ||
         Number.isNaN(value) ||
@@ -309,7 +442,7 @@ function numberValidator(): Validator<number, number, "number"> {
       }
 
       return value;
-    }
+    })
   );
 }
 

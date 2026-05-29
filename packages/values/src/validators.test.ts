@@ -67,6 +67,19 @@ describe("validators", () => {
     expect(() => v.number().max(10).validate(42)).toThrow(/must be at most 10/);
   });
 
+  it("validates safe integers", () => {
+    const integer = v.number().integer();
+
+    expect(integer.validate(42)).toBe(42);
+    expect(integer.definition.integer).toBe(true);
+    expect(() => integer.validate(1.5)).toThrow(/must be a safe integer/);
+    expect(() => integer.validate(Number.MAX_SAFE_INTEGER + 1)).toThrow(
+      /must be a safe integer/
+    );
+    // @ts-expect-error integer is only available on number validators.
+    expect(v.string().integer).toBeUndefined();
+  });
+
   it("brands ids by table and validates UUIDv7 format", () => {
     const id = generateId();
     const userIdValidator = v.id("users");

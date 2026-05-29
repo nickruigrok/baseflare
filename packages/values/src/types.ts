@@ -26,6 +26,7 @@ export type ValidatorKind =
 export interface ValidatorDefinition {
   readonly dimensions?: number;
   readonly hasDefault: boolean;
+  readonly integer?: boolean;
   readonly item?: AnyValidator;
   readonly kind: ValidatorKind;
   readonly max?: number;

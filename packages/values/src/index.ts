@@ -42,5 +42,5 @@ export {
   maxIdForMs,
   minIdForMs,
 } from "./uuid";
-export type { Validator } from "./validators";
+export type { NumberValidator, Validator } from "./validators";
 export { v } from "./validators";

@@ -131,6 +131,30 @@ describe("buildCursorPredicate", () => {
       sql: "(json_extract(_data, '$.priority') > ? OR (json_extract(_data, '$.priority') = ? AND _id > ?))",
       params: [5, 5, "id-1"],
     });
+
+    expect(
+      buildCursorPredicate(PRIORITY_ASC, {
+        orderField: "priority",
+        orderDirection: "asc",
+        id: "id-1",
+        v: "medium",
+      })
+    ).toEqual({
+      sql: "(json_extract(_data, '$.priority') > ? OR (json_extract(_data, '$.priority') = ? AND _id > ?))",
+      params: ["medium", "medium", "id-1"],
+    });
+
+    expect(
+      buildCursorPredicate(PRIORITY_ASC, {
+        orderField: "priority",
+        orderDirection: "asc",
+        id: "id-1",
+        v: true,
+      })
+    ).toEqual({
+      sql: "(json_extract(_data, '$.priority') > ? OR (json_extract(_data, '$.priority') = ? AND _id > ?))",
+      params: [1, 1, "id-1"],
+    });
   });
 
   it("builds null-aware descending predicates", () => {
