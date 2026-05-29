@@ -4,35 +4,46 @@ import {
   type DiffedIndex,
   type Schema,
   type SchemaDiff,
+  type SchemaTables,
   type TableDefinition,
+  type TableIndex,
 } from "./types";
 
+function indexFieldsEqual(left: TableIndex, right: TableIndex): boolean {
+  return (
+    left.fields.length === right.fields.length &&
+    left.fields.every((field, position) => field === right.fields[position])
+  );
+}
+
 function createSchemaDiff(options: {
-  addedTables: Record<string, TableDefinition>;
-  removedTables: string[];
+  addedTables: SchemaTables;
+  orphanedTables: string[];
   addedIndexes: readonly DiffedIndex[];
   removedIndexes: readonly DiffedIndex[];
 }): SchemaDiff {
   const hasChanges =
     Object.keys(options.addedTables).length > 0 ||
-    options.removedTables.length > 0 ||
+    options.orphanedTables.length > 0 ||
     options.addedIndexes.length > 0 ||
     options.removedIndexes.length > 0;
 
   return {
-    ...options,
+    addedTables: options.addedTables,
+    addedIndexes: options.addedIndexes,
+    removedIndexes: options.removedIndexes,
+    orphanedTables: options.orphanedTables,
     hasChanges,
     toStatements(): string[] {
       const statements: string[] = [];
 
+      // Orphaned tables are intentionally NOT dropped here — removing a table
+      // from the schema must never destroy data. They are reported via
+      // `orphanedTables` and deleted explicitly through the dashboard.
       for (const removedIndex of options.removedIndexes) {
         statements.push(
           `DROP INDEX IF EXISTS ${removedIndex.tableName}_${removedIndex.index.name}`
         );
-      }
-
-      for (const removedTable of options.removedTables) {
-        statements.push(`DROP TABLE IF EXISTS ${removedTable}`);
       }
 
       for (const tableName of Object.keys(options.addedTables)) {
@@ -53,7 +64,7 @@ function createSchemaDiff(options: {
 function collectNewTableChanges(
   current: Schema,
   target: Schema,
-  addedTables: Record<string, TableDefinition>,
+  addedTables: SchemaTables,
   addedIndexes: DiffedIndex[]
 ): void {
   for (const [tableName, table] of Object.entries(target.tables)) {
@@ -68,51 +79,63 @@ function collectNewTableChanges(
   }
 }
 
-function collectTableUpdates(
-  current: Schema,
-  target: Schema,
-  removedTables: string[],
+function diffIndexes(
+  tableName: string,
+  current: TableDefinition,
+  target: TableDefinition,
   addedIndexes: DiffedIndex[],
   removedIndexes: DiffedIndex[]
 ): void {
-  for (const [tableName, table] of Object.entries(current.tables)) {
-    if (!(tableName in target.tables)) {
-      removedTables.push(tableName);
-      for (const index of table.indexes) {
-        removedIndexes.push({ tableName, index });
-      }
+  const currentIndexes = new Map(
+    current.indexes.map((index) => [index.name, index])
+  );
+  const targetIndexes = new Map(
+    target.indexes.map((index) => [index.name, index])
+  );
+
+  for (const [indexName, index] of targetIndexes) {
+    const existing = currentIndexes.get(indexName);
+    if (!existing) {
+      addedIndexes.push({ tableName, index });
       continue;
     }
 
-    const targetTable = target.tables[tableName];
-    if (!targetTable) {
-      continue;
+    // Same name, different fields → recreate (DROP old + CREATE new).
+    if (!indexFieldsEqual(existing, index)) {
+      removedIndexes.push({ tableName, index: existing });
+      addedIndexes.push({ tableName, index });
     }
+  }
 
-    const currentIndexes = new Map(
-      table.indexes.map((index) => [index.name, index])
-    );
-    const targetIndexes = new Map(
-      targetTable.indexes.map((index) => [index.name, index])
-    );
-
-    for (const [indexName, index] of targetIndexes) {
-      if (!currentIndexes.has(indexName)) {
-        addedIndexes.push({ tableName, index });
-      }
-    }
-
-    for (const [indexName, index] of currentIndexes) {
-      if (!targetIndexes.has(indexName)) {
-        removedIndexes.push({ tableName, index });
-      }
+  for (const [indexName, index] of currentIndexes) {
+    if (!targetIndexes.has(indexName)) {
+      removedIndexes.push({ tableName, index });
     }
   }
 }
 
+function collectTableUpdates(
+  current: Schema,
+  target: Schema,
+  orphanedTables: string[],
+  addedIndexes: DiffedIndex[],
+  removedIndexes: DiffedIndex[]
+): void {
+  for (const [tableName, table] of Object.entries(current.tables)) {
+    const targetTable = target.tables[tableName];
+
+    if (!targetTable) {
+      orphanedTables.push(tableName);
+      continue;
+    }
+
+    diffIndexes(tableName, table, targetTable, addedIndexes, removedIndexes);
+  }
+}
+
 export function diff(current: Schema, target: Schema): SchemaDiff {
-  const addedTables: Record<string, TableDefinition> = {};
-  const removedTables: string[] = [];
+  const addedTables: SchemaTables = {};
+  const orphanedTables: string[] = [];
   const addedIndexes: DiffedIndex[] = [];
   const removedIndexes: DiffedIndex[] = [];
 
@@ -120,14 +143,14 @@ export function diff(current: Schema, target: Schema): SchemaDiff {
   collectTableUpdates(
     current,
     target,
-    removedTables,
+    orphanedTables,
     addedIndexes,
     removedIndexes
   );
 
   return createSchemaDiff({
     addedTables,
-    removedTables,
+    orphanedTables,
     addedIndexes,
     removedIndexes,
   });

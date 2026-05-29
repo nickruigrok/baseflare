@@ -1,12 +1,18 @@
+import { SchemaError } from "@baseflare/values";
+
 import {
   assertTableName,
   createIndexStatement,
   createTableStatement,
+  type NormalizedSchemaTables,
   type Schema,
+  type SchemaTables,
   type TableDefinition,
 } from "./types";
 
-function createSchema(tables: Record<string, TableDefinition>): Schema {
+function createSchema<TTables extends SchemaTables>(
+  tables: TTables
+): Schema<TTables> {
   return {
     tables,
     toCreateStatements(): string[] {
@@ -27,9 +33,11 @@ function createSchema(tables: Record<string, TableDefinition>): Schema {
   };
 }
 
-export function defineSchema(tables: Record<string, TableDefinition>): Schema {
+export function defineSchema<TTables extends SchemaTables>(
+  tables: TTables
+): Schema<NormalizedSchemaTables<TTables>> {
   if (Object.keys(tables).length === 0) {
-    throw new Error("Schemas must define at least one table");
+    throw new SchemaError("Schemas must define at least one table");
   }
 
   const normalizedTables: Record<string, TableDefinition> = {};
@@ -42,5 +50,5 @@ export function defineSchema(tables: Record<string, TableDefinition>): Schema {
     };
   }
 
-  return createSchema(normalizedTables);
+  return createSchema(normalizedTables as NormalizedSchemaTables<TTables>);
 }

@@ -26,5 +26,8 @@
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "uuidv7": "^1.2.1"
   }
 }

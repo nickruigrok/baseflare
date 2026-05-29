@@ -1,5 +1,6 @@
 import { describe, expect, expectTypeOf, it } from "vitest";
 
+import { ValidationError } from "./errors";
 import type { Id } from "./types";
 import { generateId } from "./uuid";
 import { v } from "./validators";
@@ -11,8 +12,7 @@ describe("validators", () => {
   it("validates primitive and composite values", () => {
     expect(v.string().min(2).max(5).validate("base")).toBe("base");
     expect(v.number().validate(42)).toBe(42);
-    expect(v.float64().validate(1.5)).toBe(1.5);
-    expect(v.int64().validate(42)).toBe(42);
+    expect(v.number().validate(1.5)).toBe(1.5);
     expect(v.boolean().validate(true)).toBe(true);
     expect(v.bytes().validate(new Uint8Array([1, 2, 3]))).toEqual(
       new Uint8Array([1, 2, 3])
@@ -46,6 +46,38 @@ describe("validators", () => {
     expect(() =>
       todoValidator.validate({ text: "ship it", extra: true })
     ).toThrow(INVALID_SCHEMA_FIELD_PATTERN);
+  });
+
+  it("throws typed ValidationError with path and code", () => {
+    try {
+      v.object({ text: v.string() }).validate({ text: 1 });
+      throw new Error("expected validation to throw");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ValidationError);
+      const validationError = error as ValidationError;
+      expect(validationError.code).toBe("VALIDATION_ERROR");
+      expect(validationError.path).toBe("value.text");
+    }
+  });
+
+  it("uses length-aware messages for bounded collections", () => {
+    expect(() => v.string().min(3).validate("hi")).toThrow(
+      /must have length at least 3/
+    );
+    expect(() => v.number().max(10).validate(42)).toThrow(/must be at most 10/);
+  });
+
+  it("validates safe integers", () => {
+    const integer = v.number().integer();
+
+    expect(integer.validate(42)).toBe(42);
+    expect(integer.definition.integer).toBe(true);
+    expect(() => integer.validate(1.5)).toThrow(/must be a safe integer/);
+    expect(() => integer.validate(Number.MAX_SAFE_INTEGER + 1)).toThrow(
+      /must be a safe integer/
+    );
+    // @ts-expect-error integer is only available on number validators.
+    expect(v.string().integer).toBeUndefined();
   });
 
   it("brands ids by table and validates UUIDv7 format", () => {

@@ -1,3 +1,4 @@
+export { SchemaError, ValidationError } from "@baseflare/values";
 export type {
   BaseflareConfig,
   BaseflareCorsConfig,
@@ -6,9 +7,19 @@ export type {
 } from "./config";
 export { defineConfig } from "./config";
 export { deserialize } from "./db/deserialize";
-export type { FilterPredicate, FilterValue } from "./db/filters";
+export type {
+  FieldFilter,
+  FilterObject,
+  FilterOperator,
+  FilterValue,
+  LogicalFilterKey,
+} from "./db/filters";
 export { createQueryBuilder } from "./db/query-builder";
-export type { DatabaseReader, QueryBuilder } from "./db/reader";
+export type {
+  DatabaseReader,
+  QueryBuilder,
+  QueryOrderDirection,
+} from "./db/reader";
 export { serialize } from "./db/serialize";
 export type { DocumentData, DocumentPatch } from "./db/write-validation";
 export {
@@ -51,9 +62,13 @@ export { defineSchema } from "./schema/define-schema";
 export { defineTable } from "./schema/define-table";
 export { diff } from "./schema/diff";
 export type {
+  DataModelFromSchema,
   DiffedIndex,
+  Doc,
+  NormalizedSchemaTables,
   Schema,
   SchemaDiff,
+  SchemaTables,
   TableDefBuilder,
   TableDefinition,
   TableIndex,

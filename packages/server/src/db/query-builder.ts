@@ -1,14 +1,30 @@
-import type { PaginationOptions, PaginationResult } from "@baseflare/values";
+import {
+  type PaginationOptions,
+  type PaginationResult,
+  ValidationError,
+} from "@baseflare/values";
 
-import { buildFilterClause, type FilterPredicate } from "./filters";
+import {
+  buildCursorPredicate,
+  type CursorPayload,
+  decodeCursor,
+  encodeCursor,
+  type OrderDirection,
+  type OrderSpec,
+} from "./cursor";
+import {
+  assertQueryField,
+  combineFilters,
+  compileFilter,
+  type FilterObject,
+  fieldExpression,
+} from "./filters";
 import type { QueryBuilder } from "./reader";
 
-type QueryOrder = "asc" | "desc";
-
 interface QueryState {
-  readonly filters: FilterPredicate;
+  readonly filter?: FilterObject;
   readonly limit?: number;
-  readonly order: QueryOrder;
+  readonly order: OrderSpec;
 }
 
 interface BuiltQuery {
@@ -22,64 +38,36 @@ interface QueryExecutor<TDocument> {
 }
 
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
-const WHERE_PREFIX_PATTERN = /^WHERE /;
 
 function assertTableIdentifier(tableName: string): void {
   if (!IDENTIFIER_PATTERN.test(tableName) || tableName.startsWith("_")) {
-    throw new Error(
+    throw new ValidationError(
+      tableName,
       `Table name "${tableName}" must start with a letter and contain only letters, numbers, and underscores`
     );
   }
 }
 
+function assertDirection(value: string): asserts value is OrderDirection {
+  if (value !== "asc" && value !== "desc") {
+    throw new ValidationError(
+      "order",
+      `Order direction must be "asc" or "desc", received "${value}"`
+    );
+  }
+}
+
 function createBaseState(): QueryState {
-  return {
-    filters: {},
-    order: "asc",
-  };
+  return { order: { field: "_id", direction: "asc" } };
 }
 
-function buildCursorClause(
-  order: QueryOrder,
-  cursor: string | null
-): {
-  sql: string;
-  params: readonly string[];
-} {
-  if (cursor === null) {
-    return { sql: "", params: [] };
+function buildOrderClause(order: OrderSpec): string {
+  const direction = order.direction.toUpperCase();
+  if (order.field === "_id") {
+    return `ORDER BY _id ${direction}`;
   }
 
-  return {
-    sql: `_id ${order === "asc" ? ">" : "<"} ?`,
-    params: [cursor],
-  };
-}
-
-function mergeWhereClauses(clauses: string[]): string {
-  const filtered = clauses.filter(Boolean);
-  if (filtered.length === 0) {
-    return "";
-  }
-
-  return `WHERE ${filtered.join(" AND ")}`;
-}
-
-function getDocumentId(document: unknown): string {
-  if (
-    typeof document !== "object" ||
-    document === null ||
-    !("_id" in document)
-  ) {
-    throw new Error('Paginated query results must include an "_id" field');
-  }
-
-  const value = document._id;
-  if (typeof value !== "string") {
-    throw new Error('Document "_id" fields must be strings');
-  }
-
-  return value;
+  return `ORDER BY ${fieldExpression(order.field)} ${direction}, _id ${direction}`;
 }
 
 class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
@@ -100,22 +88,43 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
     this.executor = executor;
   }
 
-  filter(predicate: FilterPredicate): QueryBuilder<TDocument> {
+  filter(filter: FilterObject): QueryBuilder<TDocument> {
     return this.clone({
-      filters: {
-        ...this.state.filters,
-        ...predicate,
-      },
+      filter: combineFilters(this.state.filter, filter),
     });
   }
 
-  order(direction: QueryOrder): QueryBuilder<TDocument> {
-    return this.clone({ order: direction });
+  order(direction: OrderDirection): QueryBuilder<TDocument>;
+  order(field: string, direction: OrderDirection): QueryBuilder<TDocument>;
+  order(
+    fieldOrDirection: string,
+    maybeDirection?: OrderDirection
+  ): QueryBuilder<TDocument> {
+    if (maybeDirection === undefined) {
+      assertDirection(fieldOrDirection);
+      return this.clone({
+        order: { field: "_id", direction: fieldOrDirection },
+      });
+    }
+
+    assertDirection(maybeDirection);
+    const field =
+      fieldOrDirection === "_id" || fieldOrDirection === "_createdAt"
+        ? "_id"
+        : fieldOrDirection;
+    if (field !== "_id") {
+      assertQueryField(field);
+    }
+
+    return this.clone({ order: { field, direction: maybeDirection } });
   }
 
   limit(limit: number): QueryBuilder<TDocument> {
     if (!Number.isInteger(limit) || limit < 0) {
-      throw new Error("Query limits must be a non-negative integer");
+      throw new ValidationError(
+        "limit",
+        "Query limits must be a non-negative integer"
+      );
     }
 
     return this.clone({ limit });
@@ -134,14 +143,18 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
     const results = await this.clone({ limit: 2 }).collect();
 
     if (results.length !== 1) {
-      throw new Error(
+      throw new ValidationError(
+        "unique",
         `Expected exactly one document, received ${results.length}`
       );
     }
 
     const result = results[0];
     if (!result) {
-      throw new Error("Expected a document but none was returned");
+      throw new ValidationError(
+        "unique",
+        "Expected a document but none was returned"
+      );
     }
 
     return result;
@@ -166,43 +179,53 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
     options: PaginationOptions
   ): Promise<PaginationResult<TDocument>> {
     if (!Number.isInteger(options.numItems) || options.numItems <= 0) {
-      throw new Error("Pagination requires a positive integer numItems value");
+      throw new ValidationError(
+        "numItems",
+        "Pagination requires a positive integer numItems value"
+      );
     }
 
     const executor = this.requireExecutor();
-    const pageBuilder = this.clone({ limit: options.numItems + 1 });
-    const cursorQuery = pageBuilder.toSQL(options.cursor);
-    const results = await executor.collect(cursorQuery);
+    const cursor = options.cursor
+      ? decodeCursor(options.cursor, this.state.order)
+      : null;
+    const pageQuery = this.clone({ limit: options.numItems + 1 }).toSQL(cursor);
+    const results = await executor.collect(pageQuery);
     const page = results.slice(0, options.numItems);
     const isDone = results.length <= options.numItems;
+    const lastDocument = page.at(-1);
 
     return {
       page,
       isDone,
-      continueCursor: page.at(-1)
-        ? getDocumentId(page.at(-1))
+      continueCursor: lastDocument
+        ? encodeCursor(this.state.order, lastDocument)
         : (options.cursor ?? ""),
     };
   }
 
-  toSQL(cursor: string | null = null): BuiltQuery {
-    const filters = buildFilterClause(this.state.filters);
-    const cursorClause = buildCursorClause(this.state.order, cursor);
-    const whereClause = mergeWhereClauses([
-      filters.sql.replace(WHERE_PREFIX_PATTERN, ""),
-      cursorClause.sql,
-    ]);
-    const params: Array<string | number | null> = [
-      ...filters.params,
-      ...cursorClause.params,
-    ];
-    let sql = `SELECT _id, _data FROM ${this.tableName}`;
+  toSQL(cursor: CursorPayload | null = null): BuiltQuery {
+    const clauses: string[] = [];
+    const params: Array<string | number | null> = [];
 
-    if (whereClause) {
-      sql += ` ${whereClause}`;
+    if (this.state.filter) {
+      const compiled = compileFilter(this.state.filter);
+      clauses.push(compiled.sql);
+      params.push(...compiled.params);
     }
 
-    sql += ` ORDER BY _id ${this.state.order.toUpperCase()}`;
+    if (cursor) {
+      const predicate = buildCursorPredicate(this.state.order, cursor);
+      clauses.push(predicate.sql);
+      params.push(...predicate.params);
+    }
+
+    let sql = `SELECT _id, _data FROM ${this.tableName}`;
+    if (clauses.length > 0) {
+      sql += ` WHERE ${clauses.join(" AND ")}`;
+    }
+
+    sql += ` ${buildOrderClause(this.state.order)}`;
 
     if (this.state.limit !== undefined) {
       sql += " LIMIT ?";
@@ -212,21 +235,14 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
     return { sql, params };
   }
 
-  toCountSQL(cursor: string | null = null): BuiltQuery {
-    const filters = buildFilterClause(this.state.filters);
-    const cursorClause = buildCursorClause(this.state.order, cursor);
-    const whereClause = mergeWhereClauses([
-      filters.sql.replace(WHERE_PREFIX_PATTERN, ""),
-      cursorClause.sql,
-    ]);
-    const params: Array<string | number | null> = [
-      ...filters.params,
-      ...cursorClause.params,
-    ];
+  toCountSQL(): BuiltQuery {
+    const params: Array<string | number | null> = [];
     let sql = `SELECT COUNT(*) AS count FROM ${this.tableName}`;
 
-    if (whereClause) {
-      sql += ` ${whereClause}`;
+    if (this.state.filter) {
+      const compiled = compileFilter(this.state.filter);
+      sql += ` WHERE ${compiled.sql}`;
+      params.push(...compiled.params);
     }
 
     return { sql, params };
@@ -237,17 +253,17 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
   ): BaseflareQueryBuilder<TDocument> {
     return new BaseflareQueryBuilder(
       this.tableName,
-      {
-        ...this.state,
-        ...partial,
-      },
+      { ...this.state, ...partial },
       this.executor
     );
   }
 
   private requireExecutor(): QueryExecutor<TDocument> {
     if (!this.executor) {
-      throw new Error("This QueryBuilder is not connected to an executor");
+      throw new ValidationError(
+        "executor",
+        "This QueryBuilder is not connected to an executor"
+      );
     }
 
     return this.executor;
@@ -258,8 +274,8 @@ export function createQueryBuilder<TDocument extends Record<string, unknown>>(
   tableName: string,
   executor?: QueryExecutor<TDocument>
 ): QueryBuilder<TDocument> & {
-  toSQL(cursor?: string | null): BuiltQuery;
-  toCountSQL(cursor?: string | null): BuiltQuery;
+  toSQL(cursor?: CursorPayload | null): BuiltQuery;
+  toCountSQL(): BuiltQuery;
 } {
   return new BaseflareQueryBuilder(tableName, createBaseState(), executor);
 }

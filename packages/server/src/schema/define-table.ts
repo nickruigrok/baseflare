@@ -1,4 +1,4 @@
-import type { AnyValidator } from "@baseflare/values";
+import { SchemaError, type ValidatorShape } from "@baseflare/values";
 
 import {
   assertFieldName,
@@ -8,35 +8,42 @@ import {
 } from "./types";
 
 function validateIndexFields(
-  fields: Record<string, AnyValidator>,
+  fields: ValidatorShape,
   indexFields: readonly string[]
 ): void {
   if (indexFields.length === 0) {
-    throw new Error("Index must include at least one field");
+    throw new SchemaError("Index must include at least one field");
   }
 
   for (const field of indexFields) {
     assertFieldName(field);
 
     if (!(field in fields)) {
-      throw new Error(`Index field "${field}" is not defined on the table`);
+      throw new SchemaError(
+        `Index field "${field}" is not defined on the table`
+      );
     }
   }
 }
 
-function createTableDefBuilder(
-  fields: Record<string, AnyValidator>,
+function createTableDefBuilder<TFields extends ValidatorShape>(
+  fields: TFields,
   indexes: readonly TableIndex[] = []
-): TableDefBuilder {
+): TableDefBuilder<TFields> {
   return {
     fields,
     indexes,
-    index(name: string, indexFields: readonly string[]): TableDefBuilder {
+    index(
+      name: string,
+      indexFields: readonly string[]
+    ): TableDefBuilder<TFields> {
       assertIdentifier(name, "Index name");
       validateIndexFields(fields, indexFields);
 
       if (indexes.some((index) => index.name === name)) {
-        throw new Error(`Index "${name}" is already defined on this table`);
+        throw new SchemaError(
+          `Index "${name}" is already defined on this table`
+        );
       }
 
       return createTableDefBuilder(fields, [
@@ -47,11 +54,11 @@ function createTableDefBuilder(
   };
 }
 
-export function defineTable(
-  fields: Record<string, AnyValidator>
-): TableDefBuilder {
+export function defineTable<TFields extends ValidatorShape>(
+  fields: TFields
+): TableDefBuilder<TFields> {
   if (Object.keys(fields).length === 0) {
-    throw new Error("Table definitions must include at least one field");
+    throw new SchemaError("Table definitions must include at least one field");
   }
 
   for (const [fieldName, validator] of Object.entries(fields)) {
@@ -62,7 +69,9 @@ export function defineTable(
       typeof validator !== "object" ||
       !("validate" in validator)
     ) {
-      throw new Error(`Field "${fieldName}" must use a Baseflare validator`);
+      throw new SchemaError(
+        `Field "${fieldName}" must use a Baseflare validator`
+      );
     }
   }
 

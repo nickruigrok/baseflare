@@ -10,8 +10,6 @@ export type Id<TableName extends string = string> = string & {
 export type ValidatorKind =
   | "string"
   | "number"
-  | "float64"
-  | "int64"
   | "boolean"
   | "bytes"
   | "null"
@@ -28,6 +26,7 @@ export type ValidatorKind =
 export interface ValidatorDefinition {
   readonly dimensions?: number;
   readonly hasDefault: boolean;
+  readonly integer?: boolean;
   readonly item?: AnyValidator;
   readonly kind: ValidatorKind;
   readonly max?: number;
