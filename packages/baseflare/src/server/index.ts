@@ -59,6 +59,19 @@ export type {
 export { defineRules } from "./permissions/define-rules";
 export { evaluate } from "./permissions/evaluate";
 export type { RuleOperation, Rules, TableRules } from "./permissions/types";
+export { createWorker } from "./runtime/create-worker";
+export type {
+  BaseflareExecutionContext,
+  BaseflareFunctionEntry,
+  BaseflareManifest,
+  BaseflareManifestSource,
+  BaseflareRuntimeEnv,
+  D1BindingValue,
+  D1Database,
+  D1PreparedStatement,
+  D1Result,
+  ExportedHandler,
+} from "./runtime/types";
 export { defineSchema } from "./schema/define-schema";
 export { defineTable } from "./schema/define-table";
 export { diff } from "./schema/diff";

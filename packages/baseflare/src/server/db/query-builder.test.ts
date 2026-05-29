@@ -2,6 +2,7 @@ import { minIdForMs } from "baseflare/values";
 import { describe, expect, it } from "vitest";
 
 import { decodeCursor } from "./cursor";
+import { compareSqliteJsonValues, matchesFilter } from "./filters";
 import { createQueryBuilder } from "./query-builder";
 
 const UNIQUE_DOCUMENT_ERROR_PATTERN = /Expected exactly one document/;
@@ -98,6 +99,29 @@ describe("createQueryBuilder", () => {
     expect(query.toSQL().sql).toBe(
       "SELECT _id, _data FROM todos ORDER BY json_extract(_data, '$.priority') DESC, _id DESC"
     );
+  });
+
+  it("compares in-memory values with SQLite json_extract ordering", () => {
+    expect(compareSqliteJsonValues(null, 1)).toBeLessThan(0);
+    expect(compareSqliteJsonValues(undefined, "a")).toBeLessThan(0);
+    expect(compareSqliteJsonValues(false, true)).toBeLessThan(0);
+    expect(compareSqliteJsonValues(2, "1")).toBeLessThan(0);
+    expect(compareSqliteJsonValues("10", "2")).toBeLessThan(0);
+
+    expect(matchesFilter({ value: { gt: 2 } }, { value: "1" })).toBe(true);
+    expect(matchesFilter({ value: { lt: "1" } }, { value: 2 })).toBe(true);
+  });
+
+  it("compares non-scalar values by their stored JSON shape", () => {
+    expect(
+      compareSqliteJsonValues({ z: 1, a: 2 }, { a: 2, z: 1 })
+    ).toBeGreaterThan(0);
+    expect(compareSqliteJsonValues({ $bytes: "user" }, { a: 1 })).toBeLessThan(
+      0
+    );
+    expect(
+      compareSqliteJsonValues(new Uint8Array([255]), new Uint8Array([1, 2, 3]))
+    ).toBeLessThan(0);
   });
 
   it("collapses _createdAt ordering to _id", () => {

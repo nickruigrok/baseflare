@@ -1,4 +1,4 @@
-import { generateId } from "baseflare/values";
+import { generateId, ValidationError } from "baseflare/values";
 import { describe, expect, it } from "vitest";
 
 import { deserialize } from "./deserialize";
@@ -41,5 +41,22 @@ describe("document serialization", () => {
     expect(deserialized.$bytes).toBe("i am a real string field");
     expect(deserialized.data).toEqual(new Uint8Array([9, 9]));
     expect(deserialized.$weird).toBe(1);
+  });
+
+  it("rejects non-finite numbers before JSON storage", () => {
+    expect(() => serialize({ value: Number.NaN })).toThrow(ValidationError);
+    expect(() => serialize({ value: Number.POSITIVE_INFINITY })).toThrow(
+      ValidationError
+    );
+    expect(() => serialize({ value: [1, Number.NEGATIVE_INFINITY] })).toThrow(
+      ValidationError
+    );
+    expect(() => serialize({ value: { nested: Number.NaN } })).toThrow(
+      ValidationError
+    );
+
+    expect(serialize({ value: 42 })).toEqual({
+      _data: JSON.stringify({ value: 42 }),
+    });
   });
 });

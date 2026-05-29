@@ -1,0 +1,33 @@
+export type RuntimeLogLevel = "error" | "info" | "warn";
+
+export function getRequestLogFields(request: Request): {
+  readonly method: string;
+  readonly pathname: string;
+} {
+  const url = new URL(request.url);
+  return { method: request.method, pathname: url.pathname };
+}
+
+export function logRuntimeEvent(
+  level: RuntimeLogLevel,
+  event: string,
+  fields: Record<string, unknown> = {}
+): void {
+  const payload = {
+    component: "baseflare-runtime",
+    event,
+    ...fields,
+  };
+
+  if (level === "error") {
+    console.error("baseflare-runtime", payload);
+    return;
+  }
+
+  if (level === "warn") {
+    console.warn("baseflare-runtime", payload);
+    return;
+  }
+
+  console.info("baseflare-runtime", payload);
+}

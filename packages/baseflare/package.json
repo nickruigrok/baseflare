@@ -34,10 +34,14 @@
   "scripts": {
     "build": "tsup --config tsup.config.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run",
+    "test": "vitest run --config vitest.unit.config.ts && vitest run --config vitest.runtime.config.ts",
     "clean": "rimraf dist"
   },
   "dependencies": {
     "uuidv7": "^1.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "0.11.0",
+    "@cloudflare/workers-types": "4.20260529.1"
   }
 }

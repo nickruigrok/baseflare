@@ -24,7 +24,7 @@ describe("defineSchema", () => {
     });
 
     expect(schema.toCreateStatements()).toEqual([
-      "CREATE TABLE todos (_id TEXT PRIMARY KEY, _data TEXT NOT NULL)",
+      "CREATE TABLE todos (_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0 CHECK(_rev >= 0))",
       "CREATE INDEX todos_by_completed ON todos (json_extract(_data, '$.completed'))",
     ]);
   });

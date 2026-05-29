@@ -8,7 +8,7 @@ Building a modern full-stack app requires stitching together a database, auth, f
 
 ### The Solution
 
-Baseflare is an open-source, Cloudflare-native Backend-as-a-Service. You define your schema and functions in TypeScript, and Baseflare deploys them as Cloudflare Workers with D1 (database), Durable Objects (real-time + scheduling), R2 (file storage), KV (idempotency), and Vectorize (vector search). Everything runs on your own Cloudflare account — no intermediary, no vendor lock-in, no per-seat pricing.
+Baseflare is an open-source, Cloudflare-native Backend-as-a-Service. You define your schema and functions in TypeScript, and Baseflare deploys them as Cloudflare Workers with D1 (database), Durable Objects (real-time + scheduling), R2 (file storage), and Vectorize (vector search). Everything runs on your own Cloudflare account — no intermediary, no vendor lock-in, no per-seat pricing.
 
 The developer experience matches Convex: define a schema, write query/mutation/action functions, import typed hooks in React, and get real-time reactive data out of the box. But instead of running on Convex's managed infrastructure at $25/seat/month, it runs on Cloudflare's global edge network starting at $0/month (free plan) or $5/month flat (paid plan, unlimited seats).
 
@@ -23,7 +23,7 @@ The developer experience matches Convex: define a schema, write query/mutation/a
 
 Convex proved the model — TypeScript functions with real-time subscriptions, typed client SDKs, and zero infrastructure management is the best developer experience for full-stack apps. But Convex is a managed service with per-seat pricing, single-region deployments, and no self-hosting option. Firebase has similar DX but Google's pricing is unpredictable and the SDK is bloated.
 
-Cloudflare's developer platform (Workers, D1, Durable Objects, R2, Vectorize, KV) is the most complete serverless infrastructure available — global edge deployment, zero cold starts, zero egress fees, generous free tier. But there's no framework that ties it all together into a cohesive BaaS experience. Developers are left wiring bindings, writing boilerplate, and solving the same problems (real-time, auth, permissions, schema management) from scratch.
+Cloudflare's developer platform (Workers, D1, Durable Objects, R2, Vectorize) is the most complete serverless infrastructure available — global edge deployment, zero cold starts, zero egress fees, generous free tier. But there's no framework that ties it all together into a cohesive BaaS experience. Developers are left wiring bindings, writing boilerplate, and solving the same problems (real-time, auth, permissions, schema management) from scratch.
 
 Baseflare bridges that gap: Convex's developer experience on Cloudflare's infrastructure. Open source, MIT licensed, deploy to your own account.
 
@@ -31,7 +31,7 @@ Baseflare bridges that gap: Convex's developer experience on Cloudflare's infras
 
 - **Convex-compatible API surface** — If you know Convex, you know Baseflare. Same `query()`, `mutation()`, `action()` pattern. Same `useQuery()`, `useMutation()` hooks. Same `_generated/api.ts` codegen. Migration is a find-and-replace on import paths.
 - **Zero infrastructure abstraction** — No control plane Worker, no system database, no management layer. The CLI talks directly to the Cloudflare API. Your app is just Workers + D1 + R2 + DOs. Nothing between you and the platform.
-- **Document model** — Every collection table stores `_id TEXT PRIMARY KEY, _data TEXT NOT NULL`. Schema validation at write time. No migrations for field changes. Only table creation and index changes touch D1.
+- **Document model** — Every collection table stores `_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0`. Schema validation at write time. No migrations for field changes. Only table creation and index changes touch D1.
 - **Deny-by-default permissions** — Built-in `defineRules()` with no access unless explicitly granted. Convex has no native permission system — developers roll their own. Baseflare has it out of the box.
 - **Actions can touch the database** — Unlike Convex, actions have direct `ctx.db` access (non-transactional). Less boilerplate for common patterns like "call API, save result." Use mutations when you need atomicity.
 - **No Hono, no wrangler** — Native Workers `fetch()` handler with path-based routing. CLI deploys via CF API directly. Minimal dependency surface.
@@ -92,7 +92,6 @@ Baseflare bridges that gap: Convex's developer experience on Cloudflare's infras
 | Vector search | Vectorize | CF-native vector database, works alongside D1 |
 | Scheduler | SchedulerDO (Alarms API) + Cron Triggers | DO Alarms for delayed execution (no time limit), Cron Triggers for recurring. Full job registry in DO SQLite. |
 | Secrets | Worker Secrets | Native CF encryption, no custom encryption layer |
-| KV | Cloudflare KV | Idempotency keys, fast reads |
 | Local dev | Miniflare (programmatic) | Full CF stack emulation, no wrangler dependency |
 | Auth | better-auth v1.6 | Native D1 support, per-request instance pattern |
 | Monorepo | Turborepo + pnpm workspaces | Industry standard, reliable dependency hoisting, wide ecosystem support |
@@ -156,7 +155,7 @@ npx baseflare export --env staging               # export data as JSON
 npx baseflare dashboard                          # starts local Vite dev server
 ```
 
-Only actual project resources (Workers, D1, R2, DO, Vectorize, KV) are deployed to Cloudflare. No management infrastructure, no system database, no extra Workers.
+Only actual project resources (Workers, D1, R2, DO, Vectorize) are deployed to Cloudflare. No management infrastructure, no system database, no extra Workers.
 
 **Authentication:**
 
@@ -317,7 +316,7 @@ npx baseflare deploy --env production
    export { SubscriptionDO } from 'baseflare/server'
    ```
 3. CLI deploys the Worker via Cloudflare Workers API (`PUT /client/v4/accounts/{id}/workers/scripts/{name}`)
-4. CLI applies table/index changes to D1 (create new collection tables, add/drop indexes — field changes are no-ops)
+4. CLI applies table/index changes to D1 before traffic reaches the Worker. `createWorker()` does not run DDL during requests.
 
 The Worker IS the code. No dynamic `import()`, no code bundles stored in a database. Cloudflare handles versioning and rollback natively.
 
@@ -356,7 +355,6 @@ const mf = new Miniflare({
   d1Databases: { APP_DB: 'bf-dev-db' },
   r2Buckets: { FILES: 'bf-dev-files' },
   durableObjects: { SUBSCRIPTIONS: 'SubscriptionDO' },
-  kvNamespaces: { IDEMPOTENCY: 'bf-dev-kv' },
 })
 ```
 
@@ -380,14 +378,15 @@ ID: "019078e5-d29f-7b00-8000-1a2b3c4d5e6f"  ← standard UUIDv7, time-sortable, 
 
 ### 1.8 Application Database (D1 — per-environment)
 
-Baseflare uses a **document model** on top of D1/SQLite. Each collection is a separate table with just two columns. Schema validation happens at write time in the Worker, not at the database level.
+Baseflare uses a **document model** on top of D1/SQLite. Each collection is a separate table with a small set of framework-managed columns. Schema validation happens at write time in the Worker, not at the database level.
 
 **Table structure (per collection):**
 
 ```sql
 CREATE TABLE todos (
-  _id TEXT PRIMARY KEY,  -- UUIDv7 string (contains timestamp)
-  _data TEXT NOT NULL      -- JSON document  -- JSON: {"text":"hello","completed":false,"orgId":"org1"}
+  _id TEXT PRIMARY KEY,        -- UUIDv7 string (contains timestamp)
+  _data TEXT NOT NULL,         -- JSON document: {"text":"hello","completed":false,"orgId":"org1"}
+  _rev INTEGER NOT NULL DEFAULT 0 CHECK(_rev >= 0) -- internal row revision
 );
 ```
 
@@ -402,7 +401,7 @@ CREATE INDEX todos_by_org ON todos (json_extract(_data, '$.orgId'));
 CREATE VIRTUAL TABLE todos_fts USING fts5(title, _id UNINDEXED);
 ```
 
-**Zero system tables.** The application D1 database contains only developer-defined collection tables and their indexes. Auth tables use the same document model (via custom better-auth adapter).
+**Internal runtime metadata.** User table and field names cannot start with `_`. Baseflare-owned tables use the reserved `_bf_` prefix. Phase 2 adds `_bf_table_versions` for mutation conflict detection; it is internal and never exposed through documents.
 
 **Why document model over column-per-field:**
 - Add/remove/rename fields → no migration, JSON is flexible
@@ -485,7 +484,6 @@ D1 has built-in Time Travel — point-in-time recovery for the last 30 days. No 
 | Cron triggers | Cron Trigger | Bound to environment Worker |
 | Vector search | Vectorize index | One per environment (if vector fields in schema) |
 | Secrets | Worker Secrets | Native CF encryption |
-| Idempotency keys | KV namespace | Fast reads, TTL support |
 | Environment Worker | Worker script | One per environment |
 | Dashboard | Local Vite dev server | `npx baseflare dashboard` |
 
@@ -546,7 +544,7 @@ packages/baseflare/src/server/
   db/             → query builder (json_extract() SQL), write validation, document serialization, DatabaseReader, DatabaseWriter
   permissions/    → permission engine (defineRules, evaluate)
   http/           → httpAction(), httpRouter(), HttpRouter
-  runtime/        → Phase 2+: createWorker(), D1Adapter, SubscriptionDO, SchedulerDO, R2StorageAdapter, VectorizeAdapter
+  runtime/        → Phase 2+: createWorker(), D1 runtime, SubscriptionDO, SchedulerDO, R2StorageAdapter, VectorizeAdapter
   auth/           → Phase 5+: defineAuth(), better-auth document adapter, auth manager
 ```
 
@@ -708,7 +706,7 @@ const createdAt = getCreatedAtFromId(id)
 **Package:** `baseflare/server` (runtime layer added on top of Phase 1 core logic)
 
 **Deliverables:**
-1. D1 database adapter — implements `DatabaseReader` and `DatabaseWriter` using `env.DB.prepare()`
+1. Internal D1 database adapter — implements `DatabaseReader` and `DatabaseWriter` using `env.APP_DB.prepare()`
    - `ctx.db.get(table, id)` — primary key lookup, deserialize document
    - `ctx.db.insert(table, doc)` — validate, serialize, INSERT, return `_id`
    - `ctx.db.patch(table, id, partial)` — shallow merge, `undefined` removes field, validate result
@@ -716,18 +714,22 @@ const createdAt = getCreatedAtFromId(id)
    - `ctx.db.delete(table, id)` — DELETE by `_id`
    - `ctx.db.query(table)` — returns QueryBuilder with `.filter()`, `.order()`, `.limit()`, `.first()`, `.unique()`, `.take(n)`, `.count()`, `.collect()`, `.paginate()`
 2. Worker entry point factory (`createWorker()`) — native `fetch()` handler with path-based routing
-3. RPC routes: `POST /api/query/:name`, `POST /api/mutation/:name`, `POST /api/action/:name`
+3. RPC routes: `POST /api/query/:name`, `POST /api/mutation/:name`, `POST /api/action/:name`; bodies must be exact JSON objects shaped as `{ "args": ... }`
 4. Internal function routing — `internalQuery`/`internalMutation`/`internalAction` not exposed via RPC, only callable via `ctx.runQuery()`/`ctx.runMutation()`/`ctx.runAction()`
-5. Action context — `ActionCtx` with `db` (non-transactional), `runQuery`, `runMutation`, `runAction`, `scheduler`, `storage`, `auth`, `vectorSearch`, `once`
+5. Action context — `ActionCtx` with `db` (non-transactional), `runQuery`, `runMutation`, `runAction`, `scheduler`, `storage`, `auth`
 6. Mutation context — `MutationCtx` with `db`, `auth`, `storage`, `scheduler`, `runQuery`
 7. Auth token extraction from headers, `ctx.auth` population
 8. Permission enforcement on every operation
-9. Collection table/index creation in D1 on deploy (document tables with `_id` and `_data` columns + `json_extract()` indexes)
-10. Transaction support via `env.DB.batch()`
+9. Collection table/index creation in D1 on deploy (document tables with `_id`, `_data`, `_rev` columns + `json_extract()` indexes); schema application is deploy-owned and never runs inside `createWorker()`
+10. Transaction support via `env.APP_DB.batch()`
 11. Document serialization/deserialization (plain objects ↔ JSON `_data`)
 12. Write-time schema validation + return value validation
-13. `ctx.once(key)` — check/store in KV with TTL, prevents duplicate execution in actions
-14. `BaseflareError<T>` propagation — typed errors surface to client with structured data
+13. `BaseflareError<T>` propagation — typed errors surface to client with structured data
+14. `createWorker(manifest)` accepts a `BaseflareManifest` with `schema`, optional `config`, discovered function entries, optional `rules`, and optional `http`; canonical function ids are derived from module path + export name and duplicate ids fail during manifest build
+15. Runtime-produced RPC failures use a fixed taxonomy: `VALIDATION_ERROR`, `UNAUTHORIZED`, `PERMISSION_DENIED`, `NOT_FOUND`, `MALFORMED_DOCUMENT`, `DATABASE_ERROR`, `NOT_IMPLEMENTED`, `CONFLICT`, `INTERNAL_ERROR`; database details are logged internally and sanitized from client envelopes
+16. Mutation-scoped read-your-writes use selective SQL scanning plus `_id`-based overlay reconciliation instead of full-table hydration; broad mutation queries are guarded by internal scan budgets
+17. Mutations use a serializable-by-retry concurrency model on D1; point reads track row `_rev`, query reads track `_bf_table_versions.version`, and retryable conflicts rerun deterministic mutation handlers within a bounded retry policy
+18. Baseflare does not provide built-in duplicate-execution protection. Side-effectful work belongs in actions, and duplicate handling is application-managed around the specific external system or table that needs it.
 
 **"Done" criteria:**
 ```bash
@@ -741,15 +743,14 @@ curl -X POST http://localhost:4510/api/mutation/todos:create \
 # Returns: {"result":{"_id":"3x7kp2mn...","text":"hello","completed":false}}
 
 # Call a query
-curl http://localhost:4510/api/query/todos:list
+curl -X POST http://localhost:4510/api/query/todos:list \
+  -H "Content-Type: application/json" \
+  -d '{"args":{}}'
 # Returns: {"result":[{"_id":"...","text":"hello","completed":false}]}
 
 # Permission denied for wrong org
 # Returns: {"error":{"code":"PERMISSION_DENIED"}}
 
-# ctx.once() throws on duplicate execution (idempotency guard)
-# First call with key 'charge-123' → passes, key stored in KV with TTL
-# Second call with same key → throws (already executed)
 ```
 
 ### Phase 3: Real-Time (Durable Objects) (3 weeks)
@@ -843,7 +844,7 @@ Each environment has one `SubscriptionDO` instance (singleton per environment, a
 3. OAuth client — PKCE flow, localhost callback server (port 8976), token refresh, named profiles in `~/.baseflare/credentials.json`
 4. Lazy config resolver — checks `baseflare.config.ts` + `.env.local`, prompts for missing values (profile, account, project name), writes files on first resolution
 4. Cloudflare API client for resource provisioning:
-   - Create/delete Workers, D1 databases, R2 buckets, DO namespaces, KV namespaces, Vectorize indexes
+   - Create/delete Workers, D1 databases, R2 buckets, DO namespaces, and Vectorize indexes
    - List environments by querying CF API for `bf-{project}-*` resources
 
 **"Done" criteria:**
@@ -1466,7 +1467,6 @@ interface ActionCtx {
   runQuery(ref, args): Promise<T>;
   runMutation(ref, args): Promise<T>;
   runAction(ref, args): Promise<T>;
-  once(key: string): Promise<void>;  // idempotency via KV
 }
 
 // DatabaseReader
@@ -1555,7 +1555,6 @@ export class SubscriptionDO implements DurableObject { ... }
     { name: 'SCHEDULER', class_name: 'SchedulerDO' },
   ] },
   vectorize: [{ binding: 'VECTORS', index_name: '...' }],
-  kv_namespaces: [{ binding: 'IDEMPOTENCY', id: '...' }],
 }
 ```
 
@@ -1640,11 +1639,16 @@ Deferred. Will provide `createTestCtx()`, mock utilities, and subscription track
 
 ### 6.1 Server Internals: Pure Logic ↔ Runtime
 
-The Worker creates adapter instances from CF bindings and passes them to core logic:
+The Worker creates internal adapter instances from CF bindings and passes them to core logic. These adapters are runtime plumbing, not public APIs:
 
 ```typescript
 // Inside Worker request handler
-const db = new D1Adapter(env.APP_DB)
+const db = new D1DatabaseAdapter({
+  database: env.APP_DB,
+  getContext: () => ctx,
+  schema,
+  rules,
+})
 const storage = new R2StorageAdapter(env.FILES)
 const vectors = new VectorizeAdapter(env.VECTORS)
 
@@ -1786,9 +1790,9 @@ These tests span multiple packages and define end-to-end correctness. They must 
 4. Call query without token — `ctx.auth` is null
 5. Permission rule denies unauthenticated access
 
-### 7.7 Idempotency
-1. Action calls `ctx.once('charge-123')` — passes (key stored in KV with TTL)
-2. Same action calls `ctx.once('charge-123')` again — throws (already executed)
+### 7.7 Application-Managed Duplicate Handling
+1. Side-effectful work runs in actions, which are not retried by the runtime
+2. Apps that need duplicate handling store their own operation keys/results in app tables or the external system they call
 
 ### 7.8 Environment Isolation
 1. Deploy to "staging" and "production" environments
@@ -1861,8 +1865,6 @@ These tests span multiple packages and define end-to-end correctness. They must 
 2. Action handler accesses `ctx.runMutation(internal.todos.create, args)` — works
 3. Action handler accesses `ctx.db.query('todos')` — works (non-transactional, each op independent)
 4. Action handler accesses `ctx.db.insert('todos', doc)` + `ctx.db.insert('logs', doc)` — both succeed independently (not atomic)
-5. Action calls `ctx.once('charge-123')` first time — passes (key stored in KV)
-6. Action calls `ctx.once('charge-123')` second time — throws (already executed)
 
 ### 7.18 Return Value Validation
 1. Query with `returns: v.string()` returns a string — passes
@@ -1976,7 +1978,6 @@ Internal system errors (permission denied, validation, schema errors) use `Error
 | Vector search | Vectorize (sidecar) | D1 doesn't support native vectors |
 | Scheduler | SchedulerDO (Alarms + SQLite) for scheduled functions, CF Cron Triggers for recurring | No time limit, full job history, cancel support |
 | Secrets | Worker Secrets | CF-managed encryption |
-| Idempotency | KV | Fast reads, native TTL |
 | Local dev | Miniflare (programmatic) | Full control, no wrangler dependency |
 | Auth | better-auth v1.6 via custom document adapter + `defineAuth()` | Consistent document model for all tables, 1:1 better-auth config passthrough |
 | Deploy | CF Workers API | No wrangler CLI dependency |

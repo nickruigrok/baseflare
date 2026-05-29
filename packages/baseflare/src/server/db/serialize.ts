@@ -1,3 +1,5 @@
+import { ValidationError } from "baseflare/values";
+
 const BYTES_MARKER = "$bytes";
 const RESERVED_DOCUMENT_FIELDS = new Set(["_id", "_createdAt"]);
 
@@ -6,9 +8,16 @@ function escapeKey(key: string): string {
   return key.startsWith("$") ? `$${key}` : key;
 }
 
-function toStorageValue(value: unknown): unknown {
+export function toStorageValue(value: unknown): unknown {
   if (value instanceof Uint8Array) {
     return { [BYTES_MARKER]: Buffer.from(value).toString("base64") };
+  }
+
+  if (typeof value === "number" && !Number.isFinite(value)) {
+    throw new ValidationError(
+      "value",
+      "Stored document values must not contain NaN or infinity"
+    );
   }
 
   if (Array.isArray(value)) {

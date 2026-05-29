@@ -1,0 +1,956 @@
+import { generateId, getCreatedMsFromId } from "baseflare/values";
+
+import { type CursorPayload, decodeCursor, encodeCursor } from "../db/cursor";
+import {
+  assertQueryField,
+  compareSqliteJsonValues,
+  type FilterObject,
+  matchesFilter,
+} from "../db/filters";
+import type { QueryState } from "../db/query-builder";
+import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
+import { serialize } from "../db/serialize";
+import {
+  validateInsertData,
+  validatePatchData,
+  validateReplaceData,
+} from "../db/write-validation";
+import type { DatabaseWriter } from "../db/writer";
+import type { MutationCtx } from "../functions/types";
+import type { Rules } from "../permissions/types";
+import { type Schema, TABLE_VERSION_TABLE_NAME } from "../schema/types";
+
+import {
+  assertKnownTable,
+  assertWithinScanBudget,
+  bindStatement,
+  buildRuntimeSelectQuery,
+  createTableVersionBump,
+  deserializeRuntimeDocument,
+  executeRowQuery,
+  fetchVersionedDocument,
+  type RuntimeDocument,
+  type StoredDocumentRow,
+} from "./d1";
+import {
+  ConflictRuntimeError,
+  coerceDatabaseError,
+  coerceValidationError,
+  InternalRuntimeError,
+  NotFoundRuntimeError,
+} from "./errors";
+import { logRuntimeEvent } from "./logging";
+import {
+  assertCanDelete,
+  assertCanInsert,
+  assertCanUpdate,
+  canReadDocument,
+} from "./permissions";
+import type { D1Database, D1Result } from "./types";
+
+type SessionDatabase = Pick<D1Database, "batch" | "prepare">;
+
+interface PendingMutationWrite {
+  readonly baseRev?: number;
+  readonly document?: RuntimeDocument;
+  readonly serializedData?: string;
+  readonly type: "delete" | "insert" | "update";
+}
+
+type CommitOperation =
+  | {
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+      readonly type: "assert-row-revision" | "assert-table-version";
+    }
+  | {
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+      readonly type: "bump-table-version" | "delete" | "insert" | "update";
+    };
+
+const MUTATION_QUERY_CHUNK_SIZE = 256;
+
+function createBaseQueryState(): QueryState {
+  return { order: { field: "_id", direction: "asc" } };
+}
+
+function mergeFilters(
+  left: FilterObject | undefined,
+  right: FilterObject
+): FilterObject {
+  return left ? { AND: [left, right] } : right;
+}
+
+function assertDirection(value: string): asserts value is QueryOrderDirection {
+  if (value !== "asc" && value !== "desc") {
+    throw new Error(
+      `Order direction must be "asc" or "desc", received "${value}"`
+    );
+  }
+}
+
+function normalizeOrderField(field: string): string {
+  if (field === "_id" || field === "_createdAt") {
+    return "_id";
+  }
+
+  assertQueryField(field);
+  return field;
+}
+
+function hasCommittedEffect(write: PendingMutationWrite): boolean {
+  return (
+    write.type === "insert" ||
+    write.type === "update" ||
+    write.baseRev !== undefined
+  );
+}
+
+function compareDocuments(
+  left: RuntimeDocument,
+  right: RuntimeDocument,
+  state: QueryState
+): number {
+  let comparison =
+    state.order.field === "_id"
+      ? compareSqliteJsonValues(left._id, right._id)
+      : compareSqliteJsonValues(
+          left[state.order.field],
+          right[state.order.field]
+        );
+
+  if (comparison === 0 && state.order.field !== "_id") {
+    comparison = compareSqliteJsonValues(left._id, right._id);
+  }
+
+  return state.order.direction === "asc" ? comparison : -comparison;
+}
+
+function isAfterCursor(
+  document: RuntimeDocument,
+  cursor: CursorPayload
+): boolean {
+  const cursorDocument: RuntimeDocument = {
+    _id: cursor.id,
+    _createdAt: getCreatedMsFromId(cursor.id),
+    ...(cursor.v === undefined ? {} : { [cursor.orderField]: cursor.v }),
+  };
+
+  return (
+    compareDocuments(document, cursorDocument, {
+      order: {
+        field: cursor.orderField,
+        direction: cursor.orderDirection,
+      },
+    }) > 0
+  );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+function getRetryDelayMs(attempt: number): number {
+  return 5 * 2 ** attempt + Math.floor(Math.random() * 5);
+}
+
+function isRetryableConflict(error: unknown): boolean {
+  return (
+    error instanceof RetryableMutationConflictError ||
+    (error instanceof Error &&
+      error.message.includes(
+        `UNIQUE constraint failed: ${TABLE_VERSION_TABLE_NAME}.table_name`
+      ))
+  );
+}
+
+class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
+  private readonly database: MutationDatabase;
+  private readonly state: QueryState;
+  private readonly tableName: string;
+
+  constructor(
+    database: MutationDatabase,
+    tableName: string,
+    state: QueryState = createBaseQueryState()
+  ) {
+    this.database = database;
+    this.tableName = tableName;
+    this.state = state;
+  }
+
+  filter(filter: FilterObject): QueryBuilder<RuntimeDocument> {
+    return this.clone({ filter: mergeFilters(this.state.filter, filter) });
+  }
+
+  order(direction: QueryOrderDirection): QueryBuilder<RuntimeDocument>;
+  order(
+    field: string,
+    direction: QueryOrderDirection
+  ): QueryBuilder<RuntimeDocument>;
+  order(
+    fieldOrDirection: string,
+    maybeDirection?: QueryOrderDirection
+  ): QueryBuilder<RuntimeDocument> {
+    if (maybeDirection === undefined) {
+      assertDirection(fieldOrDirection);
+      return this.clone({
+        order: { field: "_id", direction: fieldOrDirection },
+      });
+    }
+
+    assertDirection(maybeDirection);
+    return this.clone({
+      order: {
+        field: normalizeOrderField(fieldOrDirection),
+        direction: maybeDirection,
+      },
+    });
+  }
+
+  limit(limit: number): QueryBuilder<RuntimeDocument> {
+    if (!Number.isInteger(limit) || limit < 0) {
+      throw new Error("Query limits must be a non-negative integer");
+    }
+
+    return this.clone({ limit });
+  }
+
+  collect(): Promise<RuntimeDocument[]> {
+    return this.database.collectQuery(this.tableName, this.state, null);
+  }
+
+  async first(): Promise<RuntimeDocument | null> {
+    return (await this.clone({ limit: 1 }).collect())[0] ?? null;
+  }
+
+  async unique(): Promise<RuntimeDocument> {
+    const documents = await this.clone({ limit: 2 }).collect();
+    if (documents.length !== 1) {
+      throw new Error(
+        `Expected exactly one document, received ${documents.length}`
+      );
+    }
+
+    const document = documents[0];
+    if (!document) {
+      throw new Error("Expected a document but none was returned");
+    }
+
+    return document;
+  }
+
+  take(count: number): Promise<RuntimeDocument[]> {
+    return this.limit(count).collect();
+  }
+
+  async count(): Promise<number> {
+    return (await this.database.collectQuery(this.tableName, this.state, null))
+      .length;
+  }
+
+  async paginate(options: {
+    cursor: string | null;
+    numItems: number;
+  }): Promise<{
+    continueCursor: string;
+    isDone: boolean;
+    page: RuntimeDocument[];
+  }> {
+    if (!Number.isInteger(options.numItems) || options.numItems <= 0) {
+      throw new Error("Pagination requires a positive integer numItems value");
+    }
+
+    const cursor = options.cursor
+      ? decodeCursor(options.cursor, this.state.order)
+      : null;
+    const documents = await this.database.collectQuery(
+      this.tableName,
+      {
+        ...this.state,
+        limit: options.numItems + 1,
+      },
+      cursor
+    );
+    const page = documents.slice(0, options.numItems);
+    const lastDocument = page.at(-1);
+
+    return {
+      continueCursor: lastDocument
+        ? encodeCursor(this.state.order, lastDocument)
+        : (options.cursor ?? ""),
+      isDone: documents.length <= options.numItems,
+      page,
+    };
+  }
+
+  private clone(partial: Partial<QueryState>): MutationQueryBuilder {
+    return new MutationQueryBuilder(this.database, this.tableName, {
+      ...this.state,
+      ...partial,
+    });
+  }
+}
+
+export class RetryableMutationConflictError extends Error {
+  constructor(message = "Mutation commit conflicted with a concurrent write") {
+    super(message);
+    this.name = "RetryableMutationConflictError";
+  }
+}
+
+export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
+  private readonly database: SessionDatabase;
+  private readonly functionName?: string;
+  private readonly getContext: () => MutationCtx;
+  private readonly pendingWrites = new Map<
+    string,
+    Map<string, PendingMutationWrite>
+  >();
+  private readonly rowReadRevisions = new Map<string, Map<string, number>>();
+  private readonly rules?: Rules;
+  private readonly schema: Schema;
+  private readonly tableReadVersions = new Map<string, number>();
+
+  constructor(options: {
+    database: SessionDatabase;
+    functionName?: string;
+    getContext: () => MutationCtx;
+    rules?: Rules;
+    schema: Schema;
+  }) {
+    this.database = options.database;
+    this.functionName = options.functionName;
+    this.getContext = options.getContext;
+    this.rules = options.rules;
+    this.schema = options.schema;
+  }
+
+  async commit(): Promise<void> {
+    const operations = this.buildCommitOperations();
+    if (operations.length === 0) {
+      return;
+    }
+
+    const statements = operations.map((operation) =>
+      bindStatement(
+        this.database as D1Database,
+        operation.sql,
+        operation.params
+      )
+    );
+
+    try {
+      const results = await this.database.batch(statements);
+      this.validateCommitResults(operations, results);
+    } catch (error) {
+      if (isRetryableConflict(error)) {
+        throw new RetryableMutationConflictError();
+      }
+
+      coerceDatabaseError(error, "Failed to commit mutation transaction");
+    }
+  }
+
+  async get(tableName: string, id: string): Promise<RuntimeDocument | null> {
+    assertKnownTable(this.schema, tableName);
+
+    const pendingWrite = this.getPendingWrite(tableName, id);
+    if (pendingWrite) {
+      if (pendingWrite.type === "delete") {
+        return null;
+      }
+
+      const document = this.requirePendingDocument(tableName, id, pendingWrite);
+      return (await this.canRead(tableName, document)) ? document : null;
+    }
+
+    const existing = await fetchVersionedDocument(
+      this.database as D1Database,
+      tableName,
+      id
+    );
+    if (!existing) {
+      await this.recordTableRead(tableName);
+      return null;
+    }
+
+    this.recordRowRead(tableName, id, existing.rev);
+    return (await this.canRead(tableName, existing.document))
+      ? existing.document
+      : null;
+  }
+
+  query(tableName: string): QueryBuilder<RuntimeDocument> {
+    assertKnownTable(this.schema, tableName);
+    return new MutationQueryBuilder(this, tableName);
+  }
+
+  async insert(
+    tableName: string,
+    doc: Record<string, unknown>
+  ): Promise<string> {
+    const table = assertKnownTable(this.schema, tableName);
+    const validated = this.validateInsert(table, doc);
+    await assertCanInsert(this.rules, tableName, this.getContext(), validated);
+
+    const id = generateId();
+    this.setPendingWrite(tableName, id, {
+      type: "insert",
+      document: this.createRuntimeDocument(id, validated),
+      serializedData: serialize(validated)._data,
+    });
+
+    return id;
+  }
+
+  async patch(
+    tableName: string,
+    id: string,
+    partial: Record<string, unknown>
+  ): Promise<void> {
+    const table = assertKnownTable(this.schema, tableName);
+    const existing = await this.getWritableDocument(tableName, id);
+    const validated = this.validatePatch(table, existing.document, partial);
+    await assertCanUpdate(
+      this.rules,
+      tableName,
+      this.getContext(),
+      existing.document,
+      validated
+    );
+
+    this.setPendingWrite(
+      tableName,
+      id,
+      this.createUpdatedWrite(existing.baseRev, existing.write, id, validated)
+    );
+  }
+
+  async replace(
+    tableName: string,
+    id: string,
+    doc: Record<string, unknown>
+  ): Promise<void> {
+    const table = assertKnownTable(this.schema, tableName);
+    const existing = await this.getWritableDocument(tableName, id);
+    const validated = this.validateReplace(table, doc);
+    await assertCanUpdate(
+      this.rules,
+      tableName,
+      this.getContext(),
+      existing.document,
+      validated
+    );
+
+    this.setPendingWrite(
+      tableName,
+      id,
+      this.createUpdatedWrite(existing.baseRev, existing.write, id, validated)
+    );
+  }
+
+  async delete(tableName: string, id: string): Promise<void> {
+    assertKnownTable(this.schema, tableName);
+    const existing = await this.getWritableDocument(tableName, id);
+    await assertCanDelete(
+      this.rules,
+      tableName,
+      this.getContext(),
+      existing.document
+    );
+
+    if (existing.write?.type === "insert") {
+      this.setPendingWrite(tableName, id, { type: "delete" });
+      return;
+    }
+
+    this.setPendingWrite(tableName, id, {
+      type: "delete",
+      baseRev: existing.write?.baseRev ?? existing.baseRev,
+    });
+  }
+
+  async collectQuery(
+    tableName: string,
+    state: QueryState,
+    cursor: CursorPayload | null
+  ): Promise<RuntimeDocument[]> {
+    await this.recordTableRead(tableName);
+    const baseDocuments = await this.collectBaseDocuments(
+      tableName,
+      state,
+      cursor
+    );
+    const shadowedIds = this.getShadowedIds(tableName);
+    const documents = baseDocuments.filter((doc) => !shadowedIds.has(doc._id));
+
+    for (const document of await this.getReadableOverlayDocuments(
+      tableName,
+      state,
+      cursor
+    )) {
+      documents.push(document);
+    }
+
+    documents.sort((left, right) => compareDocuments(left, right, state));
+    return state.limit === undefined
+      ? documents
+      : documents.slice(0, state.limit);
+  }
+
+  private async collectBaseDocuments(
+    tableName: string,
+    state: QueryState,
+    cursor: CursorPayload | null
+  ): Promise<RuntimeDocument[]> {
+    const documents: RuntimeDocument[] = [];
+    let offset = 0;
+    let scannedBytes = 0;
+    let scannedRows = 0;
+
+    while (true) {
+      const rows = await executeRowQuery<StoredDocumentRow>(
+        this.database as D1Database,
+        buildRuntimeSelectQuery(tableName, state, {
+          cursor,
+          limit: MUTATION_QUERY_CHUNK_SIZE,
+          offset,
+        })
+      );
+      if (rows.length === 0) {
+        break;
+      }
+
+      offset += rows.length;
+      for (const row of rows) {
+        scannedRows += 1;
+        scannedBytes += row._data.length;
+        assertWithinScanBudget(scannedRows, scannedBytes);
+
+        const document = deserializeRuntimeDocument(tableName, row);
+        if (await this.canRead(tableName, document)) {
+          documents.push(document);
+        }
+      }
+
+      if (rows.length < MUTATION_QUERY_CHUNK_SIZE) {
+        break;
+      }
+    }
+
+    return documents;
+  }
+
+  private async getReadableOverlayDocuments(
+    tableName: string,
+    state: QueryState,
+    cursor: CursorPayload | null
+  ): Promise<RuntimeDocument[]> {
+    const writes = this.pendingWrites.get(tableName);
+    if (!writes) {
+      return [];
+    }
+
+    const documents: RuntimeDocument[] = [];
+    for (const write of writes.values()) {
+      if (write.type === "delete" || !write.document) {
+        continue;
+      }
+
+      if (!matchesFilter(state.filter, write.document)) {
+        continue;
+      }
+
+      if (cursor && !isAfterCursor(write.document, cursor)) {
+        continue;
+      }
+
+      if (await this.canRead(tableName, write.document)) {
+        documents.push(write.document);
+      }
+    }
+
+    return documents;
+  }
+
+  private buildCommitOperations(): CommitOperation[] {
+    const operations: CommitOperation[] = [];
+    const mutatedTables = new Set<string>();
+
+    this.appendTableVersionAssertions(operations);
+    this.appendRowReadAssertions(operations);
+    this.appendWriteStatements(operations, mutatedTables);
+    this.appendTableVersionBumps(operations, mutatedTables);
+
+    return operations;
+  }
+
+  private createRuntimeDocument(
+    id: string,
+    document: Record<string, unknown>
+  ): RuntimeDocument {
+    return {
+      ...document,
+      _id: id,
+      _createdAt: getCreatedMsFromId(id),
+    };
+  }
+
+  private createUpdatedWrite(
+    baseRev: number | undefined,
+    existingWrite: PendingMutationWrite | undefined,
+    id: string,
+    document: Record<string, unknown>
+  ): PendingMutationWrite {
+    const runtimeDocument = this.createRuntimeDocument(id, document);
+    const serializedData = serialize(document)._data;
+
+    if (existingWrite?.type === "insert") {
+      return { type: "insert", document: runtimeDocument, serializedData };
+    }
+
+    return {
+      type: "update",
+      baseRev: existingWrite?.baseRev ?? baseRev,
+      document: runtimeDocument,
+      serializedData,
+    };
+  }
+
+  private canRead(
+    tableName: string,
+    document: RuntimeDocument
+  ): Promise<boolean> {
+    return canReadDocument(this.rules, tableName, this.getContext(), document);
+  }
+
+  private validateInsert(
+    table: Parameters<typeof validateInsertData>[0],
+    value: Record<string, unknown>
+  ): Record<string, unknown> {
+    try {
+      return validateInsertData(table, value);
+    } catch (error) {
+      coerceValidationError(error, "Invalid insert document");
+    }
+  }
+
+  private validatePatch(
+    table: Parameters<typeof validatePatchData>[0],
+    current: Record<string, unknown>,
+    patch: Record<string, unknown>
+  ): Record<string, unknown> {
+    try {
+      return validatePatchData(table, current, patch);
+    } catch (error) {
+      coerceValidationError(error, "Invalid patch document");
+    }
+  }
+
+  private validateReplace(
+    table: Parameters<typeof validateReplaceData>[0],
+    value: Record<string, unknown>
+  ): Record<string, unknown> {
+    try {
+      return validateReplaceData(table, value);
+    } catch (error) {
+      coerceValidationError(error, "Invalid replacement document");
+    }
+  }
+
+  private getPendingWrite(
+    tableName: string,
+    id: string
+  ): PendingMutationWrite | undefined {
+    return this.pendingWrites.get(tableName)?.get(id);
+  }
+
+  private setPendingWrite(
+    tableName: string,
+    id: string,
+    write: PendingMutationWrite
+  ): void {
+    const writes =
+      this.pendingWrites.get(tableName) ??
+      new Map<string, PendingMutationWrite>();
+    writes.set(id, write);
+    this.pendingWrites.set(tableName, writes);
+  }
+
+  private async getWritableDocument(
+    tableName: string,
+    id: string
+  ): Promise<{
+    readonly baseRev?: number;
+    readonly document: RuntimeDocument;
+    readonly write?: PendingMutationWrite;
+  }> {
+    const pendingWrite = this.getPendingWrite(tableName, id);
+    if (pendingWrite) {
+      if (pendingWrite.type === "delete") {
+        throw new NotFoundRuntimeError(
+          `Document "${id}" was not found in table "${tableName}"`
+        );
+      }
+
+      return {
+        baseRev: pendingWrite.baseRev,
+        document: this.requirePendingDocument(tableName, id, pendingWrite),
+        write: pendingWrite,
+      };
+    }
+
+    const existing = await fetchVersionedDocument(
+      this.database as D1Database,
+      tableName,
+      id
+    );
+    if (!existing) {
+      await this.recordTableRead(tableName);
+      throw new NotFoundRuntimeError(
+        `Document "${id}" was not found in table "${tableName}"`
+      );
+    }
+
+    this.recordRowRead(tableName, id, existing.rev);
+    return { baseRev: existing.rev, document: existing.document };
+  }
+
+  private getShadowedIds(tableName: string): Set<string> {
+    const writes = this.pendingWrites.get(tableName);
+    return writes ? new Set(writes.keys()) : new Set();
+  }
+
+  private appendTableVersionAssertions(operations: CommitOperation[]): void {
+    for (const [tableName, expectedVersion] of this.tableReadVersions) {
+      operations.push({
+        type: "assert-table-version",
+        sql: `INSERT INTO ${TABLE_VERSION_TABLE_NAME} (table_name, version)
+              SELECT ?, 0
+              WHERE COALESCE(
+                (SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ?),
+                -1
+              ) <> ?`,
+        params: [tableName, tableName, expectedVersion],
+      });
+    }
+  }
+
+  private appendRowReadAssertions(operations: CommitOperation[]): void {
+    for (const [tableName, reads] of this.rowReadRevisions) {
+      for (const [id, rev] of reads) {
+        operations.push({
+          type: "assert-row-revision",
+          sql: `INSERT INTO ${TABLE_VERSION_TABLE_NAME} (table_name, version)
+                SELECT ?, 0
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM ${tableName} WHERE _id = ? AND _rev = ?
+                )`,
+          params: [tableName, id, rev],
+        });
+      }
+    }
+  }
+
+  private appendWriteStatements(
+    operations: CommitOperation[],
+    mutatedTables: Set<string>
+  ): void {
+    for (const [tableName, writes] of this.pendingWrites) {
+      for (const [id, write] of writes) {
+        if (!hasCommittedEffect(write)) {
+          continue;
+        }
+
+        mutatedTables.add(tableName);
+        operations.push(this.createWriteOperation(tableName, id, write));
+      }
+    }
+  }
+
+  private appendTableVersionBumps(
+    operations: CommitOperation[],
+    mutatedTables: Set<string>
+  ): void {
+    for (const tableName of mutatedTables) {
+      operations.push({
+        type: "bump-table-version",
+        ...createTableVersionBump(tableName),
+      });
+    }
+  }
+
+  private createWriteOperation(
+    tableName: string,
+    id: string,
+    write: PendingMutationWrite
+  ): CommitOperation {
+    if (write.type === "insert") {
+      return {
+        type: "insert",
+        sql: `INSERT INTO ${tableName} (_id, _data, _rev) VALUES (?, ?, 0)`,
+        params: [id, write.serializedData ?? ""],
+      };
+    }
+
+    if (write.type === "update") {
+      return {
+        type: "update",
+        sql: `UPDATE ${tableName}
+              SET _data = ?, _rev = _rev + 1
+              WHERE _id = ? AND _rev = ?`,
+        params: [write.serializedData ?? "", id, write.baseRev ?? -1],
+      };
+    }
+
+    return {
+      type: "delete",
+      sql: `DELETE FROM ${tableName} WHERE _id = ? AND _rev = ?`,
+      params: [id, write.baseRev ?? -1],
+    };
+  }
+
+  private validateCommitResults(
+    operations: readonly CommitOperation[],
+    results: readonly D1Result[]
+  ): void {
+    if (results.length !== operations.length) {
+      throw new InternalRuntimeError(
+        "Mutation commit returned an unexpected number of D1 results"
+      );
+    }
+
+    for (const [index, operation] of operations.entries()) {
+      const result = results[index];
+      if (!result?.success) {
+        throw new InternalRuntimeError(
+          "Mutation commit reported an unsuccessful D1 result"
+        );
+      }
+
+      const changes = result.meta?.changes;
+      if (changes === undefined) {
+        continue;
+      }
+
+      if (
+        (operation.type === "update" ||
+          operation.type === "delete" ||
+          operation.type === "bump-table-version") &&
+        changes !== 1
+      ) {
+        throw new RetryableMutationConflictError();
+      }
+
+      if (
+        (operation.type === "assert-row-revision" ||
+          operation.type === "assert-table-version") &&
+        changes > 0
+      ) {
+        throw new RetryableMutationConflictError();
+      }
+    }
+  }
+
+  private requirePendingDocument(
+    tableName: string,
+    id: string,
+    write: PendingMutationWrite
+  ): RuntimeDocument {
+    if (!write.document) {
+      throw new InternalRuntimeError(
+        `Pending write for "${tableName}/${id}" is missing its document state`
+      );
+    }
+
+    return write.document;
+  }
+
+  private async recordTableRead(tableName: string): Promise<void> {
+    const rows = await executeRowQuery<{ version: number }>(
+      this.database as D1Database,
+      {
+        sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
+        params: [tableName],
+      }
+    );
+    const version = rows[0]?.version;
+    if (typeof version !== "number") {
+      throw new InternalRuntimeError(
+        `Missing internal table version row for "${tableName}"`
+      );
+    }
+
+    const existing = this.tableReadVersions.get(tableName);
+    if (existing === undefined) {
+      this.tableReadVersions.set(tableName, version);
+      return;
+    }
+
+    if (existing !== version) {
+      throw new RetryableMutationConflictError();
+    }
+  }
+
+  private recordRowRead(tableName: string, id: string, rev: number): void {
+    const reads =
+      this.rowReadRevisions.get(tableName) ?? new Map<string, number>();
+    const existing = reads.get(id);
+    if (existing !== undefined && existing !== rev) {
+      throw new RetryableMutationConflictError();
+    }
+
+    reads.set(id, rev);
+    this.rowReadRevisions.set(tableName, reads);
+  }
+}
+
+export function createMutationDatabaseSession(
+  database: D1Database
+): SessionDatabase {
+  return database.withSession?.("first-primary") ?? database;
+}
+
+export async function withMutationRetry<TResult>(
+  execute: () => Promise<TResult>,
+  maxAttempts = 3,
+  functionName?: string
+): Promise<TResult> {
+  for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+    try {
+      return await execute();
+    } catch (error) {
+      if (
+        !(error instanceof RetryableMutationConflictError) ||
+        attempt === maxAttempts - 1
+      ) {
+        if (error instanceof RetryableMutationConflictError) {
+          logRuntimeEvent("error", "mutation.retry_exhausted", {
+            attempts: maxAttempts,
+            functionName,
+          });
+          throw new ConflictRuntimeError(
+            "Mutation conflict retry limit exceeded"
+          );
+        }
+
+        throw error;
+      }
+
+      const delayMs = getRetryDelayMs(attempt);
+      logRuntimeEvent("warn", "mutation.retry_scheduled", {
+        attempt: attempt + 1,
+        delayMs,
+        functionName,
+        maxAttempts,
+      });
+      await delay(delayMs);
+    }
+  }
+
+  throw new InternalRuntimeError("Mutation retry loop exited unexpectedly");
+}

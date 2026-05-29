@@ -1,5 +1,7 @@
 import { maxIdForMs, minIdForMs, ValidationError } from "baseflare/values";
 
+import { toStorageValue } from "./serialize";
+
 export type FilterValue = string | number | boolean | null;
 
 export type FilterOperator = "eq" | "neq" | "gt" | "gte" | "lt" | "lte" | "in";
@@ -46,6 +48,20 @@ const COMPARISON_OPERATOR_SQL: Record<"gt" | "gte" | "lt" | "lte", string> = {
   lt: "<",
   lte: "<=",
 };
+
+type ComparableJsonValue =
+  | {
+      readonly rank: 0;
+      readonly value: null;
+    }
+  | {
+      readonly rank: 1;
+      readonly value: number;
+    }
+  | {
+      readonly rank: 2;
+      readonly value: string;
+    };
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -104,6 +120,74 @@ export function normalizeFilterValue(
   }
 
   return value;
+}
+
+function toComparableJsonValue(value: unknown): ComparableJsonValue {
+  if (value === null || value === undefined) {
+    return { rank: 0, value: null };
+  }
+
+  if (typeof value === "boolean") {
+    return { rank: 1, value: value ? 1 : 0 };
+  }
+
+  if (typeof value === "number") {
+    return { rank: 1, value };
+  }
+
+  if (typeof value === "string") {
+    return { rank: 2, value };
+  }
+
+  return { rank: 2, value: JSON.stringify(toStorageValue(value)) ?? "null" };
+}
+
+export function compareSqliteJsonValues(left: unknown, right: unknown): number {
+  const leftValue = toComparableJsonValue(left);
+  const rightValue = toComparableJsonValue(right);
+
+  if (leftValue.rank !== rightValue.rank) {
+    return leftValue.rank < rightValue.rank ? -1 : 1;
+  }
+
+  if (leftValue.value === rightValue.value) {
+    return 0;
+  }
+
+  if (leftValue.value === null) {
+    return -1;
+  }
+
+  if (rightValue.value === null) {
+    return 1;
+  }
+
+  return leftValue.value < rightValue.value ? -1 : 1;
+}
+
+export function matchesSqliteJsonComparison(
+  left: unknown,
+  operator: "gt" | "gte" | "lt" | "lte",
+  right: FilterValue
+): boolean {
+  if (left === null || left === undefined || right === null) {
+    return false;
+  }
+
+  const comparison = compareSqliteJsonValues(left, right);
+
+  switch (operator) {
+    case "gt":
+      return comparison > 0;
+    case "gte":
+      return comparison >= 0;
+    case "lt":
+      return comparison < 0;
+    case "lte":
+      return comparison <= 0;
+    default:
+      return false;
+  }
 }
 
 /** SQL fragment that addresses a field for filtering, ordering, or row comparison. */
@@ -386,4 +470,213 @@ export function combineFilters(
 
 export function compileFilter(filter: FilterObject): CompiledFilter {
   return compileFilterObject(filter, "filter");
+}
+
+function getDocumentField(
+  document: Record<string, unknown>,
+  fieldName: string
+): unknown {
+  return document[fieldName];
+}
+
+function normalizeDocumentValue(value: unknown): string | number | null {
+  if (typeof value === "boolean") {
+    return value ? 1 : 0;
+  }
+
+  if (typeof value === "string" || typeof value === "number") {
+    return value;
+  }
+
+  return null;
+}
+
+function compareValues(
+  left: unknown,
+  operator: "gt" | "gte" | "lt" | "lte",
+  right: FilterValue
+): boolean {
+  return matchesSqliteJsonComparison(left, operator, right);
+}
+
+function valuesEqual(left: unknown, right: FilterValue): boolean {
+  if (right === null) {
+    return left === null || left === undefined;
+  }
+
+  return normalizeDocumentValue(left) === normalizeFilterValue(right);
+}
+
+function valuesNotEqual(left: unknown, right: FilterValue): boolean {
+  if (right === null) {
+    return left !== null && left !== undefined;
+  }
+
+  return !valuesEqual(left, right);
+}
+
+function matchesCreatedAtFilter(
+  value: unknown,
+  operator: FilterOperator,
+  expected: unknown,
+  path: string
+): boolean {
+  if (operator === "eq" || operator === "neq" || operator === "in") {
+    throw error(path, "does not support eq, neq, or in; use gt/gte/lt/lte");
+  }
+
+  assertFilterValue(expected, path);
+  assertTimestamp(expected, path);
+
+  return compareValues(value, operator, expected);
+}
+
+function matchesFieldOperator(
+  document: Record<string, unknown>,
+  fieldName: string,
+  operator: FilterOperator,
+  expected: unknown,
+  path: string
+): boolean {
+  const value = getDocumentField(document, fieldName);
+
+  if (fieldName === CREATED_AT_FIELD) {
+    return matchesCreatedAtFilter(value, operator, expected, path);
+  }
+
+  if (operator === "in") {
+    if (!Array.isArray(expected)) {
+      throw error(path, "must be an array");
+    }
+
+    if (expected.length === 0) {
+      throw error(path, "must not be empty");
+    }
+
+    return expected.some((item, index) => {
+      assertFilterValue(item, `${path}[${index}]`);
+      return valuesEqual(value, item);
+    });
+  }
+
+  assertFilterValue(expected, path);
+
+  if (operator === "eq") {
+    return valuesEqual(value, expected);
+  }
+
+  if (operator === "neq") {
+    return valuesNotEqual(value, expected);
+  }
+
+  return compareValues(value, operator, expected);
+}
+
+function matchesFieldFilter(
+  document: Record<string, unknown>,
+  fieldName: string,
+  fieldFilter: unknown,
+  path: string
+): boolean {
+  assertQueryField(fieldName);
+
+  if (!isPlainObject(fieldFilter)) {
+    assertFilterValue(fieldFilter, path);
+    if (fieldName === CREATED_AT_FIELD) {
+      throw error(path, "does not support equality; use gt/gte/lt/lte");
+    }
+
+    return valuesEqual(getDocumentField(document, fieldName), fieldFilter);
+  }
+
+  const entries = Object.entries(fieldFilter);
+  if (entries.length === 0) {
+    throw error(path, "must include at least one operator");
+  }
+
+  return entries.every(([operator, value]) => {
+    if (!FILTER_OPERATORS.has(operator)) {
+      throw error(`${path}.${operator}`, "is not a supported filter operator");
+    }
+
+    return matchesFieldOperator(
+      document,
+      fieldName,
+      operator as FilterOperator,
+      value,
+      `${path}.${operator}`
+    );
+  });
+}
+
+function matchesLogicalFilter(
+  document: Record<string, unknown>,
+  key: LogicalFilterKey,
+  value: unknown,
+  path: string
+): boolean {
+  if (key === "NOT") {
+    if (!isPlainObject(value)) {
+      throw error(path, "must be a filter object");
+    }
+
+    return !matchesFilterObject(document, value as FilterObject, path);
+  }
+
+  if (!Array.isArray(value) || value.length === 0) {
+    throw error(path, "must be a non-empty array of filter objects");
+  }
+
+  if (key === "AND") {
+    return value.every((item, index) => {
+      if (!isPlainObject(item)) {
+        throw error(`${path}[${index}]`, "must be a filter object");
+      }
+
+      return matchesFilterObject(document, item as FilterObject, path);
+    });
+  }
+
+  return value.some((item, index) => {
+    if (!isPlainObject(item)) {
+      throw error(`${path}[${index}]`, "must be a filter object");
+    }
+
+    return matchesFilterObject(document, item as FilterObject, path);
+  });
+}
+
+function matchesFilterObject(
+  document: Record<string, unknown>,
+  filter: FilterObject,
+  path: string
+): boolean {
+  if (!isPlainObject(filter)) {
+    throw error(path, "must be a filter object");
+  }
+
+  const entries = Object.entries(filter);
+  if (entries.length === 0) {
+    throw error(path, "must include at least one condition");
+  }
+
+  return entries.every(([key, value]) => {
+    if (LOGICAL_FILTER_KEYS.has(key)) {
+      return matchesLogicalFilter(
+        document,
+        key as LogicalFilterKey,
+        value,
+        `${path}.${key}`
+      );
+    }
+
+    return matchesFieldFilter(document, key, value, `${path}.${key}`);
+  });
+}
+
+export function matchesFilter(
+  filter: FilterObject | undefined,
+  document: Record<string, unknown>
+): boolean {
+  return filter ? matchesFilterObject(document, filter, "filter") : true;
 }

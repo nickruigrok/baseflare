@@ -5,6 +5,10 @@ export const ErrorCode = {
   ValidationError: "VALIDATION_ERROR",
   SchemaError: "SCHEMA_ERROR",
   DeployError: "DEPLOY_ERROR",
+  Conflict: "CONFLICT",
+  DatabaseError: "DATABASE_ERROR",
+  MalformedDocument: "MALFORMED_DOCUMENT",
+  NotImplemented: "NOT_IMPLEMENTED",
   InternalError: "INTERNAL_ERROR",
 } as const;
 
