@@ -70,6 +70,7 @@ type CommitOperation =
     };
 
 const MUTATION_QUERY_CHUNK_SIZE = 256;
+const TABLE_VERSION_UNIQUE_CONSTRAINT_MESSAGE = `UNIQUE constraint failed: ${TABLE_VERSION_TABLE_NAME}.table_name`;
 
 function createBaseQueryState(): QueryState {
   return { order: { field: "_id", direction: "asc" } };
@@ -161,9 +162,8 @@ function isRetryableConflict(error: unknown): boolean {
   return (
     error instanceof RetryableMutationConflictError ||
     (error instanceof Error &&
-      error.message.includes(
-        `UNIQUE constraint failed: ${TABLE_VERSION_TABLE_NAME}.table_name`
-      ))
+      // D1 currently exposes table-version assertion conflicts through this SQLite message.
+      error.message.includes(TABLE_VERSION_UNIQUE_CONSTRAINT_MESSAGE))
   );
 }
 
@@ -248,8 +248,13 @@ class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
   }
 
   async count(): Promise<number> {
-    return (await this.database.collectQuery(this.tableName, this.state, null))
-      .length;
+    return (
+      await this.database.collectQuery(
+        this.tableName,
+        { ...this.state, limit: undefined },
+        null
+      )
+    ).length;
   }
 
   async paginate(options: {

@@ -27,10 +27,11 @@ import {
   createStorageReaderPlaceholder,
   createStorageWriterPlaceholder,
 } from "./placeholders";
-import type { D1Database } from "./types";
+import type { BaseflareExecutionContext, D1Database } from "./types";
 
 interface InvocationOptions {
   readonly database: D1Database;
+  readonly executionContext: BaseflareExecutionContext;
   readonly functionIndex: FunctionIndex;
   readonly invocationName?: string;
   readonly requestHeaders: Headers;

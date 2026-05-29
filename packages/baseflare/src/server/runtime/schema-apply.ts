@@ -4,7 +4,11 @@ import {
   type Schema,
 } from "../schema/types";
 
-import { ensureSuccessfulD1Result, withDatabaseErrorHandling } from "./errors";
+import {
+  ensureSuccessfulD1Result,
+  InternalRuntimeError,
+  withDatabaseErrorHandling,
+} from "./errors";
 import type { D1Database } from "./types";
 
 function createRuntimeTableStatement(tableName: string): string {
@@ -35,14 +39,25 @@ export async function applyRuntimeSchema(
 
   statements.push(...createTableVersionStatements(tableNames));
 
-  for (const statement of statements) {
-    await withDatabaseErrorHandling(
-      `Failed to apply schema statement "${statement}"`,
-      async () =>
+  await withDatabaseErrorHandling(
+    "Failed to apply runtime schema",
+    async () => {
+      const results = await database.batch(
+        statements.map((statement) => database.prepare(statement))
+      );
+
+      if (results.length !== statements.length) {
+        throw new InternalRuntimeError(
+          "Runtime schema application returned an unexpected number of D1 results"
+        );
+      }
+
+      for (const [index, result] of results.entries()) {
         ensureSuccessfulD1Result(
-          await database.prepare(statement).run(),
-          `Failed to apply schema statement "${statement}"`
-        )
-    );
-  }
+          result,
+          `Failed to apply schema statement "${statements[index] ?? "unknown"}"`
+        );
+      }
+    }
+  );
 }

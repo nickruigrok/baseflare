@@ -23,6 +23,7 @@ import {
 import { createFunctionIndex } from "./function-index";
 import { getRequestLogFields, logRuntimeEvent } from "./logging";
 import type {
+  BaseflareExecutionContext,
   BaseflareManifest,
   BaseflareRuntimeEnv,
   ExportedHandler,
@@ -116,10 +117,12 @@ function createInvocationOptions(
   env: BaseflareRuntimeEnv,
   manifest: BaseflareManifest,
   request: Request,
+  ctx: BaseflareExecutionContext,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ) {
   return {
     database: env.APP_DB,
+    executionContext: ctx,
     functionIndex,
     requestHeaders: request.headers,
     rules: manifest.rules,
@@ -132,6 +135,7 @@ async function handleQueryRequest(
   url: URL,
   env: BaseflareRuntimeEnv,
   manifest: BaseflareManifest,
+  ctx: BaseflareExecutionContext,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ): Promise<Response | null> {
   const queryName = getRouteName(url.pathname, "/api/query/");
@@ -151,7 +155,7 @@ async function handleQueryRequest(
   const args = await parseRpcBodyArgs(request);
   const result = await executeQueryDefinition(
     entry.definition as QueryDefinition,
-    createInvocationOptions(env, manifest, request, functionIndex),
+    createInvocationOptions(env, manifest, request, ctx, functionIndex),
     args
   );
 
@@ -163,6 +167,7 @@ async function handleMutationRequest(
   url: URL,
   env: BaseflareRuntimeEnv,
   manifest: BaseflareManifest,
+  ctx: BaseflareExecutionContext,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ): Promise<Response | null> {
   const mutationName = getRouteName(url.pathname, "/api/mutation/");
@@ -183,7 +188,7 @@ async function handleMutationRequest(
   const result = await executeMutationDefinition(
     entry.definition as MutationDefinition,
     {
-      ...createInvocationOptions(env, manifest, request, functionIndex),
+      ...createInvocationOptions(env, manifest, request, ctx, functionIndex),
       invocationName: entry.name,
     },
     args
@@ -197,6 +202,7 @@ async function handleActionRequest(
   url: URL,
   env: BaseflareRuntimeEnv,
   manifest: BaseflareManifest,
+  ctx: BaseflareExecutionContext,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ): Promise<Response | null> {
   const actionName = getRouteName(url.pathname, "/api/action/");
@@ -217,7 +223,7 @@ async function handleActionRequest(
   const result = await executeActionDefinition(
     entry.definition as ActionDefinition,
     {
-      ...createInvocationOptions(env, manifest, request, functionIndex),
+      ...createInvocationOptions(env, manifest, request, ctx, functionIndex),
       invocationName: entry.name,
     },
     args
@@ -231,6 +237,7 @@ function handleCustomHttpRequest(
   url: URL,
   env: BaseflareRuntimeEnv,
   manifest: BaseflareManifest,
+  ctx: BaseflareExecutionContext,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ): Promise<Response> | Response | null {
   const handler = manifest.http?.lookup(request.method, url.pathname);
@@ -239,7 +246,7 @@ function handleCustomHttpRequest(
   }
 
   const actionContext = createActionContext(
-    createInvocationOptions(env, manifest, request, functionIndex)
+    createInvocationOptions(env, manifest, request, ctx, functionIndex)
   );
 
   return handler(actionContext, request);
@@ -248,20 +255,43 @@ function handleCustomHttpRequest(
 async function routeRequest(
   request: Request,
   env: BaseflareRuntimeEnv,
+  ctx: BaseflareExecutionContext,
   manifest: BaseflareManifest,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ): Promise<Response> {
   const url = new URL(request.url);
 
   return (
-    (await handleQueryRequest(request, url, env, manifest, functionIndex)) ??
-    (await handleMutationRequest(request, url, env, manifest, functionIndex)) ??
-    (await handleActionRequest(request, url, env, manifest, functionIndex)) ??
+    (await handleQueryRequest(
+      request,
+      url,
+      env,
+      manifest,
+      ctx,
+      functionIndex
+    )) ??
+    (await handleMutationRequest(
+      request,
+      url,
+      env,
+      manifest,
+      ctx,
+      functionIndex
+    )) ??
+    (await handleActionRequest(
+      request,
+      url,
+      env,
+      manifest,
+      ctx,
+      functionIndex
+    )) ??
     (await handleCustomHttpRequest(
       request,
       url,
       env,
       manifest,
+      ctx,
       functionIndex
     )) ??
     (() => {
@@ -278,9 +308,9 @@ export function createWorker<
   const functionIndex = createFunctionIndex(manifest);
 
   return {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
       try {
-        return await routeRequest(request, env, manifest, functionIndex);
+        return await routeRequest(request, env, ctx, manifest, functionIndex);
       } catch (error) {
         if (
           !(

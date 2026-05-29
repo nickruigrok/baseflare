@@ -326,6 +326,18 @@ const createObjectOrderTodoAndList = mutation({
   },
 });
 
+const countLimitedTodos = mutation({
+  args: { ownerToken: v.string() },
+  returns: v.number(),
+  handler(ctx, args) {
+    return ctx.db
+      .query("todos")
+      .filter({ ownerToken: args.ownerToken })
+      .limit(1)
+      .count();
+  },
+});
+
 const patchWithOneRowConflict = mutation({
   args: { id: v.id("todos"), text: v.string() },
   returns: v.number(),
@@ -491,6 +503,11 @@ function createManifest(
       {
         definition: createObjectOrderTodoAndList,
         exportName: "createObjectOrderTodoAndList",
+        modulePath: "todos",
+      },
+      {
+        definition: countLimitedTodos,
+        exportName: "countLimitedTodos",
         modulePath: "todos",
       },
       {
@@ -864,6 +881,21 @@ describe("worker runtime", () => {
     expect(body.result).toEqual(["base-object", "pending-object"]);
   });
 
+  it("does not cap mutation count by query limit", async () => {
+    await createTodoViaRpc("owner-a", "first");
+    await createTodoViaRpc("owner-a", "second");
+
+    const response = await invoke("/api/mutation/todos:countLimitedTodos", {
+      body: rpcBody({ ownerToken: "owner-a" }),
+      headers: { authorization: "Bearer owner-a" },
+      method: "POST",
+    });
+    const body = (await response.json()) as { result: number };
+
+    expect(response.status).toBe(200);
+    expect(body.result).toBe(2);
+  });
+
   it("rolls back writes when return validation fails", async () => {
     const response = await invoke(
       "/api/mutation/todos:createThenInvalidReturn",
@@ -925,6 +957,7 @@ describe("worker runtime", () => {
     expect(tableResponse.status).toBe(200);
     expect(rowBody.result).toBe(2);
     expect(tableBody.result).toBe(2);
+    expect(tableConflictAttempts).toBe(2);
     expect(listBody.result.map((todo) => todo.text)).toContain(
       "after-row-conflict"
     );
@@ -1197,6 +1230,19 @@ describe("worker runtime", () => {
     const healthBody = (await healthResponse.json()) as { ok: boolean };
 
     expect(healthBody.ok).toBe(true);
+  });
+
+  it("accepts the Worker execution context without changing action contexts", async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request("http://example.com/health", { method: "GET" }),
+      env,
+      ctx
+    );
+
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(200);
   });
 
   it("bumps table versions for direct action writes", async () => {
