@@ -8,6 +8,7 @@ export default defineConfig({
     "values/index": "src/values/index.ts",
   },
   format: ["esm"],
+  splitting: true,
   dts: true,
   clean: true,
   target: "es2022",
