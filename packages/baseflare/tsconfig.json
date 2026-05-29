@@ -1,0 +1,13 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "paths": {
+      "baseflare/client": ["./src/client/index.ts"],
+      "baseflare/server": ["./src/server/index.ts"],
+      "baseflare/values": ["./src/values/index.ts"]
+    },
+    "tsBuildInfoFile": "./node_modules/.cache/tsconfig.tsbuildinfo",
+    "strictNullChecks": true
+  },
+  "include": ["src/**/*.ts"]
+}
