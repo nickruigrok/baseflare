@@ -54,6 +54,7 @@ const schema = defineSchema({
 const rules = defineRules({
   todos: {
     insert: () => true,
+    read: () => true,
   },
 });
 
@@ -150,5 +151,26 @@ describe("MutationDatabase", () => {
     await expect(withMutationRetry(async () => "ok", 0)).rejects.toThrow(
       "withMutationRetry requires at least one attempt"
     );
+  });
+
+  it("keeps the sorted top documents when limiting overlay reads", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersion: 0,
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "c" });
+    await mutationDb.insert("todos", { text: "a" });
+    await mutationDb.insert("todos", { text: "b" });
+
+    const documents = await mutationDb
+      .query("todos")
+      .order("text", "asc")
+      .limit(2)
+      .collect();
+
+    expect(documents.map((document) => document.text)).toEqual(["a", "b"]);
   });
 });

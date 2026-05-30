@@ -128,6 +128,21 @@ function compareDocuments(
   return state.order.direction === "asc" ? comparison : -comparison;
 }
 
+function addLimitedDocument(
+  documents: RuntimeDocument[],
+  document: RuntimeDocument,
+  state: QueryState
+): void {
+  documents.push(document);
+
+  if (state.limit === undefined || documents.length <= state.limit) {
+    return;
+  }
+
+  documents.sort((left, right) => compareDocuments(left, right, state));
+  documents.pop();
+}
+
 function isAfterCursor(
   document: RuntimeDocument,
   cursor: CursorPayload
@@ -359,11 +374,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     const statements = operations.map((operation) =>
-      bindStatement(
-        this.database as D1Database,
-        operation.sql,
-        operation.params
-      )
+      bindStatement(this.database, operation.sql, operation.params)
     );
 
     try {
@@ -391,11 +402,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       return (await this.canRead(tableName, document)) ? document : null;
     }
 
-    const existing = await fetchVersionedDocument(
-      this.database as D1Database,
-      tableName,
-      id
-    );
+    const existing = await fetchVersionedDocument(this.database, tableName, id);
     if (!existing) {
       await this.recordTableRead(tableName);
       return null;
@@ -539,7 +546,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
     while (true) {
       const rows = await executeRowQuery<StoredDocumentRow>(
-        this.database as D1Database,
+        this.database,
         buildRuntimeSelectQuery(tableName, state, {
           cursor,
           limit: MUTATION_QUERY_CHUNK_SIZE,
@@ -603,7 +610,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       }
 
       if (await this.canRead(tableName, write.document)) {
-        documents.push(write.document);
+        addLimitedDocument(documents, write.document, state);
       }
     }
 
@@ -737,11 +744,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       };
     }
 
-    const existing = await fetchVersionedDocument(
-      this.database as D1Database,
-      tableName,
-      id
-    );
+    const existing = await fetchVersionedDocument(this.database, tableName, id);
     if (!existing) {
       await this.recordTableRead(tableName);
       throw new NotFoundRuntimeError(
@@ -923,13 +926,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   }
 
   private async recordTableRead(tableName: string): Promise<void> {
-    const rows = await executeRowQuery<{ version: number }>(
-      this.database as D1Database,
-      {
-        sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
-        params: [tableName],
-      }
-    );
+    const rows = await executeRowQuery<{ version: number }>(this.database, {
+      sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
+      params: [tableName],
+    });
     const version = rows[0]?.version;
     if (typeof version !== "number") {
       throw new InternalRuntimeError(

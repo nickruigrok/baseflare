@@ -69,12 +69,14 @@ interface RuntimeQueryOptions<TContext> {
   readonly tableName: string;
 }
 
+type D1PrepareDatabase = Pick<D1Database, "prepare">;
+
 const QUERY_SCAN_CHUNK_SIZE = 256;
 const QUERY_SCAN_BYTE_LIMIT = 5_000_000;
 const QUERY_SCAN_ROW_LIMIT = 20_000;
 
 export function bindStatement(
-  database: D1Database,
+  database: D1PrepareDatabase,
   sql: string,
   params: readonly (string | number | null)[]
 ): D1PreparedStatement {
@@ -100,7 +102,7 @@ export function assertKnownTable(
 }
 
 export async function executeRowQuery<TRow extends Record<string, unknown>>(
-  database: D1Database,
+  database: D1PrepareDatabase,
   query: {
     readonly params: readonly (string | number | null)[];
     readonly sql: string;
@@ -138,7 +140,7 @@ export function deserializeVersionedRuntimeDocument(
 }
 
 export function fetchStoredDocument(
-  database: D1Database,
+  database: D1PrepareDatabase,
   tableName: string,
   id: string
 ): Promise<StoredDocumentRow | null> {
@@ -150,7 +152,7 @@ export function fetchStoredDocument(
 }
 
 export async function fetchVersionedDocument(
-  database: D1Database,
+  database: D1PrepareDatabase,
   tableName: string,
   id: string
 ): Promise<VersionedRuntimeDocument | null> {
