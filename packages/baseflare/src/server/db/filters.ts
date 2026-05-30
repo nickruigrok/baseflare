@@ -633,7 +633,11 @@ function matchesLogicalFilter(
         throw error(`${path}[${index}]`, "must be a filter object");
       }
 
-      return matchesFilterObject(document, item as FilterObject, path);
+      return matchesFilterObject(
+        document,
+        item as FilterObject,
+        `${path}[${index}]`
+      );
     });
   }
 
@@ -642,7 +646,11 @@ function matchesLogicalFilter(
       throw error(`${path}[${index}]`, "must be a filter object");
     }
 
-    return matchesFilterObject(document, item as FilterObject, path);
+    return matchesFilterObject(
+      document,
+      item as FilterObject,
+      `${path}[${index}]`
+    );
   });
 }
 

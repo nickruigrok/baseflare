@@ -421,7 +421,13 @@ export function assertWithinScanBudget(
 }
 
 function ensureSingleChange(changes: number | undefined): void {
-  if (changes !== undefined && changes !== 1) {
+  if (changes === undefined) {
+    throw new InternalRuntimeError(
+      "D1 did not report a change count for the write operation"
+    );
+  }
+
+  if (changes !== 1) {
     throw new ConflictRuntimeError("Document changed concurrently");
   }
 }

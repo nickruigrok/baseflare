@@ -209,6 +209,26 @@ describe("createQueryBuilder", () => {
     ).toThrow(/must be "_id"/);
   });
 
+  it("reports indexed paths for invalid nested logical filters", () => {
+    expect(() =>
+      matchesFilter(
+        {
+          AND: [{ status: { contains: "active" } }],
+        } as never,
+        { status: "active" }
+      )
+    ).toThrow(/filter\.AND\[0\]\.status\.contains/);
+
+    expect(() =>
+      matchesFilter(
+        {
+          OR: [{ status: "active" }, { age: { contains: 18 } }],
+        } as never,
+        { status: "inactive" }
+      )
+    ).toThrow(/filter\.OR\[1\]\.age\.contains/);
+  });
+
   it("supports unique, count, and pagination against an executor", async () => {
     const documents = [
       { _id: "019078e5-d29f-7000-8000-000000000001", text: "a" },
