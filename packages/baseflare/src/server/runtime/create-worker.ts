@@ -48,6 +48,22 @@ function getRouteName(pathname: string, prefix: string): string | null {
   }
 }
 
+function getRpcMethodError(pathname: string): string | null {
+  if (pathname.startsWith("/api/query/")) {
+    return "Query RPC requests must use POST";
+  }
+
+  if (pathname.startsWith("/api/mutation/")) {
+    return "Mutation RPC requests must use POST";
+  }
+
+  if (pathname.startsWith("/api/action/")) {
+    return "Action RPC requests must use POST";
+  }
+
+  return null;
+}
+
 async function parseRpcBodyArgs(request: Request): Promise<unknown> {
   const bodyText = await readRequestBodyText(request, MAX_RPC_BODY_BYTES);
   if (bodyText.trim() === "") {
@@ -113,7 +129,7 @@ async function handleQueryRequest(
   }
 
   if (request.method !== "POST") {
-    throw new ValidationRuntimeError("Query RPC requests must use POST");
+    return null;
   }
 
   const entry = functionIndex.getByName("query", queryName, "public");
@@ -145,7 +161,7 @@ async function handleMutationRequest(
   }
 
   if (request.method !== "POST") {
-    throw new ValidationRuntimeError("Mutation RPC requests must use POST");
+    return null;
   }
 
   const entry = functionIndex.getByName("mutation", mutationName, "public");
@@ -180,7 +196,7 @@ async function handleActionRequest(
   }
 
   if (request.method !== "POST") {
-    throw new ValidationRuntimeError("Action RPC requests must use POST");
+    return null;
   }
 
   const entry = functionIndex.getByName("action", actionName, "public");
@@ -264,6 +280,11 @@ async function routeRequest(
       functionIndex
     )) ??
     (() => {
+      const rpcMethodError = getRpcMethodError(url.pathname);
+      if (request.method !== "POST" && rpcMethodError) {
+        throw new ValidationRuntimeError(rpcMethodError);
+      }
+
       throw new NotFoundRuntimeError(
         `Route "${request.method} ${url.pathname}" was not found`
       );

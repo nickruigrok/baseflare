@@ -218,7 +218,13 @@ export function toErrorResponse(error: unknown): Response {
   let payload: RPCError;
   let status = 500;
 
-  if (error instanceof RuntimeError) {
+  if (error instanceof InternalRuntimeError) {
+    status = error.status;
+    payload = {
+      code: ErrorCode.InternalError,
+      message: "Internal error",
+    };
+  } else if (error instanceof RuntimeError) {
     status = error.status;
     payload = {
       code: error.runtimeCode,

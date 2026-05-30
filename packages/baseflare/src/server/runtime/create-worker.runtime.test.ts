@@ -1084,9 +1084,7 @@ describe("worker runtime", () => {
 
     expect(response.status).toBe(500);
     expect(body.error.code).toBe(ErrorCode.InternalError);
-    expect(body.error.message).toContain(
-      'Missing internal table version row for "todos"'
-    );
+    expect(body.error.message).toBe("Internal error");
   });
 
   it("fails clearly when query-read table-version metadata is missing", async () => {
@@ -1107,9 +1105,7 @@ describe("worker runtime", () => {
 
     expect(response.status).toBe(500);
     expect(body.error.code).toBe(ErrorCode.InternalError);
-    expect(body.error.message).toContain(
-      'Missing internal table version row for "todos"'
-    );
+    expect(body.error.message).toBe("Internal error");
   });
 
   it("keeps permission-filtered query terminals complete", async () => {
@@ -1353,8 +1349,12 @@ describe("worker runtime", () => {
 
     const healthResponse = await invoke("/health", { method: "GET" });
     const healthBody = (await healthResponse.json()) as { ok: boolean };
+    const customRpcPrefixResponse = await invoke("/api/query/todos:list", {
+      method: "GET",
+    });
 
     expect(healthBody.ok).toBe(true);
+    await expect(customRpcPrefixResponse.text()).resolves.toBe("custom-get");
   });
 
   it("accepts the Worker execution context without changing action contexts", async () => {
@@ -1389,7 +1389,7 @@ describe("worker runtime", () => {
   });
 
   it("requires POST and explicit args bodies for RPC", async () => {
-    const getResponse = await invoke("/api/query/todos:list", {
+    const getResponse = await invoke("/api/query/todos:missing", {
       method: "GET",
     });
     const emptyBodyResponse = await invoke("/api/query/todos:list", {

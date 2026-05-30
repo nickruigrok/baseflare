@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   DatabaseRuntimeError,
+  InternalRuntimeError,
   MalformedDocumentRuntimeError,
   toErrorResponse,
 } from "./errors";
@@ -45,6 +46,11 @@ describe("runtime errors", () => {
     const databaseResponse = toErrorResponse(
       new DatabaseRuntimeError("SELECT 1")
     );
+    const internalResponse = toErrorResponse(
+      new InternalRuntimeError("secret internal detail", {
+        tableName: "todos",
+      })
+    );
     const malformedResponse = toErrorResponse(
       new MalformedDocumentRuntimeError("Bad row", {
         id: "doc-id",
@@ -59,6 +65,12 @@ describe("runtime errors", () => {
     expect(databaseBody.error).toEqual({
       code: ErrorCode.DatabaseError,
       message: "Database error",
+    });
+    await expect(internalResponse.json()).resolves.toEqual({
+      error: {
+        code: ErrorCode.InternalError,
+        message: "Internal error",
+      },
     });
     expect(malformedResponse.status).toBe(500);
   });
