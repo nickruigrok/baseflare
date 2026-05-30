@@ -728,7 +728,7 @@ const createdAt = getCreatedAtFromId(id)
 14. `createWorker(manifest)` accepts a `BaseflareManifest` with `schema`, optional `config`, discovered function entries, optional `rules`, and optional `http`; canonical function ids are derived from module path + export name and duplicate ids fail during manifest build
 15. Runtime-produced RPC failures use a fixed taxonomy: `VALIDATION_ERROR`, `UNAUTHORIZED`, `PERMISSION_DENIED`, `NOT_FOUND`, `MALFORMED_DOCUMENT`, `DATABASE_ERROR`, `NOT_IMPLEMENTED`, `CONFLICT`, `INTERNAL_ERROR`; database details are logged internally and sanitized from client envelopes
 16. Mutation-scoped read-your-writes use selective SQL scanning plus `_id`-based overlay reconciliation instead of full-table hydration; broad mutation queries are guarded by internal scan budgets
-17. Mutations use a serializable-by-retry concurrency model on D1; point reads track row `_rev`, query reads track `_bf_table_versions.version`, and retryable conflicts rerun deterministic mutation handlers within a bounded retry policy
+17. Mutations use a serializable-by-retry concurrency model on D1; point reads track row `_rev`, query/missing-document reads track `_bf_table_versions.version`, point-read-only mutations do not conflict on unrelated inserts, and retryable conflicts rerun deterministic mutation handlers within a bounded retry policy
 18. Baseflare does not provide built-in duplicate-execution protection. Side-effectful work belongs in actions, and duplicate handling is application-managed around the specific external system or table that needs it.
 
 **"Done" criteria:**

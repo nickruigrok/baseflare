@@ -198,6 +198,16 @@ const getTodo = query({
   },
 });
 
+const uniqueTodo = query({
+  args: { ownerToken: v.string() },
+  handler(ctx, args) {
+    return ctx.db
+      .query("todos")
+      .filter({ ownerToken: args.ownerToken })
+      .unique();
+  },
+});
+
 const createTodo = mutation({
   args: { ownerToken: v.string(), text: v.string() },
   returns: v.object({
@@ -352,6 +362,16 @@ const firstTodoText = mutation({
   },
 });
 
+const uniqueTodoInMutation = mutation({
+  args: { ownerToken: v.string() },
+  handler(ctx, args) {
+    return ctx.db
+      .query("todos")
+      .filter({ ownerToken: args.ownerToken })
+      .unique();
+  },
+});
+
 const patchWithOneRowConflict = mutation({
   args: { id: v.id("todos"), text: v.string() },
   returns: v.number(),
@@ -493,6 +513,7 @@ function createManifest(
     queries: [
       { definition: listTodos, exportName: "list", modulePath: "todos" },
       { definition: getTodo, exportName: "get", modulePath: "todos" },
+      { definition: uniqueTodo, exportName: "unique", modulePath: "todos" },
       {
         definition: permissionShapeProbe,
         exportName: "permissionShapes",
@@ -549,6 +570,11 @@ function createManifest(
       {
         definition: firstTodoText,
         exportName: "firstTodoText",
+        modulePath: "todos",
+      },
+      {
+        definition: uniqueTodoInMutation,
+        exportName: "uniqueTodo",
         modulePath: "todos",
       },
       {
@@ -1244,6 +1270,58 @@ describe("worker runtime", () => {
       "beta",
     ]);
     expect(pageBody.result.page.continueCursor).not.toBe("");
+  });
+
+  it("treats query unique cardinality failures as known runtime errors", async () => {
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    await createTodoViaRpc("owner-a", "one");
+    await createTodoViaRpc("owner-a", "two");
+    errorSpy.mockClear();
+
+    const response = await invoke("/api/query/todos:unique", {
+      body: rpcBody({ ownerToken: "owner-a" }),
+      headers: { authorization: "Bearer owner-a" },
+      method: "POST",
+    });
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(500);
+    expect(body.error).toEqual({
+      code: ErrorCode.InternalError,
+      message: "Internal error",
+    });
+    expect(errorSpy).not.toHaveBeenCalled();
+  });
+
+  it("treats mutation unique cardinality failures as known runtime errors", async () => {
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+
+    await createTodoViaRpc("owner-a", "one");
+    await createTodoViaRpc("owner-a", "two");
+    errorSpy.mockClear();
+
+    const response = await invoke("/api/mutation/todos:uniqueTodo", {
+      body: rpcBody({ ownerToken: "owner-a" }),
+      headers: { authorization: "Bearer owner-a" },
+      method: "POST",
+    });
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(500);
+    expect(body.error).toEqual({
+      code: ErrorCode.InternalError,
+      message: "Internal error",
+    });
+    expect(errorSpy).not.toHaveBeenCalled();
   });
 
   it("uses stable runtime error envelopes", async () => {

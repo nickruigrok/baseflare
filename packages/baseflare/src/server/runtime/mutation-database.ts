@@ -246,14 +246,16 @@ class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
   async unique(): Promise<RuntimeDocument> {
     const documents = await this.clone({ limit: 2 }).collect();
     if (documents.length !== 1) {
-      throw new Error(
+      throw new InternalRuntimeError(
         `Expected exactly one document, received ${documents.length}`
       );
     }
 
     const document = documents[0];
     if (!document) {
-      throw new Error("Expected a document but none was returned");
+      throw new InternalRuntimeError(
+        "Expected a document but none was returned"
+      );
     }
 
     return document;
@@ -781,6 +783,9 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   private appendRowReadAssertions(operations: CommitOperation[]): void {
     for (const [tableName, reads] of this.rowReadRevisions) {
       for (const [id, rev] of reads) {
+        // Point reads intentionally validate only the row revision.
+        // Query and missing-document reads track table versions because their
+        // result sets can change when unrelated rows are inserted or deleted.
         operations.push({
           type: "assert-row-revision",
           sql: `SELECT

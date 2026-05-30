@@ -287,14 +287,16 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
   async unique(): Promise<RuntimeDocument> {
     const documents = await this.collectReadable(2, null);
     if (documents.length !== 1) {
-      throw new Error(
+      throw new InternalRuntimeError(
         `Expected exactly one document, received ${documents.length}`
       );
     }
 
     const document = documents[0];
     if (!document) {
-      throw new Error("Expected a document but none was returned");
+      throw new InternalRuntimeError(
+        "Expected a document but none was returned"
+      );
     }
 
     return document;
