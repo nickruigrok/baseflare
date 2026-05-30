@@ -244,7 +244,12 @@ async function routeRequest(
   manifest: BaseflareManifest,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ): Promise<Response> {
-  const url = new URL(request.url);
+  let url: URL;
+  try {
+    url = new URL(request.url);
+  } catch {
+    throw new ValidationRuntimeError("Request URL is malformed");
+  }
 
   return (
     (await handleQueryRequest(

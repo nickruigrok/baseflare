@@ -1370,6 +1370,30 @@ describe("worker runtime", () => {
     expect(response.status).toBe(200);
   });
 
+  it("returns validation errors for malformed synthetic request URLs", async () => {
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      {
+        headers: new Headers(),
+        method: "GET",
+        url: "not a valid URL",
+      } as Request,
+      env,
+      ctx
+    );
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    await waitOnExecutionContext(ctx);
+
+    expect(response.status).toBe(400);
+    expect(body.error).toEqual({
+      code: ErrorCode.ValidationError,
+      message: "Request URL is malformed",
+    });
+  });
+
   it("bumps table versions for direct action writes", async () => {
     const before = await env.APP_DB.prepare(
       "SELECT version FROM _bf_table_versions WHERE table_name = 'todos'"

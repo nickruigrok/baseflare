@@ -171,6 +171,18 @@ function requiresChangeCount(operation: CommitOperation): boolean {
   );
 }
 
+function isAssertOperation(
+  operation: CommitOperation
+): operation is Extract<
+  CommitOperation,
+  { type: "assert-row-revision" | "assert-table-version" }
+> {
+  return (
+    operation.type === "assert-row-revision" ||
+    operation.type === "assert-table-version"
+  );
+}
+
 class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
   private readonly database: MutationDatabase;
   private readonly state: QueryState;
@@ -872,31 +884,21 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       }
 
       const changes = result.meta?.changes;
-      if (changes === undefined) {
-        if (requiresChangeCount(operation)) {
+      if (isAssertOperation(operation)) {
+        operation.validateResult(result);
+        continue;
+      }
+
+      if (requiresChangeCount(operation)) {
+        if (changes === undefined) {
           throw new InternalRuntimeError(
             `Mutation commit operation "${operation.type}" did not report a D1 change count`
           );
         }
 
-        if (
-          operation.type === "assert-row-revision" ||
-          operation.type === "assert-table-version"
-        ) {
-          operation.validateResult(result);
+        if (changes !== 1) {
+          throw new RetryableMutationConflictError();
         }
-        continue;
-      }
-
-      if (requiresChangeCount(operation) && changes !== 1) {
-        throw new RetryableMutationConflictError();
-      }
-
-      if (
-        operation.type === "assert-row-revision" ||
-        operation.type === "assert-table-version"
-      ) {
-        operation.validateResult(result);
       }
     }
   }
@@ -965,6 +967,12 @@ export async function withMutationRetry<TResult>(
   maxAttempts = 3,
   functionName?: string
 ): Promise<TResult> {
+  if (maxAttempts < 1) {
+    throw new InternalRuntimeError(
+      "withMutationRetry requires at least one attempt"
+    );
+  }
+
   for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
     try {
       return await execute();
