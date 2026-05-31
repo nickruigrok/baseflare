@@ -424,6 +424,30 @@ describe("MutationDatabase", () => {
     expect(batchQueries[0]?.[1]).toContain("FROM todos");
   });
 
+  it("advances multi-chunk mutation scans with keyset predicates", async () => {
+    const batchQueries: string[][] = [];
+    const rows = Array.from({ length: 256 }, (_, index) =>
+      createStoredRow(index + 1)
+    );
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchQueries,
+        batchResults: [],
+        readResults: [
+          { version: 0, rows },
+          { version: 0, rows: [] },
+        ],
+      })
+    );
+
+    await expect(mutationDb.query("todos").collect()).resolves.toHaveLength(
+      256
+    );
+
+    expect(batchQueries[1]?.[1]).toContain("_id > ?");
+    expect(batchQueries[1]?.[1]).not.toContain("OFFSET");
+  });
+
   it("uses limited D1 chunks for limited mutation queries", async () => {
     const batchParams: D1BindingValue[][][] = [];
     const mutationDb = createMutationDatabase(

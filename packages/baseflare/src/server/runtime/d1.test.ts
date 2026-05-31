@@ -11,6 +11,8 @@ import {
   assertWithinScanBudget,
   buildRuntimeSelectQuery,
   D1DatabaseAdapter,
+  getNextRuntimeScanPosition,
+  type RuntimeScanPosition,
 } from "./d1";
 import type { D1Database, D1PreparedStatement, D1Result } from "./types";
 
@@ -51,6 +53,18 @@ class FakePreparedStatement implements D1PreparedStatement {
 }
 
 const testId = "019078e5-d29f-7000-8000-000000000001";
+const nextTestId = "019078e5-d29f-7000-8000-000000000002";
+
+function createStoredRow(
+  id = testId,
+  data: Record<string, unknown> = { text: "before" }
+) {
+  return {
+    _id: id,
+    _data: JSON.stringify(data),
+    _rev: 0,
+  };
+}
 
 function createFakeDatabase(options: {
   readonly batchQueries?: string[][];
@@ -126,6 +140,69 @@ describe("D1 runtime helpers", () => {
         limit: 1,
       })
     ).toThrow(/must start with a letter/);
+  });
+
+  it("uses keyset predicates for id-ordered runtime scans", () => {
+    const state = createBaseQueryState();
+    const position = getNextRuntimeScanPosition(
+      "todos",
+      state,
+      { cursor: null, offset: 0 },
+      [createStoredRow(nextTestId)]
+    );
+    const query = buildRuntimeSelectQuery("todos", state, {
+      cursor: position.cursor,
+      limit: 256,
+    });
+
+    expect(query.sql).toContain("_id > ?");
+    expect(query.sql).not.toContain("OFFSET");
+    expect(query.params).toEqual([nextTestId, 256]);
+  });
+
+  it("uses keyset predicates for scalar field-ordered runtime scans", () => {
+    const state = {
+      ...createBaseQueryState(),
+      order: { field: "text", direction: "asc" } as const,
+    };
+    const position = getNextRuntimeScanPosition(
+      "todos",
+      state,
+      { cursor: null, offset: 0 },
+      [createStoredRow(nextTestId, { text: "beta" })]
+    );
+    const query = buildRuntimeSelectQuery("todos", state, {
+      cursor: position.cursor,
+      limit: 256,
+    });
+
+    expect(query.sql).toContain(
+      "(json_extract(_data, '$.text') > ? OR (json_extract(_data, '$.text') = ? AND _id > ?))"
+    );
+    expect(query.sql).not.toContain("OFFSET");
+    expect(query.params).toEqual(["beta", "beta", nextTestId, 256]);
+  });
+
+  it("falls back to offsets for non-scalar field-ordered runtime scans", () => {
+    const state = {
+      ...createBaseQueryState(),
+      order: { field: "text", direction: "asc" } as const,
+    };
+    const position: RuntimeScanPosition = getNextRuntimeScanPosition(
+      "todos",
+      state,
+      { cursor: null, offset: 0 },
+      [createStoredRow(nextTestId, { text: { nested: true } })]
+    );
+    const query = buildRuntimeSelectQuery("todos", state, {
+      cursor: position.cursor,
+      limit: 256,
+      offset: position.cursor ? undefined : position.offset,
+    });
+
+    expect(position.cursor).toBeNull();
+    expect(query.sql).toContain("OFFSET ?");
+    expect(query.params).toEqual([256, 1]);
   });
 
   it("requires D1 change counts for direct write operations", async () => {

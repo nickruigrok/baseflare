@@ -11,6 +11,7 @@ import {
   assertQueryField,
   compileFilter,
   type FilterObject,
+  type FilterValue,
 } from "../db/filters";
 import {
   assertTableIdentifier,
@@ -76,6 +77,11 @@ export interface CommitGuard {
   readonly insertedIds?: ReadonlyMap<string, ReadonlySet<string>>;
   readonly rowRevisions?: ReadonlyMap<string, ReadonlyMap<string, number>>;
   readonly tableVersions?: ReadonlyMap<string, number>;
+}
+
+export interface RuntimeScanPosition {
+  readonly cursor: CursorPayload | null;
+  readonly offset: number;
 }
 
 interface RuntimeQueryOptions<TContext> {
@@ -273,6 +279,19 @@ function mergeFilters(
   return left ? { AND: [left, right] } : right;
 }
 
+function toScalarCursorValue(value: unknown): FilterValue | undefined {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  const type = typeof value;
+  if (type === "boolean" || type === "number" || type === "string") {
+    return value as FilterValue;
+  }
+
+  return undefined;
+}
+
 export function buildRuntimeSelectQuery(
   tableName: string,
   state: QueryState,
@@ -312,6 +331,46 @@ export function buildRuntimeSelectQuery(
   }
 
   return { sql, params };
+}
+
+export function getNextRuntimeScanPosition(
+  tableName: string,
+  state: QueryState,
+  current: RuntimeScanPosition,
+  rows: readonly StoredDocumentRow[]
+): RuntimeScanPosition {
+  const offset = current.offset + rows.length;
+  const row = rows.at(-1);
+  if (!row) {
+    return current;
+  }
+
+  if (state.order.field === "_id") {
+    return {
+      cursor: {
+        id: row._id,
+        orderDirection: state.order.direction,
+        orderField: "_id",
+      },
+      offset,
+    };
+  }
+
+  const document = deserializeRuntimeDocument(tableName, row);
+  const value = toScalarCursorValue(document[state.order.field]);
+  if (value === undefined) {
+    return { cursor: null, offset };
+  }
+
+  return {
+    cursor: {
+      id: row._id,
+      orderDirection: state.order.direction,
+      orderField: state.order.field,
+      v: value,
+    },
+    offset,
+  };
 }
 
 class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
@@ -446,24 +505,31 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
     }
 
     const documents: RuntimeDocument[] = [];
-    let offset = 0;
+    let scanPosition: RuntimeScanPosition = { cursor, offset: 0 };
     let scannedBytes = 0;
     let scannedRows = 0;
 
     while (true) {
+      const hasScanCursor = scanPosition.cursor !== null;
       const rows = await executeRowQuery<StoredDocumentRow>(
         this.options.database,
         buildRuntimeSelectQuery(this.options.tableName, this.state, {
-          cursor,
+          cursor: scanPosition.cursor ?? cursor,
           limit: QUERY_SCAN_CHUNK_SIZE,
-          offset,
+          offset: hasScanCursor ? undefined : scanPosition.offset,
         })
       );
       if (rows.length === 0) {
         break;
       }
 
-      offset += rows.length;
+      scanPosition = getNextRuntimeScanPosition(
+        this.options.tableName,
+        this.state,
+        scanPosition,
+        rows
+      );
+
       for (const row of rows) {
         scannedRows += 1;
         scannedBytes += row._data.length;

@@ -30,7 +30,9 @@ import {
   deserializeRuntimeDocument,
   deserializeVersionedRuntimeDocument,
   executeRowQuery,
+  getNextRuntimeScanPosition,
   type RuntimeDocument,
+  type RuntimeScanPosition,
   type StoredDocumentRow,
 } from "./d1";
 import {
@@ -63,6 +65,11 @@ interface PendingMutationWrite {
 interface TableVersionReadResult<TRow extends Record<string, unknown>> {
   readonly rows: readonly TRow[];
   readonly version: unknown;
+}
+
+interface ScanBudget {
+  scannedBytes: number;
+  scannedRows: number;
 }
 
 type CommitOperation =
@@ -600,17 +607,17 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     const documents: RuntimeDocument[] = [];
-    let offset = 0;
-    let scannedBytes = 0;
-    let scannedRows = 0;
+    let scanPosition: RuntimeScanPosition = { cursor, offset: 0 };
+    const budget: ScanBudget = { scannedBytes: 0, scannedRows: 0 };
 
     while (true) {
+      const hasScanCursor = scanPosition.cursor !== null;
       const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
         tableName,
         buildRuntimeSelectQuery(tableName, state, {
-          cursor,
+          cursor: scanPosition.cursor ?? cursor,
           limit: chunkSize,
-          offset,
+          offset: hasScanCursor ? undefined : scanPosition.offset,
         })
       );
       const { rows } = read;
@@ -620,26 +627,25 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       }
 
       this.recordTableReadVersion(tableName, read.version);
-      offset += rows.length;
+      scanPosition = getNextRuntimeScanPosition(
+        tableName,
+        state,
+        scanPosition,
+        rows
+      );
       // The table version is recorded before row processing, so a mid-chunk
       // limit return cannot skip OCC tracking for rows already read.
-      for (const row of rows) {
-        if (shadowedBaseIds.has(row._id)) {
-          continue;
-        }
-
-        scannedRows += 1;
-        scannedBytes += row._data.length;
-        assertWithinScanBudget(scannedRows, scannedBytes);
-
-        const document = deserializeRuntimeDocument(tableName, row);
-        if (await this.canRead(tableName, document)) {
-          documents.push(document);
-        }
-
-        if (state.limit !== undefined && documents.length >= state.limit) {
-          return documents;
-        }
+      if (
+        await this.appendReadableBaseDocuments(
+          tableName,
+          state,
+          rows,
+          shadowedBaseIds,
+          documents,
+          budget
+        )
+      ) {
+        return documents;
       }
 
       if (rows.length < chunkSize) {
@@ -648,6 +654,36 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     return documents;
+  }
+
+  private async appendReadableBaseDocuments(
+    tableName: string,
+    state: QueryState,
+    rows: readonly StoredDocumentRow[],
+    shadowedBaseIds: ReadonlySet<string>,
+    documents: RuntimeDocument[],
+    budget: ScanBudget
+  ): Promise<boolean> {
+    for (const row of rows) {
+      if (shadowedBaseIds.has(row._id)) {
+        continue;
+      }
+
+      budget.scannedRows += 1;
+      budget.scannedBytes += row._data.length;
+      assertWithinScanBudget(budget.scannedRows, budget.scannedBytes);
+
+      const document = deserializeRuntimeDocument(tableName, row);
+      if (await this.canRead(tableName, document)) {
+        documents.push(document);
+      }
+
+      if (state.limit !== undefined && documents.length >= state.limit) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private async getReadableOverlayDocuments(
