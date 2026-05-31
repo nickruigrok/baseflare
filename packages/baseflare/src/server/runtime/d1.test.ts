@@ -1,6 +1,7 @@
 import { v } from "baseflare/values";
 import { describe, expect, it } from "vitest";
 
+import { createBaseQueryState } from "../db/query-builder";
 import { defineRules } from "../permissions/define-rules";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
@@ -8,6 +9,7 @@ import type { Schema } from "../schema/types";
 import {
   assertKnownTable,
   assertWithinScanBudget,
+  buildRuntimeSelectQuery,
   D1DatabaseAdapter,
 } from "./d1";
 import type { D1Database, D1PreparedStatement, D1Result } from "./types";
@@ -96,6 +98,14 @@ describe("D1 runtime helpers", () => {
     expect(() => assertWithinScanBudget(1, 5_000_001)).toThrow(
       "Query exceeded the internal scan budget"
     );
+  });
+
+  it("validates runtime select table identifiers", () => {
+    expect(() =>
+      buildRuntimeSelectQuery("bad table", createBaseQueryState(), {
+        limit: 1,
+      })
+    ).toThrow(/must start with a letter/);
   });
 
   it("requires D1 change counts for direct write operations", async () => {

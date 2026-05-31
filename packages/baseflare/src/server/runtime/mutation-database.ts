@@ -693,7 +693,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     try {
       return validateInsertData(table, value);
     } catch (error) {
-      coerceValidationError(error, "Invalid insert document");
+      return coerceValidationError(error, "Invalid insert document");
     }
   }
 
@@ -705,7 +705,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     try {
       return validatePatchData(table, current, patch);
     } catch (error) {
-      coerceValidationError(error, "Invalid patch document");
+      return coerceValidationError(error, "Invalid patch document");
     }
   }
 
@@ -716,7 +716,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     try {
       return validateReplaceData(table, value);
     } catch (error) {
-      coerceValidationError(error, "Invalid replacement document");
+      return coerceValidationError(error, "Invalid replacement document");
     }
   }
 

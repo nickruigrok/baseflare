@@ -12,7 +12,11 @@ import {
   compileFilter,
   type FilterObject,
 } from "../db/filters";
-import { buildOrderClause, type QueryState } from "../db/query-builder";
+import {
+  assertTableIdentifier,
+  buildOrderClause,
+  type QueryState,
+} from "../db/query-builder";
 import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
 import { serialize } from "../db/serialize";
 import {
@@ -198,6 +202,7 @@ export function buildRuntimeSelectQuery(
     readonly offset?: number;
   }
 ): { params: Array<string | number | null>; sql: string } {
+  assertTableIdentifier(tableName);
   const clauses: string[] = [];
   const params: Array<string | number | null> = [];
 

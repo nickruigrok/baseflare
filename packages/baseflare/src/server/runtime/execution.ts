@@ -155,7 +155,7 @@ export function createActionContext(options: InvocationOptions): ActionCtx {
   const ctx: ActionCtx = {
     auth,
     db: new D1DatabaseAdapter<ActionCtx>({
-      database: options.database,
+      database: createMutationDatabaseSession(options.database),
       getContext: () => ctx,
       rules: options.rules,
       schema: options.schema,
