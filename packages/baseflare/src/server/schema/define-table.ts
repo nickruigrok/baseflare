@@ -3,7 +3,7 @@ import { SchemaError, type ValidatorShape } from "baseflare/values";
 import {
   assertFieldName,
   assertIdentifier,
-  type TableDefBuilder,
+  type TableBuilder,
   type TableIndex,
 } from "./types";
 
@@ -26,17 +26,14 @@ function validateIndexFields(
   }
 }
 
-function createTableDefBuilder<TFields extends ValidatorShape>(
+function createTableBuilder<TFields extends ValidatorShape>(
   fields: TFields,
   indexes: readonly TableIndex[] = []
-): TableDefBuilder<TFields> {
+): TableBuilder<TFields> {
   return {
     fields,
     indexes,
-    index(
-      name: string,
-      indexFields: readonly string[]
-    ): TableDefBuilder<TFields> {
+    index(name: string, indexFields: readonly string[]): TableBuilder<TFields> {
       assertIdentifier(name, "Index name");
       validateIndexFields(fields, indexFields);
 
@@ -46,7 +43,7 @@ function createTableDefBuilder<TFields extends ValidatorShape>(
         );
       }
 
-      return createTableDefBuilder(fields, [
+      return createTableBuilder(fields, [
         ...indexes,
         { name, fields: [...indexFields] },
       ]);
@@ -56,7 +53,7 @@ function createTableDefBuilder<TFields extends ValidatorShape>(
 
 export function defineTable<TFields extends ValidatorShape>(
   fields: TFields
-): TableDefBuilder<TFields> {
+): TableBuilder<TFields> {
   if (Object.keys(fields).length === 0) {
     throw new SchemaError("Table definitions must include at least one field");
   }
@@ -75,5 +72,5 @@ export function defineTable<TFields extends ValidatorShape>(
     }
   }
 
-  return createTableDefBuilder({ ...fields });
+  return createTableBuilder({ ...fields });
 }

@@ -1,4 +1,4 @@
-import { evaluate } from "../permissions/evaluate";
+import { evaluateRules } from "../permissions/evaluate-rules";
 import type { Rules } from "../permissions/types";
 
 import { PermissionDeniedRuntimeError } from "./errors";
@@ -14,7 +14,7 @@ export async function canReadDocument(
     return false;
   }
 
-  return await evaluate(rules, {
+  return await evaluateRules(rules, {
     tableName,
     operation: "read",
     ctx,
@@ -33,7 +33,7 @@ export async function assertCanInsert(
     throw new PermissionDeniedRuntimeError();
   }
 
-  const allowed = await evaluate(rules, {
+  const allowed = await evaluateRules(rules, {
     tableName,
     operation: "insert",
     ctx,
@@ -58,7 +58,7 @@ export async function assertCanUpdate(
     throw new PermissionDeniedRuntimeError();
   }
 
-  const allowed = await evaluate(rules, {
+  const allowed = await evaluateRules(rules, {
     tableName,
     operation: "update",
     ctx,
@@ -83,7 +83,7 @@ export async function assertCanDelete(
     throw new PermissionDeniedRuntimeError();
   }
 
-  const allowed = await evaluate(rules, {
+  const allowed = await evaluateRules(rules, {
     tableName,
     operation: "delete",
     ctx,

@@ -40,6 +40,7 @@ import {
   ensureSuccessfulD1Result,
   InternalRuntimeError,
   NotFoundRuntimeError,
+  ValidationRuntimeError,
   withDatabaseErrorHandling,
 } from "./errors";
 import {
@@ -422,7 +423,9 @@ export function assertWithinScanBudget(
     scannedRows > QUERY_SCAN_ROW_LIMIT ||
     scannedBytes > QUERY_SCAN_BYTE_LIMIT
   ) {
-    throw new InternalRuntimeError("Query exceeded the internal scan budget");
+    throw new ValidationRuntimeError(
+      "Query exceeded the internal scan budget; add a more selective filter or limit"
+    );
   }
 }
 

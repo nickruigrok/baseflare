@@ -134,19 +134,35 @@ function compareDocuments(
   return state.order.direction === "asc" ? comparison : -comparison;
 }
 
-function addLimitedDocument(
+function insertLimitedDocument(
   documents: RuntimeDocument[],
   document: RuntimeDocument,
   state: QueryState
 ): void {
-  documents.push(document);
-
-  if (state.limit === undefined || documents.length <= state.limit) {
+  if (state.limit === undefined) {
+    documents.push(document);
     return;
   }
 
-  documents.sort((left, right) => compareDocuments(left, right, state));
-  documents.pop();
+  if (state.limit === 0) {
+    return;
+  }
+
+  const insertIndex = documents.findIndex(
+    (existing) => compareDocuments(document, existing, state) < 0
+  );
+
+  if (insertIndex === -1) {
+    if (documents.length < state.limit) {
+      documents.push(document);
+    }
+    return;
+  }
+
+  documents.splice(insertIndex, 0, document);
+  if (documents.length > state.limit) {
+    documents.pop();
+  }
 }
 
 function isAfterCursor(
@@ -628,7 +644,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       }
 
       if (await this.canRead(tableName, write.document)) {
-        addLimitedDocument(documents, write.document, state);
+        insertLimitedDocument(documents, write.document, state);
       }
     }
 
@@ -652,9 +668,9 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     document: Record<string, unknown>
   ): RuntimeDocument {
     return {
-      ...document,
       _id: id,
       _createdAt: getCreatedMsFromId(id),
+      ...document,
     };
   }
 

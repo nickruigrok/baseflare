@@ -22,7 +22,7 @@ export async function readRequestBodyText(
 
       totalBytes += value.byteLength;
       if (totalBytes > maxBytes) {
-        await reader.cancel();
+        await reader.cancel().catch(() => undefined);
         throw new PayloadTooLargeRuntimeError();
       }
 

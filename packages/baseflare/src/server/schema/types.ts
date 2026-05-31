@@ -21,10 +21,9 @@ export interface TableDefinition<
   readonly indexes: readonly TableIndex[];
 }
 
-export interface TableDefBuilder<
-  TFields extends ValidatorShape = ValidatorShape,
-> extends TableDefinition<TFields> {
-  index(name: string, fields: readonly string[]): TableDefBuilder<TFields>;
+export interface TableBuilder<TFields extends ValidatorShape = ValidatorShape>
+  extends TableDefinition<TFields> {
+  index(name: string, fields: readonly string[]): TableBuilder<TFields>;
 }
 
 export type SchemaTables = Record<string, TableDefinition>;

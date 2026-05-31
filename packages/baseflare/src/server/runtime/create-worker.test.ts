@@ -68,6 +68,25 @@ describe("worker request body reader", () => {
     expect(cancelled).toBe(true);
   });
 
+  it("keeps oversized request errors when stream cancellation fails", async () => {
+    const request = new Request("http://example.com/api/query/todos:list", {
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode("too-large"));
+        },
+        cancel() {
+          return Promise.reject(new Error("cancel failed"));
+        },
+      }),
+      duplex: "half",
+      method: "POST",
+    } as RequestInit);
+
+    await expect(readRequestBodyText(request, 1)).rejects.toBeInstanceOf(
+      PayloadTooLargeRuntimeError
+    );
+  });
+
   it("uses a primary D1 session for action database access and nested calls", async () => {
     let sessionConstraint: string | undefined;
     let sessionBatchCalled = false;

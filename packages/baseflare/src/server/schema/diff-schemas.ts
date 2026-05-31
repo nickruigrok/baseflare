@@ -133,7 +133,7 @@ function collectTableUpdates(
   }
 }
 
-export function diff(current: Schema, target: Schema): SchemaDiff {
+export function diffSchemas(current: Schema, target: Schema): SchemaDiff {
   const addedTables: SchemaTables = {};
   const orphanedTables: string[] = [];
   const addedIndexes: DiffedIndex[] = [];

@@ -7,6 +7,8 @@ import {
   defineRules,
   defineSchema,
   defineTable,
+  diffSchemas,
+  evaluateRules,
   httpAction,
   httpRouter,
   mutation,
@@ -26,6 +28,8 @@ describe("baseflare/server", () => {
     expect(mutation).toBeTypeOf("function");
     expect(action).toBeTypeOf("function");
     expect(defineRules).toBeTypeOf("function");
+    expect(evaluateRules).toBeTypeOf("function");
+    expect(diffSchemas).toBeTypeOf("function");
     expect(httpAction).toBeTypeOf("function");
     expect(httpRouter).toBeTypeOf("function");
     expect(validateInsertData).toBeTypeOf("function");

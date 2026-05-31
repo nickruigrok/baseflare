@@ -8,6 +8,7 @@ import {
   createIndexStatement,
   type DataModelFromSchema,
   type Doc,
+  type TableBuilder,
 } from "./types";
 
 const RESERVED_TABLE_NAME_ERROR_PATTERN = /cannot start with "_"/;
@@ -78,9 +79,13 @@ describe("defineSchema", () => {
 
     type Schema = typeof schema;
     type TodoDoc = Doc<Schema, "todos">;
-    type SchemaTableHasIndexBuilder =
+    type TodosBuilder = ReturnType<
+      typeof defineTable<typeof schema.tables.todos.fields>
+    >;
+    type SchemaTableHasTableBuilder =
       "index" extends keyof (typeof schema)["tables"]["todos"] ? true : false;
 
+    expectTypeOf<TodosBuilder>().toExtend<TableBuilder>();
     expectTypeOf<TodoDoc["_id"]>().toEqualTypeOf<Id<"todos">>();
     expectTypeOf<TodoDoc["_createdAt"]>().toEqualTypeOf<number>();
     expectTypeOf<TodoDoc["text"]>().toEqualTypeOf<string>();
@@ -91,6 +96,6 @@ describe("defineSchema", () => {
 
     type Model = DataModelFromSchema<Schema>;
     expectTypeOf<Model["todos"]>().toEqualTypeOf<TodoDoc>();
-    expectTypeOf<SchemaTableHasIndexBuilder>().toEqualTypeOf<false>();
+    expectTypeOf<SchemaTableHasTableBuilder>().toEqualTypeOf<false>();
   });
 });

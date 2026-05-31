@@ -3,9 +3,9 @@ import { describe, expect, it } from "vitest";
 
 import { defineSchema } from "./define-schema";
 import { defineTable } from "./define-table";
-import { diff } from "./diff";
+import { diffSchemas } from "./diff-schemas";
 
-describe("diff", () => {
+describe("diffSchemas", () => {
   it("tracks table and index additions/removals while ignoring field changes", () => {
     const current = defineSchema({
       todos: defineTable({
@@ -23,7 +23,7 @@ describe("diff", () => {
       }),
     });
 
-    const schemaDiff = diff(current, target);
+    const schemaDiff = diffSchemas(current, target);
 
     expect(Object.keys(schemaDiff.addedTables)).toEqual(["users"]);
     expect(schemaDiff.orphanedTables).toEqual([]);
@@ -48,7 +48,7 @@ describe("diff", () => {
       todos: defineTable({ text: v.string() }).index("by_text", ["text"]),
     });
 
-    const schemaDiff = diff(current, target);
+    const schemaDiff = diffSchemas(current, target);
 
     expect(schemaDiff.orphanedTables).toEqual(["legacy"]);
     expect(schemaDiff.removedIndexes).toEqual([]);
@@ -71,7 +71,7 @@ describe("diff", () => {
       }).index("by_org", ["orgId", "status"]),
     });
 
-    const schemaDiff = diff(current, target);
+    const schemaDiff = diffSchemas(current, target);
 
     expect(schemaDiff.removedIndexes).toEqual([
       { tableName: "todos", index: { name: "by_org", fields: ["orgId"] } },

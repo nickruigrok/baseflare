@@ -542,7 +542,7 @@ packages/baseflare/src/server/
   schema/         → defineSchema(), defineTable(), schema diffing
   functions/      → query(), mutation(), action(), internal wrappers
   db/             → query builder (json_extract() SQL), write validation, document serialization, DatabaseReader, DatabaseWriter
-  permissions/    → permission engine (defineRules, evaluate)
+  permissions/    → permission engine (defineRules, evaluateRules)
   http/           → httpAction(), httpRouter(), HttpRouter
   runtime/        → Phase 2+: createWorker(), D1 runtime, SubscriptionDO, SchedulerDO, R2StorageAdapter, VectorizeAdapter
   auth/           → Phase 5+: defineAuth(), better-auth document adapter, auth manager
@@ -633,7 +633,7 @@ const post2 = await ctx.db.insert('posts', { authorId: postId }) // ✗ TypeScri
    - Schema parser (`defineSchema`, `defineTable`)
    - Document serialization/deserialization (plain object ↔ JSON `_data` column, `_createdAt` derived from UUIDv7 in `_id`)
    - Schema diffing (tables + indexes only — field changes are no-ops)
-   - Permission engine (`defineRules`, deny-by-default — no access unless explicitly granted, evaluate rules against context + document)
+   - Permission engine (`defineRules`, deny-by-default — no access unless explicitly granted, `evaluateRules()` checks context + document)
    - Query builder (`.filter()`, `.order()`, `.limit()`, `.first()`, `.unique()`, `.take(n)`, `.count()`, `.collect()`, `.paginate(opts)` — produces `json_extract()` SQL)
    - Index definition (`.index("name", ["field1", "field2"])` → SQL index on `json_extract()`)
    - Write-time schema validation helpers (`validateInsertData`, `validateReplaceData`, `validatePatchData`) + return value validation
@@ -1408,7 +1408,7 @@ export function defineConfig(config: BaseflareConfig): BaseflareConfig
 
 // Schema (developer-facing API)
 export function defineSchema(tables: Record<string, TableDef>): Schema
-export function defineTable(fields: Record<string, FieldDef>): TableDefBuilder
+export function defineTable(fields: Record<string, FieldDef>): TableBuilder
 
 // Public functions (callable from client)
 export function query(def: { args: Validators; returns?: Validator; handler: (ctx: QueryCtx, args) => T }): QueryDef
@@ -1527,7 +1527,7 @@ export function serialize(doc: Record<string, unknown>): { _data: string }
 export function deserialize(row: { _id: string; _data: string }): Record<string, unknown>
 
 // Schema diffing + validation (internal)
-export function diff(current: Schema, target: Schema): SchemaDiff
+export function diffSchemas(current: Schema, target: Schema): SchemaDiff
 export function validateInsertData(table: TableDefinition, data: Record<string, unknown>): Record<string, unknown>
 export function validateReplaceData(table: TableDefinition, data: Record<string, unknown>): Record<string, unknown>
 export function validatePatchData(
@@ -1662,7 +1662,7 @@ const docs = result.rows.map(row => deserialize(row))
 
 // Permission engine works on plain objects
 const filtered = docs.filter(doc =>
-  evaluate(rules, { tableName: 'todos', operation: 'read', ctx, doc })
+  evaluateRules(rules, { tableName: 'todos', operation: 'read', ctx, doc })
 )
 
 // On mutation: core validates document against schema before writing

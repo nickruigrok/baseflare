@@ -316,4 +316,19 @@ describe("MutationDatabase", () => {
 
     expect(documents.map((document) => document.text)).toEqual(["a", "b"]);
   });
+
+  it("keeps an empty overlay result for zero limits", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersion: 0,
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "a" });
+
+    await expect(mutationDb.query("todos").limit(0).collect()).resolves.toEqual(
+      []
+    );
+  });
 });
