@@ -504,6 +504,7 @@ export class D1DatabaseAdapter<TContext = unknown>
       {
         sql: `INSERT INTO ${tableName} (_id, _data, _rev) VALUES (?, ?, 0)`,
         params: [id, serialized._data],
+        requireSingleChange: true,
       },
       createTableVersionBump(tableName),
     ]);

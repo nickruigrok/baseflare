@@ -139,7 +139,8 @@ function toComparableJsonValue(value: unknown): ComparableJsonValue {
     return { rank: 2, value };
   }
 
-  return { rank: 2, value: JSON.stringify(toStorageValue(value)) ?? "null" };
+  const serialized = JSON.stringify(toStorageValue(value));
+  return { rank: 2, value: serialized ?? String(value) };
 }
 
 export function compareSqliteJsonValues(left: unknown, right: unknown): number {

@@ -129,6 +129,42 @@ describe("D1 runtime helpers", () => {
     );
   });
 
+  it("requires D1 change counts for direct inserts", async () => {
+    const database = createAdapter({
+      batchResults: [
+        { success: true },
+        { meta: { changes: 1 }, success: true },
+      ],
+      rules: defineRules({
+        todos: {
+          insert: () => true,
+        },
+      }),
+    });
+
+    await expect(database.insert("todos", { text: "after" })).rejects.toThrow(
+      "D1 did not report a change count for the write operation"
+    );
+  });
+
+  it("accepts direct inserts with one reported D1 change", async () => {
+    const database = createAdapter({
+      batchResults: [
+        { meta: { changes: 1 }, success: true },
+        { meta: { changes: 1 }, success: true },
+      ],
+      rules: defineRules({
+        todos: {
+          insert: () => true,
+        },
+      }),
+    });
+
+    await expect(database.insert("todos", { text: "after" })).resolves.toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
+    );
+  });
+
   it("coerces direct insert validation errors", async () => {
     await expect(createAdapter().insert("todos", {})).rejects.toThrow(
       "Invalid insert document"
