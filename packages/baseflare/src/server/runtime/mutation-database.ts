@@ -82,6 +82,21 @@ function createBaseQueryState(): QueryState {
   return { order: { field: "_id", direction: "asc" } };
 }
 
+function getMutationQueryChunkSize(
+  state: QueryState,
+  shadowedCount: number
+): number {
+  if (state.limit === undefined) {
+    return MUTATION_QUERY_CHUNK_SIZE;
+  }
+
+  if (state.limit === 0) {
+    return 0;
+  }
+
+  return Math.min(state.limit + shadowedCount, MUTATION_QUERY_CHUNK_SIZE);
+}
+
 function mergeFilters(
   left: FilterObject | undefined,
   right: FilterObject
@@ -568,6 +583,11 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     cursor: CursorPayload | null,
     shadowedIds: Set<string>
   ): Promise<RuntimeDocument[]> {
+    const chunkSize = getMutationQueryChunkSize(state, shadowedIds.size);
+    if (chunkSize === 0) {
+      return [];
+    }
+
     const documents: RuntimeDocument[] = [];
     let offset = 0;
     let scannedBytes = 0;
@@ -578,7 +598,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         tableName,
         buildRuntimeSelectQuery(tableName, state, {
           cursor,
-          limit: MUTATION_QUERY_CHUNK_SIZE,
+          limit: chunkSize,
           offset,
         })
       );
@@ -611,7 +631,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         }
       }
 
-      if (rows.length < MUTATION_QUERY_CHUNK_SIZE) {
+      if (rows.length < chunkSize) {
         break;
       }
     }

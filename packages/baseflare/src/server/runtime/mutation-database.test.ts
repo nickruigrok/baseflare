@@ -12,10 +12,16 @@ import {
   RetryableMutationConflictError,
   withMutationRetry,
 } from "./mutation-database";
-import type { D1Database, D1PreparedStatement, D1Result } from "./types";
+import type {
+  D1BindingValue,
+  D1Database,
+  D1PreparedStatement,
+  D1Result,
+} from "./types";
 
 class FakePreparedStatement implements D1PreparedStatement {
   private readonly allHandler: (query: string) => D1Result | Promise<D1Result>;
+  readonly params: D1BindingValue[] = [];
   readonly query: string;
 
   constructor(
@@ -30,7 +36,8 @@ class FakePreparedStatement implements D1PreparedStatement {
     return this.allHandler(this.query) as Promise<D1Result<TRow>>;
   }
 
-  bind(): D1PreparedStatement {
+  bind(...values: D1BindingValue[]): D1PreparedStatement {
+    this.params.push(...values);
     return this;
   }
 
@@ -62,10 +69,12 @@ const rules = defineRules({
   todos: {
     insert: () => true,
     read: () => true,
+    update: () => true,
   },
 });
 
 function createFakeDatabase(options: {
+  batchParams?: D1BindingValue[][][];
   batchQueries?: string[][];
   batchResults: readonly D1Result[];
   readResults?: readonly FakeReadResult[];
@@ -77,6 +86,13 @@ function createFakeDatabase(options: {
       options.batchQueries?.push(
         statements.map((statement) =>
           statement instanceof FakePreparedStatement ? statement.query : ""
+        )
+      );
+      options.batchParams?.push(
+        statements.map((statement) =>
+          statement instanceof FakePreparedStatement
+            ? [...statement.params]
+            : []
         )
       );
 
@@ -210,6 +226,65 @@ describe("MutationDatabase", () => {
     expect(batchQueries[0]).toHaveLength(2);
     expect(batchQueries[0]?.[0]).toContain(`FROM ${TABLE_VERSION_TABLE_NAME}`);
     expect(batchQueries[0]?.[1]).toContain("FROM todos");
+  });
+
+  it("uses limited D1 chunks for limited mutation queries", async () => {
+    const batchParams: D1BindingValue[][][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchResults: [],
+        readResults: [{ version: 0, rows: [createStoredRow(1)] }],
+      })
+    );
+
+    const documents = await mutationDb.query("todos").limit(1).collect();
+
+    expect(documents.map((document) => document.text)).toEqual(["todo-1"]);
+    expect(batchParams[0]?.[1]).toEqual([1]);
+  });
+
+  it("accounts for shadowed rows when sizing limited D1 chunks", async () => {
+    const batchParams: D1BindingValue[][][] = [];
+    const firstRow = createStoredRow(1);
+    const secondRow = createStoredRow(2);
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchResults: [],
+        readResults: [
+          { rows: [firstRow] },
+          { rows: [secondRow] },
+          { version: 0, rows: [firstRow, secondRow, createStoredRow(3)] },
+        ],
+      })
+    );
+
+    await mutationDb.patch("todos", firstRow._id, { text: "todo-1-updated" });
+    await mutationDb.patch("todos", secondRow._id, {
+      text: "todo-2-updated",
+    });
+
+    const documents = await mutationDb.query("todos").limit(1).collect();
+
+    expect(documents).toHaveLength(1);
+    expect(batchParams[2]?.[1]).toEqual([3]);
+  });
+
+  it("skips base reads for zero-limit mutation queries", async () => {
+    const batchQueries: string[][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchQueries,
+        batchResults: [],
+        readResults: [{ version: 0, rows: [createStoredRow(1)] }],
+      })
+    );
+
+    await expect(mutationDb.query("todos").limit(0).collect()).resolves.toEqual(
+      []
+    );
+    expect(batchQueries).toEqual([]);
   });
 
   it("retries when query chunks observe different table versions", async () => {
