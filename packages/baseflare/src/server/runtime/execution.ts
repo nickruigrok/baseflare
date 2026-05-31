@@ -46,7 +46,7 @@ function validateArgs<TArgs>(
   try {
     return definition.validateArgs(args);
   } catch (error) {
-    coerceValidationError(error, "Invalid function arguments");
+    return coerceValidationError(error, "Invalid function arguments");
   }
 }
 
@@ -57,7 +57,7 @@ function validateReturn<TResult>(
   try {
     return definition.validateReturn(value);
   } catch (error) {
-    coerceValidationError(error, "Invalid function return value");
+    return coerceValidationError(error, "Invalid function return value");
   }
 }
 

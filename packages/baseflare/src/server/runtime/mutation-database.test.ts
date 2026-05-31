@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 import { defineRules } from "../permissions/define-rules";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
+import { TABLE_VERSION_TABLE_NAME } from "../schema/types";
+import type { StoredDocumentRow } from "./d1";
 import { InternalRuntimeError } from "./errors";
 import {
   MutationDatabase,
@@ -14,7 +16,7 @@ import type { D1Database, D1PreparedStatement, D1Result } from "./types";
 
 class FakePreparedStatement implements D1PreparedStatement {
   private readonly allHandler: (query: string) => D1Result | Promise<D1Result>;
-  private readonly query: string;
+  readonly query: string;
 
   constructor(
     query: string,
@@ -45,6 +47,11 @@ class FakePreparedStatement implements D1PreparedStatement {
   }
 }
 
+interface FakeReadResult {
+  readonly rows?: readonly Record<string, unknown>[];
+  readonly version?: number;
+}
+
 const schema = defineSchema({
   todos: defineTable({
     text: v.string(),
@@ -59,11 +66,43 @@ const rules = defineRules({
 });
 
 function createFakeDatabase(options: {
+  batchQueries?: string[][];
   batchResults: readonly D1Result[];
+  readResults?: readonly FakeReadResult[];
   tableVersion?: number;
 }): D1Database {
+  const readResults = [...(options.readResults ?? [])];
   return {
-    batch() {
+    batch(statements) {
+      options.batchQueries?.push(
+        statements.map((statement) =>
+          statement instanceof FakePreparedStatement ? statement.query : ""
+        )
+      );
+
+      const versionStatement = statements[0];
+      const queryStatement = statements[1];
+      if (
+        statements.length === 2 &&
+        versionStatement instanceof FakePreparedStatement &&
+        queryStatement instanceof FakePreparedStatement &&
+        versionStatement.query.includes(`FROM ${TABLE_VERSION_TABLE_NAME}`) &&
+        queryStatement.query.includes("FROM todos")
+      ) {
+        const read = readResults.shift() ?? {
+          version: options.tableVersion,
+          rows: [],
+        };
+        return Promise.resolve([
+          {
+            results:
+              read.version === undefined ? [] : [{ version: read.version }],
+            success: true,
+          },
+          { results: read.rows ?? [], success: true },
+        ]);
+      }
+
       return Promise.resolve(options.batchResults);
     },
     prepare(query) {
@@ -91,6 +130,14 @@ function createMutationDatabase(database: D1Database): MutationDatabase {
     rules,
     schema,
   });
+}
+
+function createStoredRow(index: number): StoredDocumentRow {
+  return {
+    _id: `019078e5-d29f-7000-8000-${index.toString(16).padStart(12, "0")}`,
+    _data: JSON.stringify({ text: `todo-${index}` }),
+    _rev: 0,
+  };
 }
 
 describe("MutationDatabase", () => {
@@ -145,6 +192,82 @@ describe("MutationDatabase", () => {
     await expect(mutationDb.commit()).rejects.toThrow(
       'Missing internal table version row for "todos"'
     );
+  });
+
+  it("reads query rows and table version in one D1 batch", async () => {
+    const batchQueries: string[][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchQueries,
+        batchResults: [],
+        readResults: [{ version: 0, rows: [createStoredRow(1)] }],
+      })
+    );
+
+    const documents = await mutationDb.query("todos").collect();
+
+    expect(documents.map((document) => document.text)).toEqual(["todo-1"]);
+    expect(batchQueries[0]).toHaveLength(2);
+    expect(batchQueries[0]?.[0]).toContain(`FROM ${TABLE_VERSION_TABLE_NAME}`);
+    expect(batchQueries[0]?.[1]).toContain("FROM todos");
+  });
+
+  it("retries when query chunks observe different table versions", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        readResults: [
+          {
+            version: 0,
+            rows: Array.from({ length: 256 }, (_, index) =>
+              createStoredRow(index + 1)
+            ),
+          },
+          { version: 1, rows: [] },
+        ],
+      })
+    );
+
+    await expect(mutationDb.query("todos").collect()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
+  });
+
+  it("records the batched table version for missing document reads", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          { results: [{ version: 1 }], success: true },
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ],
+        readResults: [{ version: 0, rows: [] }],
+      })
+    );
+
+    await expect(
+      mutationDb.get("todos", createStoredRow(1)._id)
+    ).resolves.toBeNull();
+    await mutationDb.insert("todos", { text: "after-missing-get" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
+  });
+
+  it("does not require table versions for successful point reads", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        readResults: [{ rows: [createStoredRow(1)] }],
+      })
+    );
+
+    await expect(
+      mutationDb.get("todos", createStoredRow(1)._id)
+    ).resolves.toMatchObject({
+      text: "todo-1",
+    });
   });
 
   it("requires at least one mutation retry attempt", async () => {

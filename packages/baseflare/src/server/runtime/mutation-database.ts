@@ -27,8 +27,7 @@ import {
   buildRuntimeSelectQuery,
   createTableVersionBump,
   deserializeRuntimeDocument,
-  executeRowQuery,
-  fetchVersionedDocument,
+  deserializeVersionedRuntimeDocument,
   type RuntimeDocument,
   type StoredDocumentRow,
 } from "./d1";
@@ -36,8 +35,10 @@ import {
   ConflictRuntimeError,
   coerceDatabaseError,
   coerceValidationError,
+  ensureSuccessfulD1Result,
   InternalRuntimeError,
   NotFoundRuntimeError,
+  withDatabaseErrorHandling,
 } from "./errors";
 import { logRuntimeEvent } from "./logging";
 import {
@@ -55,6 +56,11 @@ interface PendingMutationWrite {
   readonly document?: RuntimeDocument;
   readonly serializedData?: string;
   readonly type: "delete" | "insert" | "update";
+}
+
+interface TableVersionReadResult<TRow extends Record<string, unknown>> {
+  readonly rows: readonly TRow[];
+  readonly version: unknown;
 }
 
 type CommitOperation =
@@ -402,15 +408,23 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       return (await this.canRead(tableName, document)) ? document : null;
     }
 
-    const existing = await fetchVersionedDocument(this.database, tableName, id);
+    const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
+      tableName,
+      {
+        sql: `SELECT _id, _data, _rev FROM ${tableName} WHERE _id = ? LIMIT 1`,
+        params: [id],
+      }
+    );
+    const existing = read.rows[0];
     if (!existing) {
-      await this.recordTableRead(tableName);
+      this.recordTableReadVersion(tableName, read.version);
       return null;
     }
 
-    this.recordRowRead(tableName, id, existing.rev);
-    return (await this.canRead(tableName, existing.document))
-      ? existing.document
+    const versioned = deserializeVersionedRuntimeDocument(tableName, existing);
+    this.recordRowRead(tableName, id, versioned.rev);
+    return (await this.canRead(tableName, versioned.document))
+      ? versioned.document
       : null;
   }
 
@@ -509,7 +523,6 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     state: QueryState,
     cursor: CursorPayload | null
   ): Promise<RuntimeDocument[]> {
-    await this.recordTableRead(tableName);
     const shadowedIds = this.getShadowedIds(tableName);
     const baseDocuments = await this.collectBaseDocuments(
       tableName,
@@ -545,18 +558,21 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     let scannedRows = 0;
 
     while (true) {
-      const rows = await executeRowQuery<StoredDocumentRow>(
-        this.database,
+      const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
+        tableName,
         buildRuntimeSelectQuery(tableName, state, {
           cursor,
           limit: MUTATION_QUERY_CHUNK_SIZE,
           offset,
         })
       );
+      const { rows } = read;
       if (rows.length === 0) {
+        this.recordTableReadVersion(tableName, read.version);
         break;
       }
 
+      this.recordTableReadVersion(tableName, read.version);
       offset += rows.length;
       for (const row of rows) {
         scannedRows += 1;
@@ -744,16 +760,24 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       };
     }
 
-    const existing = await fetchVersionedDocument(this.database, tableName, id);
+    const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
+      tableName,
+      {
+        sql: `SELECT _id, _data, _rev FROM ${tableName} WHERE _id = ? LIMIT 1`,
+        params: [id],
+      }
+    );
+    const existing = read.rows[0];
     if (!existing) {
-      await this.recordTableRead(tableName);
+      this.recordTableReadVersion(tableName, read.version);
       throw new NotFoundRuntimeError(
         `Document "${id}" was not found in table "${tableName}"`
       );
     }
 
-    this.recordRowRead(tableName, id, existing.rev);
-    return { baseRev: existing.rev, document: existing.document };
+    const versioned = deserializeVersionedRuntimeDocument(tableName, existing);
+    this.recordRowRead(tableName, id, versioned.rev);
+    return { baseRev: versioned.rev, document: versioned.document };
   }
 
   private getShadowedIds(tableName: string): Set<string> {
@@ -925,12 +949,50 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     return write.document;
   }
 
-  private async recordTableRead(tableName: string): Promise<void> {
-    const rows = await executeRowQuery<{ version: number }>(this.database, {
-      sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
-      params: [tableName],
-    });
-    const version = rows[0]?.version;
+  private async fetchTableVersionAndRows<TRow extends Record<string, unknown>>(
+    tableName: string,
+    query: {
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+    }
+  ): Promise<TableVersionReadResult<TRow>> {
+    const versionSql = `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`;
+    const versionStatement = bindStatement(this.database, versionSql, [
+      tableName,
+    ]);
+    const queryStatement = bindStatement(
+      this.database,
+      query.sql,
+      query.params
+    );
+    const results = await withDatabaseErrorHandling(
+      "Failed to run D1 mutation read",
+      async () => this.database.batch([versionStatement, queryStatement])
+    );
+    const versionResult = results[0];
+    const queryResult = results[1];
+    if (!(versionResult && queryResult)) {
+      throw new InternalRuntimeError(
+        "D1 mutation read did not return all batch results"
+      );
+    }
+
+    ensureSuccessfulD1Result(
+      versionResult,
+      `Failed to run D1 query "${versionSql}"`
+    );
+    ensureSuccessfulD1Result(
+      queryResult,
+      `Failed to run D1 query "${query.sql}"`
+    );
+
+    return {
+      version: versionResult.results?.[0]?.version,
+      rows: (queryResult?.results ?? []) as readonly TRow[],
+    };
+  }
+
+  private recordTableReadVersion(tableName: string, version: unknown): void {
     if (typeof version !== "number") {
       throw new InternalRuntimeError(
         `Missing internal table version row for "${tableName}"`
