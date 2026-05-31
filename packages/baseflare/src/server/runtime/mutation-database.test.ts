@@ -209,6 +209,25 @@ function createStoredRow(index: number): StoredDocumentRow {
 }
 
 describe("MutationDatabase", () => {
+  it("fails closed when a mutated table has no committed writes", () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({ batchResults: [] })
+    );
+    const appendWriteStatements = (
+      mutationDb as unknown as {
+        appendWriteStatementsForTable(
+          operations: unknown[],
+          tableName: string,
+          expectedPreviousChanges: number
+        ): number;
+      }
+    ).appendWriteStatementsForTable.bind(mutationDb);
+
+    expect(() => appendWriteStatements([], "todos", 1)).toThrow(
+      'Mutated table "todos" has no committed writes'
+    );
+  });
+
   it("creates primary sessions without re-wrapping existing sessions", () => {
     let rootSessionConstraint: string | undefined;
     let nestedSessionCalled = false;
@@ -279,6 +298,22 @@ describe("MutationDatabase", () => {
     await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
     await expect(mutationDb.commit()).rejects.toThrow(
       'Mutation commit operation "bump-table-versions" did not report a D1 change count'
+    );
+  });
+
+  it("includes the table name in duplicate mutation unique errors", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersion: 0,
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "first" });
+    await mutationDb.insert("todos", { text: "second" });
+
+    await expect(mutationDb.query("todos").unique()).rejects.toThrow(
+      'Expected exactly one document from "todos", received 2'
     );
   });
 

@@ -2,7 +2,11 @@ import { minIdForMs } from "baseflare/values";
 import { describe, expect, it } from "vitest";
 
 import { decodeCursor } from "./cursor";
-import { compareSqliteJsonValues, matchesFilter } from "./filters";
+import {
+  compareSqliteJsonValues,
+  fieldExpression,
+  matchesFilter,
+} from "./filters";
 import { createQueryBuilder } from "./query-builder";
 
 const UNIQUE_DOCUMENT_ERROR_PATTERN = /Expected exactly one document/;
@@ -134,6 +138,10 @@ describe("createQueryBuilder", () => {
     expect(query.toSQL().sql).toBe(
       "SELECT _id, _data FROM todos ORDER BY _id ASC"
     );
+  });
+
+  it("resolves _createdAt field expressions to _id", () => {
+    expect(fieldExpression("_createdAt")).toBe("_id");
   });
 
   it("filters _id directly", () => {

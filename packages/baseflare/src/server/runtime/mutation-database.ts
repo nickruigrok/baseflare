@@ -302,7 +302,7 @@ class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
 
     if (documents.length > 1) {
       throw new InternalRuntimeError(
-        `Expected exactly one document, received ${documents.length}`
+        `Expected exactly one document from "${this.tableName}", received ${documents.length}`
       );
     }
 
@@ -973,18 +973,30 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     let previousChanges = expectedPreviousChanges;
     const writes = this.pendingWrites.get(tableName);
     if (!writes) {
-      return previousChanges;
+      throw new InternalRuntimeError(
+        `Mutated table "${tableName}" has no committed writes`
+      );
     }
 
+    let appendedWrite = false;
     for (const [id, write] of writes) {
       if (!hasCommittedEffect(write)) {
         continue;
       }
 
+      appendedWrite = true;
       operations.push(
         this.createWriteOperation(tableName, id, write, previousChanges)
       );
       previousChanges = 1;
+    }
+
+    // getMutatedTables() only returns tables with committed-effect writes. If
+    // that invariant changes, the changes() chain must fail closed.
+    if (!appendedWrite) {
+      throw new InternalRuntimeError(
+        `Mutated table "${tableName}" has no committed writes`
+      );
     }
 
     return previousChanges;

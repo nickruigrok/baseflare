@@ -191,7 +191,7 @@ export function matchesSqliteJsonComparison(
 
 /** SQL fragment that addresses a field for filtering, ordering, or row comparison. */
 export function fieldExpression(name: string): string {
-  if (name === ID_FIELD) {
+  if (name === ID_FIELD || name === CREATED_AT_FIELD) {
     return ID_FIELD;
   }
 

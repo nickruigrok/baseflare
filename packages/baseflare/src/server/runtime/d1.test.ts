@@ -18,10 +18,16 @@ import type { D1Database, D1PreparedStatement, D1Result } from "./types";
 
 class FakePreparedStatement implements D1PreparedStatement {
   private readonly firstResult: Record<string, unknown> | null;
+  private readonly rows: readonly Record<string, unknown>[];
   readonly query: string;
 
-  constructor(query: string, firstResult: Record<string, unknown> | null) {
+  constructor(
+    query: string,
+    firstResult: Record<string, unknown> | null,
+    rows: readonly Record<string, unknown>[]
+  ) {
     this.firstResult = firstResult;
+    this.rows = rows;
     this.query = query;
   }
 
@@ -29,7 +35,7 @@ class FakePreparedStatement implements D1PreparedStatement {
     const result = {
       results: this.query.includes("_bf_table_versions")
         ? [{ version: 0 }]
-        : [],
+        : this.rows,
       success: true,
     } as unknown as D1Result<TRow>;
     return Promise.resolve(result);
@@ -69,6 +75,7 @@ function createStoredRow(
 function createFakeDatabase(options: {
   readonly batchQueries?: string[][];
   readonly batchResults: readonly D1Result[];
+  readonly queryRows?: readonly Record<string, unknown>[];
 }): D1Database {
   return {
     batch(statements) {
@@ -80,11 +87,15 @@ function createFakeDatabase(options: {
       return Promise.resolve(options.batchResults);
     },
     prepare(query) {
-      return new FakePreparedStatement(query, {
-        _id: testId,
-        _data: JSON.stringify({ text: "before" }),
-        _rev: 0,
-      });
+      return new FakePreparedStatement(
+        query,
+        {
+          _id: testId,
+          _data: JSON.stringify({ text: "before" }),
+          _rev: 0,
+        },
+        options.queryRows ?? []
+      );
     },
   };
 }
@@ -100,12 +111,14 @@ function createTodoSchema() {
 function createAdapter(options?: {
   readonly batchQueries?: string[][];
   readonly batchResults?: readonly D1Result[];
+  readonly queryRows?: readonly Record<string, unknown>[];
   readonly rules?: ReturnType<typeof defineRules>;
 }): D1DatabaseAdapter {
   return new D1DatabaseAdapter({
     database: createFakeDatabase({
       batchQueries: options?.batchQueries,
       batchResults: options?.batchResults ?? [],
+      queryRows: options?.queryRows,
     }),
     getContext: () => ({}),
     rules: options?.rules,
@@ -203,6 +216,24 @@ describe("D1 runtime helpers", () => {
     expect(position.cursor).toBeNull();
     expect(query.sql).toContain("OFFSET ?");
     expect(query.params).toEqual([256, 1]);
+  });
+
+  it("includes the table name in duplicate unique errors", async () => {
+    const database = createAdapter({
+      queryRows: [
+        createStoredRow(testId),
+        createStoredRow(nextTestId, { text: "after" }),
+      ],
+      rules: defineRules({
+        todos: {
+          read: () => true,
+        },
+      }),
+    });
+
+    await expect(database.query("todos").unique()).rejects.toThrow(
+      'Expected exactly one document from "todos", received 2'
+    );
   });
 
   it("requires D1 change counts for direct write operations", async () => {
