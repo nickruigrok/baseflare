@@ -42,6 +42,7 @@ const CREATED_AT_FIELD = "_createdAt";
 const QUERYABLE_RESERVED_FIELDS = new Set([ID_FIELD, CREATED_AT_FIELD]);
 const LOGICAL_FILTER_KEYS = new Set(["AND", "OR", "NOT"]);
 const FILTER_OPERATORS = new Set(["eq", "neq", "gt", "gte", "lt", "lte", "in"]);
+const MAX_IN_VALUES = 100;
 const COMPARISON_OPERATOR_SQL: Record<"gt" | "gte" | "lt" | "lte", string> = {
   gt: ">",
   gte: ">=",
@@ -304,6 +305,10 @@ function compileInFilter(
 ): CompiledFilter {
   if (values.length === 0) {
     throw error(path, "must not be empty");
+  }
+
+  if (values.length > MAX_IN_VALUES) {
+    throw error(path, `must not contain more than ${MAX_IN_VALUES} values`);
   }
 
   const nonNullValues = values.filter((value) => value !== null);

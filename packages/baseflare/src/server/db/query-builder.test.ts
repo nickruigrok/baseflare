@@ -147,6 +147,23 @@ describe("createQueryBuilder", () => {
     });
   });
 
+  it("limits in filters to a bounded number of values", () => {
+    const values = Array.from({ length: 100 }, (_, index) => `id-${index}`);
+    const query = createQueryBuilder("todos").filter({
+      _id: { in: values },
+    }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL().params).toHaveLength(100);
+
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({
+          _id: { in: [...values, "id-100"] },
+        }) as ReturnType<typeof createQueryBuilder>
+      ).toSQL()
+    ).toThrow(/must not contain more than 100 values/);
+  });
+
   it("translates _createdAt range filters to _id boundaries", () => {
     const query = createQueryBuilder("todos").filter({
       _createdAt: { gte: 1000 },

@@ -239,9 +239,22 @@ describe("MutationDatabase", () => {
       },
     };
 
-    expect(createMutationDatabaseSession(database)).toBe(session);
+    const rootSession = createMutationDatabaseSession(database);
+    expect(rootSession).toBe(session);
     expect(rootSessionConstraint).toBe("first-primary");
-    expect(createMutationDatabaseSession(session)).toBe(session);
+    expect(rootSession).toMatchObject({
+      batch: expect.any(Function),
+      getBookmark: expect.any(Function),
+      prepare: expect.any(Function),
+    });
+
+    const existingSession = createMutationDatabaseSession(session);
+    expect(existingSession).toBe(session);
+    expect(existingSession).toMatchObject({
+      batch: expect.any(Function),
+      getBookmark: expect.any(Function),
+      prepare: expect.any(Function),
+    });
     expect(nestedSessionCalled).toBe(false);
   });
 

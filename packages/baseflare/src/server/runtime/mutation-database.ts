@@ -984,6 +984,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         }
 
         if (changes !== operation.expectedChanges) {
+          // The guarded bump uses one global AND predicate, so D1 should report
+          // either zero changed rows or every mutated table-version row.
           if (operation.type === "bump-table-versions" && changes === 0) {
             throw new RetryableMutationConflictError();
           }
