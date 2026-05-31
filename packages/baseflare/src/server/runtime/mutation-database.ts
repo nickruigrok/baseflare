@@ -564,6 +564,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       cursor,
       shadowedBaseIds
     );
+    if (state.limit === 0) {
+      return [];
+    }
+
     const documents = [...baseDocuments];
 
     for (const document of await this.getReadableOverlayDocuments(
@@ -588,6 +592,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   ): Promise<RuntimeDocument[]> {
     const chunkSize = getMutationQueryChunkSize(state, shadowedBaseIds.size);
     if (chunkSize === 0) {
+      this.recordTableReadVersion(
+        tableName,
+        await this.fetchTableVersion(tableName)
+      );
       return [];
     }
 
@@ -653,10 +661,17 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     const documents: RuntimeDocument[] = [];
+    let scannedBytes = 0;
+    let scannedRows = 0;
     for (const write of writes.values()) {
       if (write.type === "delete" || !write.document) {
         continue;
       }
+
+      scannedRows += 1;
+      scannedBytes +=
+        write.serializedData?.length ?? JSON.stringify(write.document).length;
+      assertWithinScanBudget(scannedRows, scannedBytes);
 
       if (!matchesFilter(state.filter, write.document)) {
         continue;
@@ -672,6 +687,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     return documents;
+  }
+
+  private async fetchTableVersion(tableName: string): Promise<unknown> {
+    const rows = await executeRowQuery<{ version: number }>(this.database, {
+      sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
+      params: [tableName],
+    });
+    return rows[0]?.version;
   }
 
   private buildCommitOperations(
@@ -1154,6 +1177,8 @@ export function createMutationDatabaseSession(
     return database;
   }
 
+  // D1 Sessions provide the strongest mutation read consistency. Runtimes
+  // without sessions fall back to the raw binding and rely on OCC at commit.
   return database.withSession?.("first-primary") ?? database;
 }
 

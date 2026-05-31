@@ -98,9 +98,19 @@ function createFakeDatabase(options: {
   queryLog?: string[];
   readResults?: readonly FakeReadResult[];
   tableVersion?: null | number;
+  tableVersionReads?: readonly (null | number)[];
   tableVersions?: Readonly<Record<string, number>>;
 }): D1Database {
   const readResults = [...(options.readResults ?? [])];
+  const tableVersionReads = [...(options.tableVersionReads ?? [])];
+  const readTableVersion = (): null | number => {
+    if (tableVersionReads.length > 0) {
+      return tableVersionReads.shift() ?? null;
+    }
+
+    return options.tableVersion === undefined ? 0 : options.tableVersion;
+  };
+
   return {
     batch(statements) {
       options.batchQueries?.push(
@@ -147,6 +157,7 @@ function createFakeDatabase(options: {
         if (statement.includes("FROM _bf_table_versions")) {
           if (statement.includes(" IN ")) {
             const tableVersions = options.tableVersions ?? {};
+            const versionOverride = tableVersionReads.shift();
             return {
               results: params
                 .map((tableName) => {
@@ -155,10 +166,9 @@ function createFakeDatabase(options: {
                   }
 
                   const version =
-                    tableVersions[tableName] ??
-                    (options.tableVersion === undefined
-                      ? 0
-                      : options.tableVersion);
+                    versionOverride === undefined
+                      ? (tableVersions[tableName] ?? readTableVersion())
+                      : versionOverride;
                   return version === null
                     ? undefined
                     : { table_name: tableName, version };
@@ -168,8 +178,7 @@ function createFakeDatabase(options: {
             };
           }
 
-          const version =
-            options.tableVersion === undefined ? 0 : options.tableVersion;
+          const version = readTableVersion();
           return {
             results: version === null ? [] : [{ version }],
             success: true,
@@ -300,7 +309,6 @@ describe("MutationDatabase", () => {
 
     await mutationDb.insert("todos", { text: "assertion-validation" });
 
-    await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
     await expect(mutationDb.commit()).rejects.toThrow(
       'Missing internal table version row for "todos"'
     );
@@ -502,20 +510,40 @@ describe("MutationDatabase", () => {
     expect(documents.map((document) => document.text)).toEqual(["todo-2"]);
   });
 
-  it("skips base reads for zero-limit mutation queries", async () => {
-    const batchQueries: string[][] = [];
+  it("records table versions without base rows for zero-limit mutation queries", async () => {
+    const queryLog: string[] = [];
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
-        batchQueries,
         batchResults: [],
-        readResults: [{ version: 0, rows: [createStoredRow(1)] }],
+        queryLog,
+        tableVersion: 0,
       })
     );
 
     await expect(mutationDb.query("todos").limit(0).collect()).resolves.toEqual(
       []
     );
-    expect(batchQueries).toEqual([]);
+    expect(queryLog).toEqual([
+      "SELECT version FROM _bf_table_versions WHERE table_name = ? LIMIT 1",
+    ]);
+  });
+
+  it("retries stale writes after zero-limit mutation queries", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersionReads: [0, 1],
+      })
+    );
+
+    await expect(mutationDb.query("todos").limit(0).collect()).resolves.toEqual(
+      []
+    );
+    await mutationDb.insert("todos", { text: "after-zero-limit" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
   });
 
   it("retries when query chunks observe different table versions", async () => {
@@ -625,9 +653,11 @@ describe("MutationDatabase", () => {
   });
 
   it("keeps an empty overlay result for zero limits", async () => {
+    const queryLog: string[] = [];
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
         batchResults: [],
+        queryLog,
         tableVersion: 0,
       })
     );
@@ -636,6 +666,24 @@ describe("MutationDatabase", () => {
 
     await expect(mutationDb.query("todos").limit(0).collect()).resolves.toEqual(
       []
+    );
+    expect(queryLog).toEqual([
+      "SELECT version FROM _bf_table_versions WHERE table_name = ? LIMIT 1",
+    ]);
+  });
+
+  it("applies scan budgets to pending overlay documents", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersion: 0,
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "x".repeat(5_000_001) });
+
+    await expect(mutationDb.query("todos").collect()).rejects.toThrow(
+      "Query exceeded the internal scan budget; add a more selective filter"
     );
   });
 });

@@ -733,7 +733,7 @@ const createdAt = getCreatedAtFromId(id)
 19. D1 mutation commits gate document writes behind guarded table-version bumps before running document statements, because D1 batch result validation is not a rollback boundary
 20. Baseflare does not provide built-in duplicate-execution protection. Side-effectful work belongs in actions, and duplicate handling is application-managed around the specific external system or table that needs it.
 
-**Phase 2 scaling note:** The D1 OCC guard grows with the mutation read/write dependency set. This is correct and production-safe for normal SaaS mutations, but future hardening should monitor SQL size, D1 parameter limits, high-contention retries, and very large bulk-write patterns. If needed, add explicit chunked bulk/import APIs instead of making normal mutations more complex.
+**Phase 2 scaling note:** The D1 OCC guard grows with the mutation read/write dependency set. This is correct and production-safe for normal SaaS mutations, but future hardening should monitor SQL size, D1 parameter limits, high-contention retries, and very large bulk-write patterns. D1 chunk scans are currently correct under the internal scan budget, but should move from `OFFSET` to keyset advancement in a dedicated performance pass. If needed, add explicit chunked bulk/import APIs instead of making normal mutations more complex.
 
 **"Done" criteria:**
 ```bash

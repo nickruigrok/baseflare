@@ -22,12 +22,6 @@ import type {
 const schema = defineSchema({
   todos: defineTable({ text: v.string() }),
 });
-const rules = defineRules({
-  todos: {
-    insert: () => true,
-    read: () => true,
-  },
-});
 
 class FakePreparedStatement implements D1PreparedStatement {
   private readonly query: string;
@@ -41,7 +35,13 @@ class FakePreparedStatement implements D1PreparedStatement {
       success: true,
       results: this.query.includes("_bf_table_versions")
         ? [{ table_name: "todos", version: 0 }]
-        : [],
+        : [
+            {
+              _id: "019078e5-d29f-7000-8000-000000000001",
+              _data: JSON.stringify({ text: "from-session" }),
+              _rev: 0,
+            },
+          ],
     } as unknown as D1Result<TRow>;
     return Promise.resolve(result);
   }
@@ -103,9 +103,19 @@ describe("worker request body reader", () => {
   it("uses a primary D1 session for action database access and nested calls", async () => {
     let rootSessionCalls = 0;
     let nestedSessionCalls = 0;
+    let readRuleCalls = 0;
     let sessionConstraint: string | undefined;
     let sessionBatchCalled = false;
     let sessionPrepareCalls = 0;
+    const actionRules = defineRules({
+      todos: {
+        insert: () => true,
+        read: () => {
+          readRuleCalls += 1;
+          return false;
+        },
+      },
+    });
     const session: D1DatabaseSession & {
       withSession(constraint?: string): D1DatabaseSession;
     } = {
@@ -143,8 +153,7 @@ describe("worker request body reader", () => {
     };
     const getTodoQuery = query({
       args: {},
-      handler: (ctx) =>
-        ctx.db.get("todos", "019078e5-d29f-7000-8000-000000000001"),
+      handler: (ctx) => ctx.db.query("todos").collect(),
     });
     const getTodoAction = action({
       args: {},
@@ -159,7 +168,8 @@ describe("worker request body reader", () => {
       args: {},
       async handler(ctx) {
         await ctx.db.get("todos", "019078e5-d29f-7000-8000-000000000001");
-        await ctx.runQuery(getTodoQuery, {});
+        const nestedQueryResult = await ctx.runQuery(getTodoQuery, {});
+        expect(nestedQueryResult).toEqual([]);
         await ctx.runAction(getTodoAction, {});
         await ctx.runMutation(insertTodoMutation, {});
       },
@@ -199,7 +209,7 @@ describe("worker request body reader", () => {
         })
       ),
       requestHeaders: new Headers(),
-      rules,
+      rules: actionRules,
       schema,
     });
 
@@ -210,5 +220,6 @@ describe("worker request body reader", () => {
     expect(nestedSessionCalls).toBe(0);
     expect(sessionPrepareCalls).toBeGreaterThanOrEqual(3);
     expect(sessionBatchCalled).toBe(true);
+    expect(readRuleCalls).toBeGreaterThan(0);
   });
 });
