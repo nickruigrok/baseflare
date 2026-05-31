@@ -67,6 +67,12 @@ export interface VersionedRuntimeDocument {
   readonly rev: number;
 }
 
+export interface CommitGuard {
+  readonly insertedIds?: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly rowRevisions?: ReadonlyMap<string, ReadonlyMap<string, number>>;
+  readonly tableVersions?: ReadonlyMap<string, number>;
+}
+
 interface RuntimeQueryOptions<TContext> {
   readonly database: D1Database;
   readonly getContext: () => TContext;
@@ -80,6 +86,74 @@ type D1PrepareDatabase = Pick<D1Database, "prepare">;
 const QUERY_SCAN_CHUNK_SIZE = 256;
 const QUERY_SCAN_BYTE_LIMIT = 5_000_000;
 const QUERY_SCAN_ROW_LIMIT = 20_000;
+
+function appendGuardCondition(
+  conditions: string[],
+  params: Array<string | number | null>,
+  condition: string,
+  conditionParams: readonly (string | number | null)[]
+): void {
+  conditions.push(condition);
+  params.push(...conditionParams);
+}
+
+function buildCommitGuardConditions(
+  guard: CommitGuard,
+  options: {
+    readonly ignoredTables?: ReadonlySet<string>;
+  } = {}
+): {
+  readonly conditions: readonly string[];
+  readonly params: readonly (string | number | null)[];
+} {
+  const conditions: string[] = [];
+  const params: Array<string | number | null> = [];
+
+  for (const [tableName, version] of guard.tableVersions ?? []) {
+    if (options.ignoredTables?.has(tableName)) {
+      continue;
+    }
+
+    appendGuardCondition(
+      conditions,
+      params,
+      `EXISTS (SELECT 1 FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? AND version = ?)`,
+      [tableName, version]
+    );
+  }
+
+  for (const [tableName, reads] of guard.rowRevisions ?? []) {
+    if (options.ignoredTables?.has(tableName)) {
+      continue;
+    }
+
+    for (const [id, rev] of reads) {
+      appendGuardCondition(
+        conditions,
+        params,
+        `EXISTS (SELECT 1 FROM ${tableName} WHERE _id = ? AND _rev = ?)`,
+        [id, rev]
+      );
+    }
+  }
+
+  for (const [tableName, ids] of guard.insertedIds ?? []) {
+    if (options.ignoredTables?.has(tableName)) {
+      continue;
+    }
+
+    for (const id of ids) {
+      appendGuardCondition(
+        conditions,
+        params,
+        `NOT EXISTS (SELECT 1 FROM ${tableName} WHERE _id = ?)`,
+        [id]
+      );
+    }
+  }
+
+  return { conditions, params };
+}
 
 export function bindStatement(
   database: D1PrepareDatabase,
@@ -429,7 +503,13 @@ export function assertWithinScanBudget(
   }
 }
 
-function ensureSingleChange(changes: number | undefined): void {
+function ensureSingleChange(
+  changes: number | undefined,
+  operation: {
+    readonly conflictOnZero?: boolean;
+    readonly type: string;
+  }
+): void {
   if (changes === undefined) {
     throw new InternalRuntimeError(
       "D1 did not report a change count for the write operation"
@@ -437,7 +517,13 @@ function ensureSingleChange(changes: number | undefined): void {
   }
 
   if (changes !== 1) {
-    throw new ConflictRuntimeError("Document changed concurrently");
+    if (operation.conflictOnZero) {
+      throw new ConflictRuntimeError("Document changed concurrently");
+    }
+
+    throw new InternalRuntimeError(
+      `D1 write operation "${operation.type}" did not apply after its guard passed`
+    );
   }
 }
 
@@ -503,13 +589,21 @@ export class D1DatabaseAdapter<TContext = unknown>
 
     const id = generateId();
     const serialized = serialize(validated);
+    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createGuardedTableVersionBump(
+        tableName,
+        createDirectWriteGuard(tableName, {
+          insertId: id,
+        })
+      ),
       {
-        sql: `INSERT INTO ${tableName} (_id, _data, _rev) VALUES (?, ?, 0)`,
+        type: "insert",
+        sql: `INSERT INTO ${tableName} (_id, _data, _rev)
+              SELECT ?, ?, 0 WHERE changes() = 1`,
         params: [id, serialized._data],
         requireSingleChange: true,
       },
-      createTableVersionBump(tableName),
     ]);
 
     return id;
@@ -532,13 +626,23 @@ export class D1DatabaseAdapter<TContext = unknown>
     );
 
     const serialized = serialize(validated);
+    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createGuardedTableVersionBump(
+        tableName,
+        createDirectWriteGuard(tableName, {
+          rowId: id,
+          rev: existing.rev,
+        })
+      ),
       {
-        sql: `UPDATE ${tableName} SET _data = ?, _rev = _rev + 1 WHERE _id = ? AND _rev = ?`,
+        type: "update",
+        sql: `UPDATE ${tableName}
+              SET _data = ?, _rev = _rev + 1
+              WHERE _id = ? AND _rev = ? AND changes() = 1`,
         params: [serialized._data, id, existing.rev],
         requireSingleChange: true,
       },
-      createTableVersionBump(tableName),
     ]);
   }
 
@@ -559,13 +663,23 @@ export class D1DatabaseAdapter<TContext = unknown>
     );
 
     const serialized = serialize(validated);
+    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createGuardedTableVersionBump(
+        tableName,
+        createDirectWriteGuard(tableName, {
+          rowId: id,
+          rev: existing.rev,
+        })
+      ),
       {
-        sql: `UPDATE ${tableName} SET _data = ?, _rev = _rev + 1 WHERE _id = ? AND _rev = ?`,
+        type: "update",
+        sql: `UPDATE ${tableName}
+              SET _data = ?, _rev = _rev + 1
+              WHERE _id = ? AND _rev = ? AND changes() = 1`,
         params: [serialized._data, id, existing.rev],
         requireSingleChange: true,
       },
-      createTableVersionBump(tableName),
     ]);
   }
 
@@ -579,13 +693,22 @@ export class D1DatabaseAdapter<TContext = unknown>
       existing.document
     );
 
+    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createGuardedTableVersionBump(
+        tableName,
+        createDirectWriteGuard(tableName, {
+          rowId: id,
+          rev: existing.rev,
+        })
+      ),
       {
-        sql: `DELETE FROM ${tableName} WHERE _id = ? AND _rev = ?`,
+        type: "delete",
+        sql: `DELETE FROM ${tableName}
+              WHERE _id = ? AND _rev = ? AND changes() = 1`,
         params: [id, existing.rev],
         requireSingleChange: true,
       },
-      createTableVersionBump(tableName),
     ]);
   }
 
@@ -637,11 +760,25 @@ export class D1DatabaseAdapter<TContext = unknown>
     }
   }
 
+  private async assertTableVersionRow(tableName: string): Promise<void> {
+    const rows = await executeRowQuery<{ version: number }>(this.database, {
+      sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
+      params: [tableName],
+    });
+    if (typeof rows[0]?.version !== "number") {
+      throw new InternalRuntimeError(
+        `Missing internal table version row for "${tableName}"`
+      );
+    }
+  }
+
   private async runWriteBatch(
     operations: readonly {
+      readonly conflictOnZero?: boolean;
       readonly params: readonly (string | number | null)[];
       readonly requireSingleChange?: boolean;
       readonly sql: string;
+      readonly type: "bump-table-version" | "delete" | "insert" | "update";
     }[]
   ): Promise<void> {
     const statements = operations.map((operation) =>
@@ -661,20 +798,75 @@ export class D1DatabaseAdapter<TContext = unknown>
     for (const [index, result] of results.entries()) {
       ensureSuccessfulD1Result(result, "Failed to commit D1 write");
       if (operations[index]?.requireSingleChange) {
-        ensureSingleChange(result.meta?.changes);
+        ensureSingleChange(result.meta?.changes, operations[index]);
       }
     }
   }
 }
 
+function createDirectWriteGuard(
+  tableName: string,
+  options:
+    | {
+        readonly insertId: string;
+      }
+    | {
+        readonly rev: number;
+        readonly rowId: string;
+      }
+): CommitGuard {
+  if ("insertId" in options) {
+    return {
+      insertedIds: new Map([[tableName, new Set([options.insertId])]]),
+    };
+  }
+
+  return {
+    rowRevisions: new Map([
+      [tableName, new Map([[options.rowId, options.rev]])],
+    ]),
+  };
+}
+
 export function createTableVersionBump(tableName: string): {
+  readonly conflictOnZero: true;
   readonly params: readonly string[];
   readonly requireSingleChange: true;
   readonly sql: string;
+  readonly type: "bump-table-version";
 } {
   return {
     sql: `UPDATE ${TABLE_VERSION_TABLE_NAME} SET version = version + 1 WHERE table_name = ?`,
     params: [tableName],
+    conflictOnZero: true,
     requireSingleChange: true,
+    type: "bump-table-version",
+  };
+}
+
+export function createGuardedTableVersionBump(
+  tableName: string,
+  guard: CommitGuard,
+  options: {
+    readonly ignoredTables?: ReadonlySet<string>;
+  } = {}
+): {
+  readonly conflictOnZero: true;
+  readonly params: readonly (string | number | null)[];
+  readonly requireSingleChange: true;
+  readonly sql: string;
+  readonly type: "bump-table-version";
+} {
+  const guardConditions = buildCommitGuardConditions(guard, options);
+  const conditions = ["table_name = ?", ...guardConditions.conditions];
+
+  return {
+    sql: `UPDATE ${TABLE_VERSION_TABLE_NAME}
+          SET version = version + 1
+          WHERE ${conditions.join(" AND ")}`,
+    params: [tableName, ...guardConditions.params],
+    conflictOnZero: true,
+    requireSingleChange: true,
+    type: "bump-table-version",
   };
 }

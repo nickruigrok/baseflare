@@ -19,6 +19,21 @@ mutation/action that pages through the table and `patch`es each document. A
 dedicated migrations primitive may come later; for now the patch-on-rewrite
 pattern covers the common cases.
 
+## Mutation semantics
+
+Mutations are atomic from the application point of view. The runtime detects
+write conflicts and retries mutation handlers when it can do so safely, so
+mutation handlers must be deterministic and retry-safe.
+
+Keep external side effects in actions, not mutations. Actions are the right
+place for network calls, payments, email, webhooks, and other work that should
+not be retried automatically. If an action needs atomic database writes, call a
+mutation with `ctx.runMutation()`.
+
+Keep mutations focused on a bounded set of documents. For large datasets, use
+selective filters and pagination; future bulk/import workflows will cover very
+large write jobs explicitly.
+
 ## Query filter semantics
 
 Object filters treat `null` as the JSON-safe nullish query value for document

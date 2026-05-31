@@ -730,7 +730,10 @@ const createdAt = getCreatedAtFromId(id)
 16. Mutation-scoped read-your-writes use selective SQL scanning plus `_id`-based overlay reconciliation instead of full-table hydration; broad mutation queries are guarded by internal scan budgets
 17. Runtime `.count()` is permission-aware, so it may scan matching rows to enforce read rules; large-table counts should use selective `.filter(...)` clauses and are guarded by internal scan budgets
 18. Mutations use a serializable-by-retry concurrency model on D1; point reads track row `_rev`, query/missing-document reads track `_bf_table_versions.version`, point-read-only mutations do not conflict on unrelated inserts, and retryable conflicts rerun deterministic mutation handlers within a bounded retry policy
-19. Baseflare does not provide built-in duplicate-execution protection. Side-effectful work belongs in actions, and duplicate handling is application-managed around the specific external system or table that needs it.
+19. D1 mutation commits gate document writes behind guarded table-version bumps before running document statements, because D1 batch result validation is not a rollback boundary
+20. Baseflare does not provide built-in duplicate-execution protection. Side-effectful work belongs in actions, and duplicate handling is application-managed around the specific external system or table that needs it.
+
+**Phase 2 scaling note:** The D1 OCC guard grows with the mutation read/write dependency set. This is correct and production-safe for normal SaaS mutations, but future hardening should monitor SQL size, D1 parameter limits, high-contention retries, and very large bulk-write patterns. If needed, add explicit chunked bulk/import APIs instead of making normal mutations more complex.
 
 **"Done" criteria:**
 ```bash

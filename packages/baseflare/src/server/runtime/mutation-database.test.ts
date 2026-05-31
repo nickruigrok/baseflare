@@ -79,7 +79,7 @@ function createFakeDatabase(options: {
   batchQueries?: string[][];
   batchResults: readonly D1Result[];
   readResults?: readonly FakeReadResult[];
-  tableVersion?: number;
+  tableVersion?: null | number;
 }): D1Database {
   const readResults = [...(options.readResults ?? [])];
   return {
@@ -125,11 +125,10 @@ function createFakeDatabase(options: {
     prepare(query) {
       return new FakePreparedStatement(query, (statement) => {
         if (statement.includes("FROM _bf_table_versions")) {
+          const version =
+            options.tableVersion === undefined ? 0 : options.tableVersion;
           return {
-            results:
-              options.tableVersion === undefined
-                ? []
-                : [{ version: options.tableVersion }],
+            results: version === null ? [] : [{ version }],
             success: true,
           };
         }
@@ -169,15 +168,15 @@ describe("MutationDatabase", () => {
 
     await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
     await expect(mutationDb.commit()).rejects.toThrow(
-      'Mutation commit operation "insert" did not report a D1 change count'
+      'Mutation commit operation "bump-table-version" did not report a D1 change count'
     );
   });
 
-  it("treats zero write changes as retryable conflicts", async () => {
+  it("treats guarded bump misses as retryable conflicts", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
         batchResults: [
-          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 0 }, success: true },
           { meta: { changes: 0 }, success: true },
         ],
       })
@@ -190,19 +189,14 @@ describe("MutationDatabase", () => {
     );
   });
 
-  it("validates assertion results even when D1 reports select changes", async () => {
+  it("requires internal table version rows before committing", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
-        batchResults: [
-          { meta: { changes: 0 }, results: [], success: true },
-          { meta: { changes: 1 }, success: true },
-          { meta: { changes: 1 }, success: true },
-        ],
-        tableVersion: 0,
+        batchResults: [],
+        tableVersion: null,
       })
     );
 
-    await mutationDb.query("todos").count();
     await mutationDb.insert("todos", { text: "assertion-validation" });
 
     await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
@@ -336,9 +330,8 @@ describe("MutationDatabase", () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
         batchResults: [
-          { results: [{ version: 1 }], success: true },
-          { meta: { changes: 1 }, success: true },
-          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
         ],
         readResults: [{ version: 0, rows: [] }],
       })
@@ -369,7 +362,7 @@ describe("MutationDatabase", () => {
     });
   });
 
-  it("asserts successful point reads with row revisions only", async () => {
+  it("does not commit assertions for read-only point reads", async () => {
     const batchQueries: string[][] = [];
     const row = createStoredRow(1);
     const mutationDb = createMutationDatabase(
@@ -383,9 +376,11 @@ describe("MutationDatabase", () => {
     await mutationDb.get("todos", row._id);
     await mutationDb.commit();
 
-    const assertionBatch = batchQueries.at(-1);
-    expect(assertionBatch).toEqual([
-      "SELECT _rev AS rowRev FROM todos WHERE _id = ? LIMIT 1",
+    expect(batchQueries).toEqual([
+      [
+        "SELECT version FROM _bf_table_versions WHERE table_name = ? LIMIT 1",
+        "SELECT _id, _data, _rev FROM todos WHERE _id = ? LIMIT 1",
+      ],
     ]);
   });
 

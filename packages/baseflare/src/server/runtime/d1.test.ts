@@ -16,13 +16,21 @@ import type { D1Database, D1PreparedStatement, D1Result } from "./types";
 
 class FakePreparedStatement implements D1PreparedStatement {
   private readonly firstResult: Record<string, unknown> | null;
+  readonly query: string;
 
-  constructor(firstResult: Record<string, unknown> | null) {
+  constructor(query: string, firstResult: Record<string, unknown> | null) {
     this.firstResult = firstResult;
+    this.query = query;
   }
 
   all<TRow = Record<string, unknown>>(): Promise<D1Result<TRow>> {
-    return Promise.resolve({ results: [], success: true });
+    const result = {
+      results: this.query.includes("_bf_table_versions")
+        ? [{ version: 0 }]
+        : [],
+      success: true,
+    } as unknown as D1Result<TRow>;
+    return Promise.resolve(result);
   }
 
   bind(): D1PreparedStatement {
@@ -44,13 +52,21 @@ class FakePreparedStatement implements D1PreparedStatement {
 
 const testId = "019078e5-d29f-7000-8000-000000000001";
 
-function createFakeDatabase(batchResults: readonly D1Result[]): D1Database {
+function createFakeDatabase(options: {
+  readonly batchQueries?: string[][];
+  readonly batchResults: readonly D1Result[];
+}): D1Database {
   return {
-    batch() {
-      return Promise.resolve(batchResults);
+    batch(statements) {
+      options.batchQueries?.push(
+        statements.map((statement) =>
+          statement instanceof FakePreparedStatement ? statement.query : ""
+        )
+      );
+      return Promise.resolve(options.batchResults);
     },
-    prepare() {
-      return new FakePreparedStatement({
+    prepare(query) {
+      return new FakePreparedStatement(query, {
         _id: testId,
         _data: JSON.stringify({ text: "before" }),
         _rev: 0,
@@ -68,11 +84,15 @@ function createTodoSchema() {
 }
 
 function createAdapter(options?: {
+  readonly batchQueries?: string[][];
   readonly batchResults?: readonly D1Result[];
   readonly rules?: ReturnType<typeof defineRules>;
 }): D1DatabaseAdapter {
   return new D1DatabaseAdapter({
-    database: createFakeDatabase(options?.batchResults ?? []),
+    database: createFakeDatabase({
+      batchQueries: options?.batchQueries,
+      batchResults: options?.batchResults ?? [],
+    }),
     getContext: () => ({}),
     rules: options?.rules,
     schema: createTodoSchema(),
@@ -178,6 +198,46 @@ describe("D1 runtime helpers", () => {
     await expect(database.insert("todos", { text: "after" })).resolves.toMatch(
       /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
     );
+  });
+
+  it("gates direct inserts behind table-version bumps", async () => {
+    const batchQueries: string[][] = [];
+    const database = createAdapter({
+      batchQueries,
+      batchResults: [
+        { meta: { changes: 1 }, success: true },
+        { meta: { changes: 1 }, success: true },
+      ],
+      rules: defineRules({
+        todos: {
+          insert: () => true,
+        },
+      }),
+    });
+
+    await database.insert("todos", { text: "after" });
+
+    expect(batchQueries[0]?.[0]).toContain("UPDATE _bf_table_versions");
+    expect(batchQueries[0]?.[0]).toContain("NOT EXISTS");
+    expect(batchQueries[0]?.[1]).toContain("WHERE changes() = 1");
+  });
+
+  it("reports direct write guard misses as conflicts", async () => {
+    const database = createAdapter({
+      batchResults: [
+        { meta: { changes: 0 }, success: true },
+        { meta: { changes: 0 }, success: true },
+      ],
+      rules: defineRules({
+        todos: {
+          update: () => true,
+        },
+      }),
+    });
+
+    await expect(
+      database.patch("todos", testId, { text: "after" })
+    ).rejects.toThrow("Document changed concurrently");
   });
 
   it("coerces direct insert validation errors", async () => {

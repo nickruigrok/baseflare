@@ -1070,10 +1070,16 @@ describe("worker runtime", () => {
     expect(listBody.result.map((todo) => todo.text)).toContain(
       "after-table-conflict"
     );
+    expect(
+      listBody.result.filter((todo) => todo.text === "after-table-conflict")
+    ).toHaveLength(1);
   });
 
   it("returns conflict when mutation retries are exhausted", async () => {
     const id = await createTodoViaRpc("owner-a", "before-exhaustion");
+    const before = await env.APP_DB.prepare(
+      "SELECT version FROM _bf_table_versions WHERE table_name = 'todos'"
+    ).first<{ version: number }>();
 
     const response = await invoke(
       "/api/mutation/todos:patchWithExhaustedRowConflicts",
@@ -1086,11 +1092,15 @@ describe("worker runtime", () => {
     const body = (await response.json()) as {
       error: { code: string; message: string };
     };
+    const after = await env.APP_DB.prepare(
+      "SELECT version FROM _bf_table_versions WHERE table_name = 'todos'"
+    ).first<{ version: number }>();
 
     expect(response.status).toBe(409);
     expect(body.error.code).toBe(ErrorCode.Conflict);
     expect(body.error.message).toBe("Mutation conflict retry limit exceeded");
     expect(exhaustedConflictAttempts).toBe(3);
+    expect(after?.version).toBe(before?.version);
   });
 
   it("keeps successful point-read OCC row-scoped", async () => {
@@ -1108,9 +1118,9 @@ describe("worker runtime", () => {
       error: { code: string; message: string };
     };
 
-    expect(response.status).toBe(409);
-    expect(body.error.code).toBe(ErrorCode.Conflict);
-    expect(body.error.message).toBe("Mutation conflict retry limit exceeded");
+    expect(response.status).toBe(500);
+    expect(body.error.code).toBe(ErrorCode.InternalError);
+    expect(body.error.message).toBe("Internal error");
   });
 
   it("fails clearly when query-read table-version metadata is missing", async () => {

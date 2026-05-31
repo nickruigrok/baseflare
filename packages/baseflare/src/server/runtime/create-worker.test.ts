@@ -16,6 +16,7 @@ import type {
   D1Database,
   D1DatabaseSession,
   D1PreparedStatement,
+  D1Result,
 } from "./types";
 
 const schema = defineSchema({
@@ -29,8 +30,20 @@ const rules = defineRules({
 });
 
 class FakePreparedStatement implements D1PreparedStatement {
-  all() {
-    return Promise.resolve({ success: true, results: [] });
+  private readonly query: string;
+
+  constructor(query: string) {
+    this.query = query;
+  }
+
+  all<TRow = Record<string, unknown>>() {
+    const result = {
+      success: true,
+      results: this.query.includes("_bf_table_versions")
+        ? [{ version: 0 }]
+        : [],
+    } as unknown as D1Result<TRow>;
+    return Promise.resolve(result);
   }
 
   bind(): D1PreparedStatement {
@@ -91,7 +104,6 @@ describe("worker request body reader", () => {
     let sessionConstraint: string | undefined;
     let sessionBatchCalled = false;
     let sessionPrepareCalls = 0;
-    const statement = new FakePreparedStatement();
     const session: D1DatabaseSession = {
       batch() {
         sessionBatchCalled = true;
@@ -103,9 +115,9 @@ describe("worker request body reader", () => {
       getBookmark() {
         return null;
       },
-      prepare() {
+      prepare(query) {
         sessionPrepareCalls += 1;
-        return statement;
+        return new FakePreparedStatement(query);
       },
     };
     const database: D1Database = {
