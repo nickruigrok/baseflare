@@ -424,7 +424,7 @@ export function assertWithinScanBudget(
     scannedBytes > QUERY_SCAN_BYTE_LIMIT
   ) {
     throw new ValidationRuntimeError(
-      "Query exceeded the internal scan budget; add a more selective filter or limit"
+      "Query exceeded the internal scan budget; add a more selective filter"
     );
   }
 }

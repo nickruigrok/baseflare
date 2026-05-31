@@ -613,13 +613,13 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       // The table version is recorded before row processing, so a mid-chunk
       // limit return cannot skip OCC tracking for rows already read.
       for (const row of rows) {
-        scannedRows += 1;
-        scannedBytes += row._data.length;
-        assertWithinScanBudget(scannedRows, scannedBytes);
-
         if (shadowedIds.has(row._id)) {
           continue;
         }
+
+        scannedRows += 1;
+        scannedBytes += row._data.length;
+        assertWithinScanBudget(scannedRows, scannedBytes);
 
         const document = deserializeRuntimeDocument(tableName, row);
         if (await this.canRead(tableName, document)) {

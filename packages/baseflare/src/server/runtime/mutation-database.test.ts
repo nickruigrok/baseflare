@@ -67,6 +67,7 @@ const schema = defineSchema({
 
 const rules = defineRules({
   todos: {
+    delete: () => true,
     insert: () => true,
     read: () => true,
     update: () => true,
@@ -269,6 +270,29 @@ describe("MutationDatabase", () => {
 
     expect(documents).toHaveLength(1);
     expect(batchParams[2]?.[1]).toEqual([3]);
+  });
+
+  it("excludes shadowed rows from mutation scan budgets", async () => {
+    const shadowedRow = {
+      ...createStoredRow(1),
+      _data: JSON.stringify({ text: "x".repeat(5_000_001) }),
+    };
+    const visibleRow = createStoredRow(2);
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        readResults: [
+          { rows: [shadowedRow] },
+          { version: 0, rows: [shadowedRow, visibleRow] },
+        ],
+      })
+    );
+
+    await mutationDb.delete("todos", shadowedRow._id);
+
+    const documents = await mutationDb.query("todos").limit(1).collect();
+
+    expect(documents.map((document) => document.text)).toEqual(["todo-2"]);
   });
 
   it("skips base reads for zero-limit mutation queries", async () => {

@@ -728,8 +728,9 @@ const createdAt = getCreatedAtFromId(id)
 14. `createWorker(manifest)` accepts a `BaseflareManifest` with `schema`, optional `config`, discovered function entries, optional `rules`, and optional `http`; canonical function ids are derived from module path + export name and duplicate ids fail during manifest build
 15. Runtime-produced RPC failures use a fixed taxonomy: `VALIDATION_ERROR`, `UNAUTHORIZED`, `PERMISSION_DENIED`, `NOT_FOUND`, `MALFORMED_DOCUMENT`, `DATABASE_ERROR`, `NOT_IMPLEMENTED`, `CONFLICT`, `INTERNAL_ERROR`; database details are logged internally and sanitized from client envelopes
 16. Mutation-scoped read-your-writes use selective SQL scanning plus `_id`-based overlay reconciliation instead of full-table hydration; broad mutation queries are guarded by internal scan budgets
-17. Mutations use a serializable-by-retry concurrency model on D1; point reads track row `_rev`, query/missing-document reads track `_bf_table_versions.version`, point-read-only mutations do not conflict on unrelated inserts, and retryable conflicts rerun deterministic mutation handlers within a bounded retry policy
-18. Baseflare does not provide built-in duplicate-execution protection. Side-effectful work belongs in actions, and duplicate handling is application-managed around the specific external system or table that needs it.
+17. Runtime `.count()` is permission-aware, so it may scan matching rows to enforce read rules; large-table counts should use selective `.filter(...)` clauses and are guarded by internal scan budgets
+18. Mutations use a serializable-by-retry concurrency model on D1; point reads track row `_rev`, query/missing-document reads track `_bf_table_versions.version`, point-read-only mutations do not conflict on unrelated inserts, and retryable conflicts rerun deterministic mutation handlers within a bounded retry policy
+19. Baseflare does not provide built-in duplicate-execution protection. Side-effectful work belongs in actions, and duplicate handling is application-managed around the specific external system or table that needs it.
 
 **"Done" criteria:**
 ```bash
@@ -1495,7 +1496,7 @@ interface QueryBuilder {
   first(): Promise<Doc | null>;
   unique(): Promise<Doc>;          // throws if 0 or 2+ results
   take(n: number): Promise<Doc[]>; // shorthand for .limit(n).collect()
-  count(): Promise<number>;        // SELECT COUNT(*)
+  count(): Promise<number>;        // permission-aware runtime count
   paginate(opts: PaginationOptions): Promise<PaginationResult<Doc>>;
 }
 
@@ -1849,7 +1850,7 @@ These tests span multiple packages and define end-to-end correctness. They must 
 2. `.unique()` with 0 results → throws
 3. `.unique()` with 2+ results → throws
 4. `.take(5)` → returns first 5 documents
-5. `.count()` → returns number without fetching documents
+5. `.count()` → returns permission-aware count; use `.filter(...)` for large tables
 6. `.paginate({ numItems: 2, cursor: null })` → returns `{ page: [...], isDone: false, continueCursor: '...' }`
 7. `.paginate({ numItems: 2, cursor: prevCursor })` → returns next page
 

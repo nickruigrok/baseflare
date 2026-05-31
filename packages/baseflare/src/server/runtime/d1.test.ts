@@ -93,10 +93,10 @@ describe("D1 runtime helpers", () => {
 
   it("fails clearly when internal scan budgets are exceeded", () => {
     expect(() => assertWithinScanBudget(20_001, 0)).toThrow(
-      "Query exceeded the internal scan budget; add a more selective filter or limit"
+      "Query exceeded the internal scan budget; add a more selective filter"
     );
     expect(() => assertWithinScanBudget(1, 5_000_001)).toThrow(
-      "Query exceeded the internal scan budget; add a more selective filter or limit"
+      "Query exceeded the internal scan budget; add a more selective filter"
     );
   });
 
