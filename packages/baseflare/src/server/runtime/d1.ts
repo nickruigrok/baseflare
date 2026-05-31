@@ -49,7 +49,11 @@ import {
   assertCanUpdate,
   canReadDocument,
 } from "./permissions";
-import type { D1BindingValue, D1Database, D1PreparedStatement } from "./types";
+import type {
+  D1BindingValue,
+  D1PreparedStatement,
+  RuntimeDatabase,
+} from "./types";
 
 export type RuntimeDocument = Record<string, unknown> & {
   _createdAt: number;
@@ -74,14 +78,14 @@ export interface CommitGuard {
 }
 
 interface RuntimeQueryOptions<TContext> {
-  readonly database: D1Database;
+  readonly database: RuntimeDatabase;
   readonly getContext: () => TContext;
   readonly rules?: Rules;
   readonly schema: Schema;
   readonly tableName: string;
 }
 
-type D1PrepareDatabase = Pick<D1Database, "prepare">;
+type D1PrepareDatabase = Pick<RuntimeDatabase, "prepare">;
 
 const QUERY_SCAN_CHUNK_SIZE = 256;
 const QUERY_SCAN_BYTE_LIMIT = 5_000_000;
@@ -530,13 +534,13 @@ function ensureSingleChange(
 export class D1DatabaseAdapter<TContext = unknown>
   implements DatabaseWriter<RuntimeDocument>
 {
-  private readonly database: D1Database;
+  private readonly database: RuntimeDatabase;
   private readonly getContext: () => TContext;
   private readonly rules?: Rules;
   private readonly schema: Schema;
 
   constructor(options: {
-    database: D1Database;
+    database: RuntimeDatabase;
     getContext: () => TContext;
     rules?: Rules;
     schema: Schema;

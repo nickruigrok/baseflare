@@ -142,6 +142,8 @@ export interface D1Database {
   ): D1DatabaseSession;
 }
 
+export type RuntimeDatabase = D1Database | D1DatabaseSession;
+
 export interface BaseflareRuntimeEnv {
   APP_DB: D1Database;
 }

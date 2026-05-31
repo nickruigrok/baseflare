@@ -101,10 +101,14 @@ describe("worker request body reader", () => {
   });
 
   it("uses a primary D1 session for action database access and nested calls", async () => {
+    let rootSessionCalls = 0;
+    let nestedSessionCalls = 0;
     let sessionConstraint: string | undefined;
     let sessionBatchCalled = false;
     let sessionPrepareCalls = 0;
-    const session: D1DatabaseSession = {
+    const session: D1DatabaseSession & {
+      withSession(constraint?: string): D1DatabaseSession;
+    } = {
       batch() {
         sessionBatchCalled = true;
         return Promise.resolve([
@@ -119,6 +123,10 @@ describe("worker request body reader", () => {
         sessionPrepareCalls += 1;
         return new FakePreparedStatement(query);
       },
+      withSession() {
+        nestedSessionCalls += 1;
+        return this;
+      },
     };
     const database: D1Database = {
       batch() {
@@ -128,6 +136,7 @@ describe("worker request body reader", () => {
         throw new Error("Expected action db to use a session");
       },
       withSession(constraint) {
+        rootSessionCalls += 1;
         sessionConstraint = constraint;
         return session;
       },
@@ -197,6 +206,8 @@ describe("worker request body reader", () => {
     await getTodo.handler(ctx, {});
 
     expect(sessionConstraint).toBe("first-primary");
+    expect(rootSessionCalls).toBe(1);
+    expect(nestedSessionCalls).toBe(0);
     expect(sessionPrepareCalls).toBeGreaterThanOrEqual(3);
     expect(sessionBatchCalled).toBe(true);
   });

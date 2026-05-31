@@ -8,6 +8,7 @@ import { TABLE_VERSION_TABLE_NAME } from "../schema/types";
 import type { StoredDocumentRow } from "./d1";
 import { InternalRuntimeError } from "./errors";
 import {
+  createMutationDatabaseSession,
   MutationDatabase,
   RetryableMutationConflictError,
   withMutationRetry,
@@ -15,6 +16,7 @@ import {
 import type {
   D1BindingValue,
   D1Database,
+  D1DatabaseSession,
   D1PreparedStatement,
   D1Result,
 } from "./types";
@@ -157,6 +159,51 @@ function createStoredRow(index: number): StoredDocumentRow {
 }
 
 describe("MutationDatabase", () => {
+  it("creates primary sessions without re-wrapping existing sessions", () => {
+    let rootSessionConstraint: string | undefined;
+    let nestedSessionCalled = false;
+    const session: D1DatabaseSession & {
+      withSession(constraint?: string): D1DatabaseSession;
+    } = {
+      batch() {
+        return Promise.resolve([]);
+      },
+      getBookmark() {
+        return "bookmark";
+      },
+      prepare(query) {
+        return new FakePreparedStatement(query, () => ({
+          results: [],
+          success: true,
+        }));
+      },
+      withSession() {
+        nestedSessionCalled = true;
+        return this;
+      },
+    };
+    const database: D1Database = {
+      batch() {
+        return Promise.resolve([]);
+      },
+      prepare(query) {
+        return new FakePreparedStatement(query, () => ({
+          results: [],
+          success: true,
+        }));
+      },
+      withSession(constraint) {
+        rootSessionConstraint = constraint;
+        return session;
+      },
+    };
+
+    expect(createMutationDatabaseSession(database)).toBe(session);
+    expect(rootSessionConstraint).toBe("first-primary");
+    expect(createMutationDatabaseSession(session)).toBe(session);
+    expect(nestedSessionCalled).toBe(false);
+  });
+
   it("requires D1 change counts for commit write operations", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({

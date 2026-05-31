@@ -49,9 +49,9 @@ import {
   assertCanUpdate,
   canReadDocument,
 } from "./permissions";
-import type { D1Database, D1Result } from "./types";
+import type { D1DatabaseSession, D1Result, RuntimeDatabase } from "./types";
 
-type SessionDatabase = Pick<D1Database, "batch" | "prepare">;
+type SessionDatabase = Pick<RuntimeDatabase, "batch" | "prepare">;
 
 interface PendingMutationWrite {
   readonly baseRev?: number;
@@ -1104,9 +1104,19 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   }
 }
 
+export function isD1DatabaseSession(
+  database: RuntimeDatabase
+): database is D1DatabaseSession {
+  return "getBookmark" in database;
+}
+
 export function createMutationDatabaseSession(
-  database: D1Database
+  database: RuntimeDatabase
 ): SessionDatabase {
+  if (isD1DatabaseSession(database)) {
+    return database;
+  }
+
   return database.withSession?.("first-primary") ?? database;
 }
 
