@@ -574,6 +574,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
       this.recordTableReadVersion(tableName, read.version);
       offset += rows.length;
+      // The table version is recorded before row processing, so a mid-chunk
+      // limit return cannot skip OCC tracking for rows already read.
       for (const row of rows) {
         scannedRows += 1;
         scannedBytes += row._data.length;

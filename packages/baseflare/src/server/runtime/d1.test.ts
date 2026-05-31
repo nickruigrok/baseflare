@@ -57,6 +57,26 @@ function createFakeDatabase(batchResults: readonly D1Result[]): D1Database {
   };
 }
 
+function createTodoSchema() {
+  return defineSchema({
+    todos: defineTable({
+      text: v.string(),
+    }),
+  });
+}
+
+function createAdapter(options?: {
+  readonly batchResults?: readonly D1Result[];
+  readonly rules?: ReturnType<typeof defineRules>;
+}): D1DatabaseAdapter {
+  return new D1DatabaseAdapter({
+    database: createFakeDatabase(options?.batchResults ?? []),
+    getContext: () => ({}),
+    rules: options?.rules,
+    schema: createTodoSchema(),
+  });
+}
+
 describe("D1 runtime helpers", () => {
   it("looks up schema tables by own property only", () => {
     const schema = {
@@ -79,24 +99,17 @@ describe("D1 runtime helpers", () => {
   });
 
   it("requires D1 change counts for direct write operations", async () => {
-    const schema = defineSchema({
-      todos: defineTable({
-        text: v.string(),
-      }),
-    });
     const rules = defineRules({
       todos: {
         update: () => true,
       },
     });
-    const database = new D1DatabaseAdapter({
-      database: createFakeDatabase([
+    const database = createAdapter({
+      batchResults: [
         { success: true },
         { meta: { changes: 1 }, success: true },
-      ]),
-      getContext: () => ({}),
+      ],
       rules,
-      schema,
     });
 
     await expect(
@@ -104,5 +117,39 @@ describe("D1 runtime helpers", () => {
     ).rejects.toThrow(
       "D1 did not report a change count for the write operation"
     );
+  });
+
+  it("coerces direct insert validation errors", async () => {
+    await expect(createAdapter().insert("todos", {})).rejects.toThrow(
+      "Invalid insert document"
+    );
+  });
+
+  it("coerces direct patch validation errors", async () => {
+    const database = createAdapter({
+      rules: defineRules({
+        todos: {
+          update: () => true,
+        },
+      }),
+    });
+
+    await expect(
+      database.patch("todos", testId, { text: 123 })
+    ).rejects.toThrow("Invalid patch document");
+  });
+
+  it("coerces direct replace validation errors", async () => {
+    const database = createAdapter({
+      rules: defineRules({
+        todos: {
+          update: () => true,
+        },
+      }),
+    });
+
+    await expect(
+      database.replace("todos", testId, { text: 123 })
+    ).rejects.toThrow("Invalid replacement document");
   });
 });

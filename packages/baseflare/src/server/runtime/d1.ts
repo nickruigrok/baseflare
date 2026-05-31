@@ -32,6 +32,7 @@ import {
   ConflictRuntimeError,
   coerceDatabaseError,
   coerceMalformedDocumentError,
+  coerceValidationError,
   ensureSuccessfulD1Result,
   InternalRuntimeError,
   NotFoundRuntimeError,
@@ -489,7 +490,7 @@ export class D1DatabaseAdapter<TContext = unknown>
     doc: Record<string, unknown>
   ): Promise<string> {
     const table = assertKnownTable(this.schema, tableName);
-    const validated = validateInsertData(table, doc);
+    const validated = this.validateInsert(table, doc);
     await assertCanInsert(this.rules, tableName, this.getContext(), validated);
 
     const id = generateId();
@@ -512,7 +513,7 @@ export class D1DatabaseAdapter<TContext = unknown>
   ): Promise<void> {
     const table = assertKnownTable(this.schema, tableName);
     const existing = await this.getWritableDocument(tableName, id);
-    const validated = validatePatchData(table, existing.document, partial);
+    const validated = this.validatePatch(table, existing.document, partial);
     await assertCanUpdate(
       this.rules,
       tableName,
@@ -539,7 +540,7 @@ export class D1DatabaseAdapter<TContext = unknown>
   ): Promise<void> {
     const table = assertKnownTable(this.schema, tableName);
     const existing = await this.getWritableDocument(tableName, id);
-    const validated = validateReplaceData(table, doc);
+    const validated = this.validateReplace(table, doc);
     await assertCanUpdate(
       this.rules,
       tableName,
@@ -591,6 +592,40 @@ export class D1DatabaseAdapter<TContext = unknown>
     }
 
     return existing;
+  }
+
+  private validateInsert(
+    table: Parameters<typeof validateInsertData>[0],
+    value: Record<string, unknown>
+  ): Record<string, unknown> {
+    try {
+      return validateInsertData(table, value);
+    } catch (error) {
+      return coerceValidationError(error, "Invalid insert document");
+    }
+  }
+
+  private validatePatch(
+    table: Parameters<typeof validatePatchData>[0],
+    current: Record<string, unknown>,
+    patch: Record<string, unknown>
+  ): Record<string, unknown> {
+    try {
+      return validatePatchData(table, current, patch);
+    } catch (error) {
+      return coerceValidationError(error, "Invalid patch document");
+    }
+  }
+
+  private validateReplace(
+    table: Parameters<typeof validateReplaceData>[0],
+    value: Record<string, unknown>
+  ): Record<string, unknown> {
+    try {
+      return validateReplaceData(table, value);
+    } catch (error) {
+      return coerceValidationError(error, "Invalid replacement document");
+    }
   }
 
   private async runWriteBatch(
