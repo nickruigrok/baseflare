@@ -652,6 +652,12 @@ export class D1DatabaseAdapter<TContext = unknown>
       async () => this.database.batch(statements)
     );
 
+    if (results.length !== operations.length) {
+      throw new InternalRuntimeError(
+        "D1 write batch returned an unexpected number of results"
+      );
+    }
+
     for (const [index, result] of results.entries()) {
       ensureSuccessfulD1Result(result, "Failed to commit D1 write");
       if (operations[index]?.requireSingleChange) {

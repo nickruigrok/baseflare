@@ -37,6 +37,26 @@ class FakePreparedStatement implements D1PreparedStatement {
 }
 
 describe("runtime schema apply", () => {
+  it("validates runtime schema table identifiers before preparing DDL", async () => {
+    const schema = {
+      tables: {
+        "bad table": defineTable({ text: v.string() }),
+      },
+    } as unknown as ReturnType<typeof defineSchema>;
+    const database: D1Database = {
+      prepare() {
+        throw new Error("Schema apply should validate before preparing");
+      },
+      batch() {
+        return Promise.resolve([]);
+      },
+    };
+
+    await expect(applyRuntimeSchema(database, schema)).rejects.toThrow(
+      /must start with a letter/
+    );
+  });
+
   it("applies all schema statements in one D1 batch", async () => {
     const schema = defineSchema({
       todos: defineTable({

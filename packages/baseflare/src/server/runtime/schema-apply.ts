@@ -1,3 +1,4 @@
+import { assertTableIdentifier } from "../db/query-builder";
 import {
   createIndexStatement,
   createTableVersionStatements,
@@ -24,6 +25,7 @@ export async function applyRuntimeSchema(
   const tableNames = Object.keys(schema.tables);
 
   for (const tableName of tableNames) {
+    assertTableIdentifier(tableName);
     statements.push({
       sql: createRuntimeTableStatement(tableName),
       params: [],

@@ -129,6 +129,21 @@ describe("D1 runtime helpers", () => {
     );
   });
 
+  it("requires D1 write batches to return one result per operation", async () => {
+    const database = createAdapter({
+      batchResults: [{ meta: { changes: 1 }, success: true }],
+      rules: defineRules({
+        todos: {
+          insert: () => true,
+        },
+      }),
+    });
+
+    await expect(database.insert("todos", { text: "after" })).rejects.toThrow(
+      "D1 write batch returned an unexpected number of results"
+    );
+  });
+
   it("requires D1 change counts for direct inserts", async () => {
     const database = createAdapter({
       batchResults: [
