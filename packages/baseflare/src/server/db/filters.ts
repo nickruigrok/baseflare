@@ -154,12 +154,9 @@ export function compareSqliteJsonValues(left: unknown, right: unknown): number {
     return 0;
   }
 
-  if (leftValue.value === null) {
-    return -1;
-  }
-
-  if (rightValue.value === null) {
-    return 1;
+  // Rank 0 only contains nullish values, which compare equal once ranks match.
+  if (leftValue.rank === 0 || rightValue.rank === 0) {
+    return 0;
   }
 
   return leftValue.value < rightValue.value ? -1 : 1;

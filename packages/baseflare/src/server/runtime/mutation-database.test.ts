@@ -270,6 +270,26 @@ describe("MutationDatabase", () => {
     });
   });
 
+  it("asserts successful point reads with row revisions only", async () => {
+    const batchQueries: string[][] = [];
+    const row = createStoredRow(1);
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchQueries,
+        batchResults: [{ results: [{ rowRev: row._rev }], success: true }],
+        readResults: [{ version: 0, rows: [row] }],
+      })
+    );
+
+    await mutationDb.get("todos", row._id);
+    await mutationDb.commit();
+
+    const assertionBatch = batchQueries.at(-1);
+    expect(assertionBatch).toEqual([
+      "SELECT _rev AS rowRev FROM todos WHERE _id = ? LIMIT 1",
+    ]);
+  });
+
   it("requires at least one mutation retry attempt", async () => {
     await expect(withMutationRetry(async () => "ok", 0)).rejects.toThrow(
       "withMutationRetry requires at least one attempt"

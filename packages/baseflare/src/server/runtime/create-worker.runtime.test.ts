@@ -1093,7 +1093,7 @@ describe("worker runtime", () => {
     expect(exhaustedConflictAttempts).toBe(3);
   });
 
-  it("fails clearly when row-read table-version metadata is missing", async () => {
+  it("keeps successful point-read OCC row-scoped", async () => {
     const id = await createTodoViaRpc("owner-a", "before-missing-row-version");
 
     const response = await invoke(
@@ -1108,9 +1108,9 @@ describe("worker runtime", () => {
       error: { code: string; message: string };
     };
 
-    expect(response.status).toBe(500);
-    expect(body.error.code).toBe(ErrorCode.InternalError);
-    expect(body.error.message).toBe("Internal error");
+    expect(response.status).toBe(409);
+    expect(body.error.code).toBe(ErrorCode.Conflict);
+    expect(body.error.message).toBe("Mutation conflict retry limit exceeded");
   });
 
   it("fails clearly when query-read table-version metadata is missing", async () => {

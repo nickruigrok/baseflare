@@ -102,6 +102,7 @@ describe("createQueryBuilder", () => {
   });
 
   it("compares in-memory values with SQLite json_extract ordering", () => {
+    expect(compareSqliteJsonValues(null, null)).toBe(0);
     expect(compareSqliteJsonValues(null, 1)).toBeLessThan(0);
     expect(compareSqliteJsonValues(undefined, "a")).toBeLessThan(0);
     expect(compareSqliteJsonValues(false, true)).toBeLessThan(0);

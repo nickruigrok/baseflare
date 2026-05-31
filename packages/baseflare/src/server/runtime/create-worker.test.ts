@@ -2,6 +2,9 @@ import { v } from "baseflare/values";
 import { describe, expect, it } from "vitest";
 
 import { action } from "../functions/action";
+import { mutation } from "../functions/mutation";
+import { query } from "../functions/query";
+import { defineRules } from "../permissions/define-rules";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
 import { PayloadTooLargeRuntimeError } from "./errors";
@@ -17,6 +20,12 @@ import type {
 
 const schema = defineSchema({
   todos: defineTable({ text: v.string() }),
+});
+const rules = defineRules({
+  todos: {
+    insert: () => true,
+    read: () => true,
+  },
 });
 
 class FakePreparedStatement implements D1PreparedStatement {
@@ -59,19 +68,24 @@ describe("worker request body reader", () => {
     expect(cancelled).toBe(true);
   });
 
-  it("uses a primary D1 session for action database access", async () => {
+  it("uses a primary D1 session for action database access and nested calls", async () => {
     let sessionConstraint: string | undefined;
-    let sessionPrepareCalled = false;
+    let sessionBatchCalled = false;
+    let sessionPrepareCalls = 0;
     const statement = new FakePreparedStatement();
     const session: D1DatabaseSession = {
       batch() {
-        return Promise.resolve([]);
+        sessionBatchCalled = true;
+        return Promise.resolve([
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ]);
       },
       getBookmark() {
         return null;
       },
       prepare() {
-        sessionPrepareCalled = true;
+        sessionPrepareCalls += 1;
         return statement;
       },
     };
@@ -87,10 +101,28 @@ describe("worker request body reader", () => {
         return session;
       },
     };
-    const getTodo = action({
+    const getTodoQuery = query({
       args: {},
       handler: (ctx) =>
         ctx.db.get("todos", "019078e5-d29f-7000-8000-000000000001"),
+    });
+    const getTodoAction = action({
+      args: {},
+      handler: (ctx) =>
+        ctx.db.get("todos", "019078e5-d29f-7000-8000-000000000001"),
+    });
+    const insertTodoMutation = mutation({
+      args: {},
+      handler: (ctx) => ctx.db.insert("todos", { text: "nested" }),
+    });
+    const getTodo = action({
+      args: {},
+      async handler(ctx) {
+        await ctx.db.get("todos", "019078e5-d29f-7000-8000-000000000001");
+        await ctx.runQuery(getTodoQuery, {});
+        await ctx.runAction(getTodoAction, {});
+        await ctx.runMutation(insertTodoMutation, {});
+      },
     });
 
     const ctx = createActionContext({
@@ -100,14 +132,41 @@ describe("worker request body reader", () => {
           // Test execution context stub.
         },
       },
-      functionIndex: createFunctionIndex(buildBaseflareManifest({ schema })),
+      functionIndex: createFunctionIndex(
+        buildBaseflareManifest({
+          actions: [
+            {
+              definition: getTodoAction,
+              exportName: "getTodoAction",
+              modulePath: "test",
+            },
+          ],
+          mutations: [
+            {
+              definition: insertTodoMutation,
+              exportName: "insertTodoMutation",
+              modulePath: "test",
+            },
+          ],
+          queries: [
+            {
+              definition: getTodoQuery,
+              exportName: "getTodoQuery",
+              modulePath: "test",
+            },
+          ],
+          schema,
+        })
+      ),
       requestHeaders: new Headers(),
+      rules,
       schema,
     });
 
     await getTodo.handler(ctx, {});
 
     expect(sessionConstraint).toBe("first-primary");
-    expect(sessionPrepareCalled).toBe(true);
+    expect(sessionPrepareCalls).toBeGreaterThanOrEqual(3);
+    expect(sessionBatchCalled).toBe(true);
   });
 });

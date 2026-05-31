@@ -817,20 +817,11 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         // result sets can change when unrelated rows are inserted or deleted.
         operations.push({
           type: "assert-row-revision",
-          sql: `SELECT
-                  (SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1) AS tableVersion,
-                  (SELECT _rev FROM ${tableName} WHERE _id = ? LIMIT 1) AS rowRev`,
-          params: [tableName, id],
+          sql: `SELECT _rev AS rowRev FROM ${tableName} WHERE _id = ? LIMIT 1`,
+          params: [id],
           validateResult(result) {
             const row = result.results?.[0];
-            const tableVersion = row?.tableVersion;
             const rowRev = row?.rowRev;
-
-            if (typeof tableVersion !== "number") {
-              throw new InternalRuntimeError(
-                `Missing internal table version row for "${tableName}"`
-              );
-            }
 
             if (rowRev !== rev) {
               throw new RetryableMutationConflictError();
