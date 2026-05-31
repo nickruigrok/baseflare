@@ -1185,5 +1185,7 @@ export async function withMutationRetry<TResult>(
     }
   }
 
+  // Defensive sentinel for future retry-loop refactors; current branches return
+  // on success or throw on failure.
   throw new InternalRuntimeError("Mutation retry loop exited unexpectedly");
 }

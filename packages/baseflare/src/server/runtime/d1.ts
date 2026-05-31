@@ -52,6 +52,7 @@ import {
 import type {
   D1BindingValue,
   D1PreparedStatement,
+  D1Result,
   RuntimeDatabase,
 } from "./types";
 
@@ -531,6 +532,18 @@ function ensureSingleChange(
   }
 }
 
+function assertTableVersionResult(
+  result: D1Result,
+  operation: { readonly tableName?: string }
+): void {
+  const row = result.results?.[0];
+  if (typeof row?.version !== "number") {
+    throw new InternalRuntimeError(
+      `Missing internal table version row for "${operation.tableName ?? "unknown"}"`
+    );
+  }
+}
+
 export class D1DatabaseAdapter<TContext = unknown>
   implements DatabaseWriter<RuntimeDocument>
 {
@@ -593,8 +606,8 @@ export class D1DatabaseAdapter<TContext = unknown>
 
     const id = generateId();
     const serialized = serialize(validated);
-    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createTableVersionAssertion(tableName),
       createGuardedTableVersionBump(
         tableName,
         createDirectWriteGuard(tableName, {
@@ -630,8 +643,8 @@ export class D1DatabaseAdapter<TContext = unknown>
     );
 
     const serialized = serialize(validated);
-    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createTableVersionAssertion(tableName),
       createGuardedTableVersionBump(
         tableName,
         createDirectWriteGuard(tableName, {
@@ -667,8 +680,8 @@ export class D1DatabaseAdapter<TContext = unknown>
     );
 
     const serialized = serialize(validated);
-    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createTableVersionAssertion(tableName),
       createGuardedTableVersionBump(
         tableName,
         createDirectWriteGuard(tableName, {
@@ -697,8 +710,8 @@ export class D1DatabaseAdapter<TContext = unknown>
       existing.document
     );
 
-    await this.assertTableVersionRow(tableName);
     await this.runWriteBatch([
+      createTableVersionAssertion(tableName),
       createGuardedTableVersionBump(
         tableName,
         createDirectWriteGuard(tableName, {
@@ -764,25 +777,19 @@ export class D1DatabaseAdapter<TContext = unknown>
     }
   }
 
-  private async assertTableVersionRow(tableName: string): Promise<void> {
-    const rows = await executeRowQuery<{ version: number }>(this.database, {
-      sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
-      params: [tableName],
-    });
-    if (typeof rows[0]?.version !== "number") {
-      throw new InternalRuntimeError(
-        `Missing internal table version row for "${tableName}"`
-      );
-    }
-  }
-
   private async runWriteBatch(
     operations: readonly {
       readonly conflictOnZero?: boolean;
       readonly params: readonly (string | number | null)[];
       readonly requireSingleChange?: boolean;
       readonly sql: string;
-      readonly type: "bump-table-version" | "delete" | "insert" | "update";
+      readonly tableName?: string;
+      readonly type:
+        | "assert-table-version"
+        | "bump-table-version"
+        | "delete"
+        | "insert"
+        | "update";
     }[]
   ): Promise<void> {
     const statements = operations.map((operation) =>
@@ -800,9 +807,19 @@ export class D1DatabaseAdapter<TContext = unknown>
     }
 
     for (const [index, result] of results.entries()) {
+      const operation = operations[index];
       ensureSuccessfulD1Result(result, "Failed to commit D1 write");
-      if (operations[index]?.requireSingleChange) {
-        ensureSingleChange(result.meta?.changes, operations[index]);
+      if (!operation) {
+        continue;
+      }
+
+      if (operation.type === "assert-table-version") {
+        assertTableVersionResult(result, operation);
+        continue;
+      }
+
+      if (operation.requireSingleChange) {
+        ensureSingleChange(result.meta?.changes, operation);
       }
     }
   }
@@ -829,6 +846,20 @@ function createDirectWriteGuard(
     rowRevisions: new Map([
       [tableName, new Map([[options.rowId, options.rev]])],
     ]),
+  };
+}
+
+function createTableVersionAssertion(tableName: string): {
+  readonly params: readonly string[];
+  readonly sql: string;
+  readonly tableName: string;
+  readonly type: "assert-table-version";
+} {
+  return {
+    sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
+    params: [tableName],
+    tableName,
+    type: "assert-table-version",
   };
 }
 

@@ -136,6 +136,7 @@ describe("D1 runtime helpers", () => {
     });
     const database = createAdapter({
       batchResults: [
+        { results: [{ version: 0 }], success: true },
         { success: true },
         { meta: { changes: 1 }, success: true },
       ],
@@ -151,7 +152,10 @@ describe("D1 runtime helpers", () => {
 
   it("requires D1 write batches to return one result per operation", async () => {
     const database = createAdapter({
-      batchResults: [{ meta: { changes: 1 }, success: true }],
+      batchResults: [
+        { results: [{ version: 0 }], success: true },
+        { meta: { changes: 1 }, success: true },
+      ],
       rules: defineRules({
         todos: {
           insert: () => true,
@@ -167,6 +171,7 @@ describe("D1 runtime helpers", () => {
   it("requires D1 change counts for direct inserts", async () => {
     const database = createAdapter({
       batchResults: [
+        { results: [{ version: 0 }], success: true },
         { success: true },
         { meta: { changes: 1 }, success: true },
       ],
@@ -185,6 +190,7 @@ describe("D1 runtime helpers", () => {
   it("accepts direct inserts with one reported D1 change", async () => {
     const database = createAdapter({
       batchResults: [
+        { results: [{ version: 0 }], success: true },
         { meta: { changes: 1 }, success: true },
         { meta: { changes: 1 }, success: true },
       ],
@@ -205,6 +211,7 @@ describe("D1 runtime helpers", () => {
     const database = createAdapter({
       batchQueries,
       batchResults: [
+        { results: [{ version: 0 }], success: true },
         { meta: { changes: 1 }, success: true },
         { meta: { changes: 1 }, success: true },
       ],
@@ -217,14 +224,35 @@ describe("D1 runtime helpers", () => {
 
     await database.insert("todos", { text: "after" });
 
-    expect(batchQueries[0]?.[0]).toContain("UPDATE _bf_table_versions");
-    expect(batchQueries[0]?.[0]).toContain("NOT EXISTS");
-    expect(batchQueries[0]?.[1]).toContain("WHERE changes() = 1");
+    expect(batchQueries[0]?.[0]).toContain("SELECT version");
+    expect(batchQueries[0]?.[1]).toContain("UPDATE _bf_table_versions");
+    expect(batchQueries[0]?.[1]).toContain("NOT EXISTS");
+    expect(batchQueries[0]?.[2]).toContain("WHERE changes() = 1");
+  });
+
+  it("reports missing direct write table versions as internal errors", async () => {
+    const database = createAdapter({
+      batchResults: [
+        { results: [], success: true },
+        { meta: { changes: 0 }, success: true },
+        { meta: { changes: 0 }, success: true },
+      ],
+      rules: defineRules({
+        todos: {
+          insert: () => true,
+        },
+      }),
+    });
+
+    await expect(database.insert("todos", { text: "after" })).rejects.toThrow(
+      'Missing internal table version row for "todos"'
+    );
   });
 
   it("reports direct write guard misses as conflicts", async () => {
     const database = createAdapter({
       batchResults: [
+        { results: [{ version: 0 }], success: true },
         { meta: { changes: 0 }, success: true },
         { meta: { changes: 0 }, success: true },
       ],
