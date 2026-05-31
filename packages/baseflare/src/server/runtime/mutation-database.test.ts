@@ -432,6 +432,26 @@ describe("MutationDatabase", () => {
     expect(batchParams[0]?.[1]).toEqual([1]);
   });
 
+  it("does not count pending inserts as shadowed base rows for chunk sizing", async () => {
+    const batchParams: D1BindingValue[][][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchResults: [],
+        readResults: [{ version: 0, rows: [createStoredRow(1)] }],
+      })
+    );
+
+    for (let index = 0; index < 5; index += 1) {
+      await mutationDb.insert("todos", { text: `pending-${index}` });
+    }
+
+    const documents = await mutationDb.query("todos").limit(1).collect();
+
+    expect(documents).toHaveLength(1);
+    expect(batchParams[0]?.[1]).toEqual([1]);
+  });
+
   it("accounts for shadowed rows when sizing limited D1 chunks", async () => {
     const batchParams: D1BindingValue[][][] = [];
     const firstRow = createStoredRow(1);

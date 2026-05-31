@@ -374,7 +374,11 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
 
   async unique(): Promise<RuntimeDocument> {
     const documents = await this.collectReadable(2, null);
-    if (documents.length !== 1) {
+    if (documents.length === 0) {
+      throw new NotFoundRuntimeError("Document not found");
+    }
+
+    if (documents.length > 1) {
       throw new InternalRuntimeError(
         `Expected exactly one document, received ${documents.length}`
       );
@@ -837,9 +841,7 @@ function createDirectWriteGuard(
       }
 ): CommitGuard {
   if ("insertId" in options) {
-    return {
-      insertedIds: new Map([[tableName, new Set([options.insertId])]]),
-    };
+    return { insertedIds: new Map([[tableName, new Set([options.insertId])]]) };
   }
 
   return {
@@ -860,22 +862,6 @@ function createTableVersionAssertion(tableName: string): {
     params: [tableName],
     tableName,
     type: "assert-table-version",
-  };
-}
-
-export function createTableVersionBump(tableName: string): {
-  readonly conflictOnZero: true;
-  readonly params: readonly string[];
-  readonly requireSingleChange: true;
-  readonly sql: string;
-  readonly type: "bump-table-version";
-} {
-  return {
-    sql: `UPDATE ${TABLE_VERSION_TABLE_NAME} SET version = version + 1 WHERE table_name = ?`,
-    params: [tableName],
-    conflictOnZero: true,
-    requireSingleChange: true,
-    type: "bump-table-version",
   };
 }
 

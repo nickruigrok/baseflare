@@ -289,7 +289,11 @@ class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
 
   async unique(): Promise<RuntimeDocument> {
     const documents = await this.clone({ limit: 2 }).collect();
-    if (documents.length !== 1) {
+    if (documents.length === 0) {
+      throw new NotFoundRuntimeError("Document not found");
+    }
+
+    if (documents.length > 1) {
       throw new InternalRuntimeError(
         `Expected exactly one document, received ${documents.length}`
       );
@@ -553,12 +557,12 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     state: QueryState,
     cursor: CursorPayload | null
   ): Promise<RuntimeDocument[]> {
-    const shadowedIds = this.getShadowedIds(tableName);
+    const shadowedBaseIds = this.getShadowedBaseIds(tableName);
     const baseDocuments = await this.collectBaseDocuments(
       tableName,
       state,
       cursor,
-      shadowedIds
+      shadowedBaseIds
     );
     const documents = [...baseDocuments];
 
@@ -580,9 +584,9 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     tableName: string,
     state: QueryState,
     cursor: CursorPayload | null,
-    shadowedIds: Set<string>
+    shadowedBaseIds: Set<string>
   ): Promise<RuntimeDocument[]> {
-    const chunkSize = getMutationQueryChunkSize(state, shadowedIds.size);
+    const chunkSize = getMutationQueryChunkSize(state, shadowedBaseIds.size);
     if (chunkSize === 0) {
       return [];
     }
@@ -612,7 +616,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       // The table version is recorded before row processing, so a mid-chunk
       // limit return cannot skip OCC tracking for rows already read.
       for (const row of rows) {
-        if (shadowedIds.has(row._id)) {
+        if (shadowedBaseIds.has(row._id)) {
           continue;
         }
 
@@ -825,9 +829,20 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     return { baseRev: versioned.rev, document: versioned.document };
   }
 
-  private getShadowedIds(tableName: string): Set<string> {
+  private getShadowedBaseIds(tableName: string): Set<string> {
     const writes = this.pendingWrites.get(tableName);
-    return writes ? new Set(writes.keys()) : new Set();
+    if (!writes) {
+      return new Set();
+    }
+
+    const ids = new Set<string>();
+    for (const [id, write] of writes) {
+      if (write.type === "update" || write.type === "delete") {
+        ids.add(id);
+      }
+    }
+
+    return ids;
   }
 
   private getMutatedTables(): string[] {

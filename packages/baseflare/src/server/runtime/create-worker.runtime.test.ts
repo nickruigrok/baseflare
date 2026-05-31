@@ -30,7 +30,6 @@ import { defineRules } from "../permissions/define-rules";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
 import { createWorker } from "./create-worker";
-import { createTableVersionBump } from "./d1";
 import { buildBaseflareManifest } from "./manifest";
 import { applyRuntimeSchema } from "./schema-apply";
 import type { BaseflareManifest, D1Database } from "./types";
@@ -694,26 +693,27 @@ async function insertStoredTodo(doc: {
 }): Promise<string> {
   const id = generateId();
   const data = JSON.stringify({ completed: false, ...doc });
-  const bump = createTableVersionBump("todos");
 
   await env.APP_DB.batch([
     env.APP_DB.prepare(
       "INSERT INTO todos (_id, _data, _rev) VALUES (?, ?, 0)"
     ).bind(id, data),
-    env.APP_DB.prepare(bump.sql).bind(...bump.params),
+    env.APP_DB.prepare(
+      "UPDATE _bf_table_versions SET version = version + 1 WHERE table_name = ?"
+    ).bind("todos"),
   ]);
 
   return id;
 }
 
 async function insertMalformedStoredTodo(text: string): Promise<void> {
-  const bump = createTableVersionBump("todos");
-
   await env.APP_DB.batch([
     env.APP_DB.prepare(
       "INSERT INTO todos (_id, _data, _rev) VALUES (?, ?, 0)"
     ).bind("not-a-uuid-v7", JSON.stringify({ ownerToken: "owner-a", text })),
-    env.APP_DB.prepare(bump.sql).bind(...bump.params),
+    env.APP_DB.prepare(
+      "UPDATE _bf_table_versions SET version = version + 1 WHERE table_name = ?"
+    ).bind("todos"),
   ]);
 }
 
@@ -1282,7 +1282,24 @@ describe("worker runtime", () => {
     expect(pageBody.result.page.continueCursor).not.toBe("");
   });
 
-  it("treats query unique cardinality failures as known runtime errors", async () => {
+  it("returns not found for query unique zero-result lookups", async () => {
+    const response = await invoke("/api/query/todos:unique", {
+      body: rpcBody({ ownerToken: "missing-owner" }),
+      headers: { authorization: "Bearer missing-owner" },
+      method: "POST",
+    });
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(404);
+    expect(body.error).toEqual({
+      code: ErrorCode.NotFound,
+      message: "Document not found",
+    });
+  });
+
+  it("treats query unique duplicate results as known runtime errors", async () => {
     const errorSpy = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -1308,7 +1325,24 @@ describe("worker runtime", () => {
     expect(errorSpy).not.toHaveBeenCalled();
   });
 
-  it("treats mutation unique cardinality failures as known runtime errors", async () => {
+  it("returns not found for mutation unique zero-result lookups", async () => {
+    const response = await invoke("/api/mutation/todos:uniqueTodo", {
+      body: rpcBody({ ownerToken: "missing-owner" }),
+      headers: { authorization: "Bearer missing-owner" },
+      method: "POST",
+    });
+    const body = (await response.json()) as {
+      error: { code: string; message: string };
+    };
+
+    expect(response.status).toBe(404);
+    expect(body.error).toEqual({
+      code: ErrorCode.NotFound,
+      message: "Document not found",
+    });
+  });
+
+  it("treats mutation unique duplicate results as known runtime errors", async () => {
     const errorSpy = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
