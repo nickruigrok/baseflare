@@ -874,3 +874,31 @@ export function createGuardedTableVersionBump(
     type: "bump-table-version",
   };
 }
+
+export function createGuardedTableVersionBumps(
+  tableNames: readonly string[],
+  guard: CommitGuard
+): {
+  readonly conflictOnZero: true;
+  readonly expectedChanges: number;
+  readonly params: readonly (string | number | null)[];
+  readonly sql: string;
+  readonly type: "bump-table-versions";
+} {
+  const guardConditions = buildCommitGuardConditions(guard);
+  const placeholders = tableNames.map(() => "?").join(", ");
+  const conditions = [
+    `table_name IN (${placeholders})`,
+    ...guardConditions.conditions,
+  ];
+
+  return {
+    sql: `UPDATE ${TABLE_VERSION_TABLE_NAME}
+          SET version = version + 1
+          WHERE ${conditions.join(" AND ")}`,
+    params: [...tableNames, ...guardConditions.params],
+    conflictOnZero: true,
+    expectedChanges: tableNames.length,
+    type: "bump-table-versions",
+  };
+}

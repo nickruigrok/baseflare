@@ -26,7 +26,7 @@ import {
   bindStatement,
   buildRuntimeSelectQuery,
   type CommitGuard,
-  createGuardedTableVersionBump,
+  createGuardedTableVersionBumps,
   deserializeRuntimeDocument,
   deserializeVersionedRuntimeDocument,
   executeRowQuery,
@@ -68,11 +68,13 @@ interface TableVersionReadResult<TRow extends Record<string, unknown>> {
 type CommitOperation =
   | {
       readonly conflictOnZero: true;
+      readonly expectedChanges: number;
       readonly params: readonly (string | number | null)[];
       readonly sql: string;
-      readonly type: "bump-table-version";
+      readonly type: "bump-table-versions";
     }
   | {
+      readonly expectedChanges: number;
       readonly params: readonly (string | number | null)[];
       readonly sql: string;
       readonly type: "delete" | "insert" | "update";
@@ -218,7 +220,7 @@ function isRetryableConflict(error: unknown): boolean {
 
 function requiresChangeCount(operation: CommitOperation): boolean {
   return (
-    operation.type === "bump-table-version" ||
+    operation.type === "bump-table-versions" ||
     operation.type === "delete" ||
     operation.type === "insert" ||
     operation.type === "update"
@@ -400,7 +402,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       return;
     }
 
-    await this.assertTableVersionRows(mutatedTables);
+    await this.assertTableVersions(mutatedTables);
 
     const operations = this.buildCommitOperations(mutatedTables);
     if (operations.length === 0) {
@@ -671,18 +673,18 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   private buildCommitOperations(
     mutatedTables: readonly string[]
   ): CommitOperation[] {
-    const operations: CommitOperation[] = [];
     const guard = this.createCommitGuard();
-    const guardedTables = new Set<string>();
+    const operations: CommitOperation[] = [
+      createGuardedTableVersionBumps(mutatedTables, guard),
+    ];
+    let expectedPreviousChanges = mutatedTables.length;
 
     for (const tableName of mutatedTables) {
-      operations.push(
-        createGuardedTableVersionBump(tableName, guard, {
-          ignoredTables: guardedTables,
-        })
+      expectedPreviousChanges = this.appendWriteStatementsForTable(
+        operations,
+        tableName,
+        expectedPreviousChanges
       );
-      this.appendWriteStatementsForTable(operations, tableName);
-      guardedTables.add(tableName);
     }
 
     return operations;
@@ -891,11 +893,13 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
   private appendWriteStatementsForTable(
     operations: CommitOperation[],
-    tableName: string
-  ): void {
+    tableName: string,
+    expectedPreviousChanges: number
+  ): number {
+    let previousChanges = expectedPreviousChanges;
     const writes = this.pendingWrites.get(tableName);
     if (!writes) {
-      return;
+      return previousChanges;
     }
 
     for (const [id, write] of writes) {
@@ -903,21 +907,28 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         continue;
       }
 
-      operations.push(this.createWriteOperation(tableName, id, write));
+      operations.push(
+        this.createWriteOperation(tableName, id, write, previousChanges)
+      );
+      previousChanges = 1;
     }
+
+    return previousChanges;
   }
 
   private createWriteOperation(
     tableName: string,
     id: string,
-    write: PendingMutationWrite
+    write: PendingMutationWrite,
+    expectedPreviousChanges: number
   ): CommitOperation {
     if (write.type === "insert") {
       return {
         type: "insert",
         sql: `INSERT INTO ${tableName} (_id, _data, _rev)
-              SELECT ?, ?, 0 WHERE changes() = 1`,
-        params: [id, write.serializedData ?? ""],
+              SELECT ?, ?, 0 WHERE changes() = ?`,
+        params: [id, write.serializedData ?? "", expectedPreviousChanges],
+        expectedChanges: 1,
       };
     }
 
@@ -926,16 +937,23 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         type: "update",
         sql: `UPDATE ${tableName}
               SET _data = ?, _rev = _rev + 1
-              WHERE _id = ? AND _rev = ? AND changes() = 1`,
-        params: [write.serializedData ?? "", id, write.baseRev ?? -1],
+              WHERE _id = ? AND _rev = ? AND changes() = ?`,
+        params: [
+          write.serializedData ?? "",
+          id,
+          write.baseRev ?? -1,
+          expectedPreviousChanges,
+        ],
+        expectedChanges: 1,
       };
     }
 
     return {
       type: "delete",
       sql: `DELETE FROM ${tableName}
-            WHERE _id = ? AND _rev = ? AND changes() = 1`,
-      params: [id, write.baseRev ?? -1],
+            WHERE _id = ? AND _rev = ? AND changes() = ?`,
+      params: [id, write.baseRev ?? -1, expectedPreviousChanges],
+      expectedChanges: 1,
     };
   }
 
@@ -965,8 +983,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
           );
         }
 
-        if (changes !== 1) {
-          if (operation.type === "bump-table-version") {
+        if (changes !== operation.expectedChanges) {
+          if (operation.type === "bump-table-versions" && changes === 0) {
             throw new RetryableMutationConflictError();
           }
 
@@ -978,39 +996,41 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
   }
 
-  private async assertTableVersionRows(
+  private async assertTableVersions(
     tableNames: readonly string[]
   ): Promise<void> {
-    for (const tableName of tableNames) {
-      const rows = await executeRowQuery<{ version: number }>(this.database, {
-        sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
-        params: [tableName],
-      });
-      const version = rows[0]?.version;
-      if (typeof version !== "number") {
-        throw new InternalRuntimeError(
-          `Missing internal table version row for "${tableName}"`
-        );
-      }
+    const checkedTables = new Set([
+      ...tableNames,
+      ...this.tableReadVersions.keys(),
+    ]);
+    if (checkedTables.size === 0) {
+      return;
     }
 
-    for (const tableName of this.tableReadVersions.keys()) {
-      if (tableNames.includes(tableName)) {
-        continue;
-      }
+    const checkedTableNames = [...checkedTables];
+    const placeholders = checkedTableNames.map(() => "?").join(", ");
+    const rows = await executeRowQuery<{
+      table_name: string;
+      version: number;
+    }>(this.database, {
+      sql: `SELECT table_name, version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name IN (${placeholders})`,
+      params: checkedTableNames,
+    });
 
-      const rows = await executeRowQuery<{ version: number }>(this.database, {
-        sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
-        params: [tableName],
-      });
-      const version = rows[0]?.version;
+    const versions = new Map(
+      rows.map((row) => [row.table_name, row.version] as const)
+    );
+
+    for (const tableName of checkedTableNames) {
+      const version = versions.get(tableName);
       if (typeof version !== "number") {
         throw new InternalRuntimeError(
           `Missing internal table version row for "${tableName}"`
         );
       }
 
-      if (version !== this.tableReadVersions.get(tableName)) {
+      const readVersion = this.tableReadVersions.get(tableName);
+      if (readVersion !== undefined && version !== readVersion) {
         throw new RetryableMutationConflictError();
       }
     }

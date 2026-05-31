@@ -22,20 +22,26 @@ import type {
 } from "./types";
 
 class FakePreparedStatement implements D1PreparedStatement {
-  private readonly allHandler: (query: string) => D1Result | Promise<D1Result>;
+  private readonly allHandler: (
+    query: string,
+    params: readonly D1BindingValue[]
+  ) => D1Result | Promise<D1Result>;
   readonly params: D1BindingValue[] = [];
   readonly query: string;
 
   constructor(
     query: string,
-    allHandler: (query: string) => D1Result | Promise<D1Result>
+    allHandler: (
+      query: string,
+      params: readonly D1BindingValue[]
+    ) => D1Result | Promise<D1Result>
   ) {
     this.allHandler = allHandler;
     this.query = query;
   }
 
   all<TRow = Record<string, unknown>>(): Promise<D1Result<TRow>> {
-    return this.allHandler(this.query) as Promise<D1Result<TRow>>;
+    return this.allHandler(this.query, this.params) as Promise<D1Result<TRow>>;
   }
 
   bind(...values: D1BindingValue[]): D1PreparedStatement {
@@ -62,12 +68,21 @@ interface FakeReadResult {
 }
 
 const schema = defineSchema({
+  labels: defineTable({
+    text: v.string(),
+  }),
   todos: defineTable({
     text: v.string(),
   }),
 });
 
 const rules = defineRules({
+  labels: {
+    delete: () => true,
+    insert: () => true,
+    read: () => true,
+    update: () => true,
+  },
   todos: {
     delete: () => true,
     insert: () => true,
@@ -80,8 +95,10 @@ function createFakeDatabase(options: {
   batchParams?: D1BindingValue[][][];
   batchQueries?: string[][];
   batchResults: readonly D1Result[];
+  queryLog?: string[];
   readResults?: readonly FakeReadResult[];
   tableVersion?: null | number;
+  tableVersions?: Readonly<Record<string, number>>;
 }): D1Database {
   const readResults = [...(options.readResults ?? [])];
   return {
@@ -125,8 +142,32 @@ function createFakeDatabase(options: {
       return Promise.resolve(options.batchResults);
     },
     prepare(query) {
-      return new FakePreparedStatement(query, (statement) => {
+      options.queryLog?.push(query);
+      return new FakePreparedStatement(query, (statement, params) => {
         if (statement.includes("FROM _bf_table_versions")) {
+          if (statement.includes(" IN ")) {
+            const tableVersions = options.tableVersions ?? {};
+            return {
+              results: params
+                .map((tableName) => {
+                  if (typeof tableName !== "string") {
+                    return undefined;
+                  }
+
+                  const version =
+                    tableVersions[tableName] ??
+                    (options.tableVersion === undefined
+                      ? 0
+                      : options.tableVersion);
+                  return version === null
+                    ? undefined
+                    : { table_name: tableName, version };
+                })
+                .filter((row) => row !== undefined),
+              success: true,
+            };
+          }
+
           const version =
             options.tableVersion === undefined ? 0 : options.tableVersion;
           return {
@@ -215,7 +256,7 @@ describe("MutationDatabase", () => {
 
     await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
     await expect(mutationDb.commit()).rejects.toThrow(
-      'Mutation commit operation "bump-table-version" did not report a D1 change count'
+      'Mutation commit operation "bump-table-versions" did not report a D1 change count'
     );
   });
 
@@ -250,6 +291,98 @@ describe("MutationDatabase", () => {
     await expect(mutationDb.commit()).rejects.toThrow(
       'Missing internal table version row for "todos"'
     );
+  });
+
+  it("prevents document writes when a multi-table commit gate fails", async () => {
+    const batchParams: D1BindingValue[][][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchResults: [
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ],
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "todo" });
+    await mutationDb.insert("labels", { text: "label" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
+    expect(batchParams[0]?.[1]?.at(-1)).toBe(2);
+    expect(batchParams[0]?.[2]?.at(-1)).toBe(1);
+  });
+
+  it("commits successful multi-table writes behind one table-version gate", async () => {
+    const batchQueries: string[][] = [];
+    const batchParams: D1BindingValue[][][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchQueries,
+        batchResults: [
+          { meta: { changes: 2 }, success: true },
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ],
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "todo" });
+    await mutationDb.insert("labels", { text: "label" });
+    await mutationDb.commit();
+
+    expect(batchQueries[0]).toHaveLength(3);
+    expect(batchQueries[0]?.[0]).toContain("table_name IN (?, ?)");
+    expect(batchParams[0]?.[0]?.slice(0, 2)).toEqual(["todos", "labels"]);
+    expect(batchParams[0]?.[1]?.at(-1)).toBe(2);
+    expect(batchParams[0]?.[2]?.at(-1)).toBe(1);
+  });
+
+  it("checks stale read versions when a table is also mutated", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        readResults: [{ version: 0, rows: [] }],
+        tableVersions: { todos: 1 },
+      })
+    );
+
+    await mutationDb.query("todos").collect();
+    await mutationDb.insert("todos", { text: "stale" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
+  });
+
+  it("checks all table versions with one pre-commit query", async () => {
+    const queryLog: string[] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ],
+        queryLog,
+        readResults: [{ version: 0, rows: [] }],
+      })
+    );
+
+    await mutationDb.query("todos").collect();
+    await mutationDb.insert("todos", { text: "one-query" });
+    await mutationDb.commit();
+
+    expect(
+      queryLog.filter((query) =>
+        query.includes("SELECT table_name, version FROM _bf_table_versions")
+      )
+    ).toEqual([
+      "SELECT table_name, version FROM _bf_table_versions WHERE table_name IN (?)",
+    ]);
   });
 
   it("reads query rows and table version in one D1 batch", async () => {

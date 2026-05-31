@@ -40,7 +40,7 @@ class FakePreparedStatement implements D1PreparedStatement {
     const result = {
       success: true,
       results: this.query.includes("_bf_table_versions")
-        ? [{ version: 0 }]
+        ? [{ table_name: "todos", version: 0 }]
         : [],
     } as unknown as D1Result<TRow>;
     return Promise.resolve(result);
