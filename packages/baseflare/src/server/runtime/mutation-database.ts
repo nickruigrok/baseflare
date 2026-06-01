@@ -1106,6 +1106,9 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   private async assertTableVersions(
     tableNames: readonly string[]
   ): Promise<void> {
+    // This precheck catches missing metadata and obvious stale reads early.
+    // The guarded commit batch remains the authoritative OCC boundary, so
+    // concurrent writes after this point still retry at commit time.
     const checkedTables = new Set([
       ...tableNames,
       ...this.tableReadVersions.keys(),

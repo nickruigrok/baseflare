@@ -131,7 +131,35 @@ npx baseflare deploy --env production →
 
 First deploy to a new environment auto-provisions all CF resources. Subsequent deploys update the Worker and schema. `npx baseflare env destroy` deletes all resources.
 
-Environment names are project-scoped slugs and must be unique within a Baseflare project. Baseflare-managed Cloudflare resources keep the `bf-` prefix (`bf-{project}-{env}`) so CLI discovery and destructive operations can safely distinguish them from user-created resources. After provisioning, commands resolve environments by stored Cloudflare resource IDs, not fuzzy name matching. Cloudflare name lookup is only a recovery/linking fallback; if multiple matching resources exist, the CLI fails closed and asks the user to link the environment by explicit resource ID.
+Environment names are project-scoped slugs and must be unique within a Baseflare project. Baseflare-managed Cloudflare resources keep the `bf-` prefix (`bf-{project}-{env}`) so CLI discovery and destructive operations can safely distinguish them from user-created resources. `baseflare.config.ts` remains committed app configuration. `.baseflare/project.json` is generated local CLI state and stores the Cloudflare resources linked to each environment.
+
+After provisioning, commands resolve `--env <name>` through `.baseflare/project.json` before calling Cloudflare. Registry entries store deterministic resource names plus stable resource IDs where Cloudflare provides them. API calls use IDs when available; names are display values, drift checks, and recovery hints. Cloudflare name lookup is only a strict recovery/linking fallback. If multiple matching resources exist, the CLI fails closed and asks the user to link the environment by explicit resource ID.
+
+```json
+{
+  "version": 1,
+  "project": {
+    "slug": "my-app"
+  },
+  "cloudflare": {
+    "accountId": "account-id"
+  },
+  "environments": {
+    "production": {
+      "worker": {
+        "name": "bf-my-app-production"
+      },
+      "database": {
+        "id": "d1-database-id",
+        "name": "bf-my-app-production-db"
+      },
+      "bucket": {
+        "name": "bf-my-app-production-files"
+      }
+    }
+  }
+}
+```
 
 ### 1.4 Management Architecture
 
@@ -851,7 +879,7 @@ Each environment has one `SubscriptionDO` instance (singleton per environment, a
 4. Lazy config resolver — checks `baseflare.config.ts` + `.env.local`, prompts for missing values (profile, account, project name), writes files on first resolution
 4. Cloudflare API client for resource provisioning:
    - Create/delete Workers, D1 databases, R2 buckets, DO namespaces, and Vectorize indexes
-   - Store provisioned resource IDs in `.baseflare/project.json` after first deploy
+   - Store provisioned resource names and IDs in `.baseflare/project.json` after first deploy
    - Resolve `--env <name>` through the project environment registry before Cloudflare calls
    - List environments from the registry, with CF API `bf-{project}-*` discovery as a strict recovery/linking fallback
    - Reject duplicate environment slugs within a project and fail closed on ambiguous Cloudflare name matches

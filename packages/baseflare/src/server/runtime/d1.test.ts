@@ -423,6 +423,48 @@ describe("D1 runtime helpers", () => {
     ).rejects.toThrow("Document changed concurrently");
   });
 
+  it("reports guarded direct write multi-change anomalies as internal errors", async () => {
+    const database = createAdapter({
+      batchResults: [
+        { results: [{ version: 0 }], success: true },
+        { meta: { changes: 2 }, success: true },
+        { meta: { changes: 0 }, success: true },
+      ],
+      rules: defineRules({
+        todos: {
+          update: () => true,
+        },
+      }),
+    });
+
+    await expect(
+      database.patch("todos", testId, { text: "after" })
+    ).rejects.toThrow(
+      'D1 write operation "bump-table-version" did not apply after its guard passed'
+    );
+  });
+
+  it("reports unguarded direct write change anomalies as internal errors", async () => {
+    const database = createAdapter({
+      batchResults: [
+        { results: [{ version: 0 }], success: true },
+        { meta: { changes: 1 }, success: true },
+        { meta: { changes: 2 }, success: true },
+      ],
+      rules: defineRules({
+        todos: {
+          update: () => true,
+        },
+      }),
+    });
+
+    await expect(
+      database.patch("todos", testId, { text: "after" })
+    ).rejects.toThrow(
+      'D1 write operation "update" did not apply after its guard passed'
+    );
+  });
+
   it("coerces direct insert validation errors", async () => {
     await expect(createAdapter().insert("todos", {})).rejects.toThrow(
       "Invalid insert document"

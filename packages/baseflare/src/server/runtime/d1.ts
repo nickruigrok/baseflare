@@ -597,7 +597,7 @@ function ensureSingleChange(
   }
 
   if (changes !== 1) {
-    if (operation.conflictOnZero) {
+    if (operation.conflictOnZero && changes === 0) {
       throw new ConflictRuntimeError("Document changed concurrently");
     }
 
