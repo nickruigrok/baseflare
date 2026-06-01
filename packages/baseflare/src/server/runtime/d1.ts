@@ -100,12 +100,7 @@ function appendGuardCondition(
   params.push(...conditionParams);
 }
 
-function buildCommitGuardConditions(
-  guard: CommitGuard,
-  options: {
-    readonly ignoredTables?: ReadonlySet<string>;
-  } = {}
-): {
+function buildCommitGuardConditions(guard: CommitGuard): {
   readonly conditions: readonly string[];
   readonly params: readonly (string | number | null)[];
 } {
@@ -113,10 +108,6 @@ function buildCommitGuardConditions(
   const params: Array<string | number | null> = [];
 
   for (const [tableName, version] of guard.tableVersions ?? []) {
-    if (options.ignoredTables?.has(tableName)) {
-      continue;
-    }
-
     appendGuardCondition(
       conditions,
       params,
@@ -126,10 +117,6 @@ function buildCommitGuardConditions(
   }
 
   for (const [tableName, reads] of guard.rowRevisions ?? []) {
-    if (options.ignoredTables?.has(tableName)) {
-      continue;
-    }
-
     for (const [id, rev] of reads) {
       appendGuardCondition(
         conditions,
@@ -141,10 +128,6 @@ function buildCommitGuardConditions(
   }
 
   for (const [tableName, ids] of guard.insertedIds ?? []) {
-    if (options.ignoredTables?.has(tableName)) {
-      continue;
-    }
-
     for (const id of ids) {
       appendGuardCondition(
         conditions,

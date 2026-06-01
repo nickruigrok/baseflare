@@ -10,6 +10,8 @@ import {
   assertKnownTable,
   assertWithinScanBudget,
   buildRuntimeSelectQuery,
+  type CommitGuard,
+  createGuardedTableVersionBumps,
   D1DatabaseAdapter,
   getNextRuntimeScanPosition,
   getRuntimeScanQueryOptions,
@@ -301,5 +303,40 @@ describe("D1 runtime helpers", () => {
     await expect(database.query("todos").unique()).rejects.toThrow(
       'Expected exactly one document from "todos", received 2'
     );
+  });
+
+  it("builds guarded table-version bumps with all commit guard conditions", () => {
+    const guard: CommitGuard = {
+      insertedIds: new Map([["todos", new Set([nextTestId])]]),
+      rowRevisions: new Map([["labels", new Map([[testId, 7]])]]),
+      tableVersions: new Map([
+        ["labels", 2],
+        ["todos", 3],
+      ]),
+    };
+
+    const bump = createGuardedTableVersionBumps(["labels", "todos"], guard);
+
+    expect(bump.sql).toContain("table_name IN (?, ?)");
+    expect(bump.sql).toContain(
+      "EXISTS (SELECT 1 FROM _bf_table_versions WHERE table_name = ? AND version = ?)"
+    );
+    expect(bump.sql).toContain(
+      "EXISTS (SELECT 1 FROM labels WHERE _id = ? AND _rev = ?)"
+    );
+    expect(bump.sql).toContain(
+      "NOT EXISTS (SELECT 1 FROM todos WHERE _id = ?)"
+    );
+    expect(bump.params).toEqual([
+      "labels",
+      "todos",
+      "labels",
+      2,
+      "todos",
+      3,
+      testId,
+      7,
+      nextTestId,
+    ]);
   });
 });

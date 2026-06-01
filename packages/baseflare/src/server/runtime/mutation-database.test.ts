@@ -404,7 +404,9 @@ describe("MutationDatabase", () => {
     await mutationDb.insert("todos", { text: "todo" });
     await mutationDb.insert("labels", { text: "label" });
 
-    await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
+    await expect(mutationDb.commit()).rejects.toThrow(
+      'Mutation commit operation "bump-table-versions" applied 3 rows but expected 2'
+    );
   });
 
   it("requires internal table version rows before committing", async () => {

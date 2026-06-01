@@ -427,10 +427,6 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     const operations = this.buildCommitOperations(mutatedTables);
-    if (operations.length === 0) {
-      return;
-    }
-
     const statements = operations.map((operation) =>
       bindStatement(this.database, operation.sql, operation.params)
     );
@@ -1153,7 +1149,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
           }
 
           throw new InternalRuntimeError(
-            `Mutation commit operation "${operation.type}" did not apply after its guard passed`
+            `Mutation commit operation "${operation.type}" applied ${changes} rows but expected ${operation.expectedChanges}`
           );
         }
       }
