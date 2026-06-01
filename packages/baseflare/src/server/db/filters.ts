@@ -554,6 +554,10 @@ function matchesFieldOperator(
       throw error(path, "must not be empty");
     }
 
+    if (expected.length > MAX_IN_VALUES) {
+      throw error(path, `must not contain more than ${MAX_IN_VALUES} values`);
+    }
+
     return expected.some((item, index) => {
       assertFilterValue(item, `${path}[${index}]`);
       return valuesEqual(value, item);

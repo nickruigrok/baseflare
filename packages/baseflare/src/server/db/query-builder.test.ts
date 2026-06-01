@@ -170,6 +170,11 @@ describe("createQueryBuilder", () => {
         }) as ReturnType<typeof createQueryBuilder>
       ).toSQL()
     ).toThrow(/must not contain more than 100 values/);
+
+    expect(matchesFilter({ _id: { in: values } }, { _id: "id-99" })).toBe(true);
+    expect(() =>
+      matchesFilter({ _id: { in: [...values, "id-100"] } }, { _id: "id-99" })
+    ).toThrow(/must not contain more than 100 values/);
   });
 
   it("translates _createdAt range filters to _id boundaries", () => {

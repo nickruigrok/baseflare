@@ -903,6 +903,25 @@ describe("MutationDatabase", () => {
     );
   });
 
+  it("shares one scan budget across base and overlay documents", async () => {
+    const baseRow = {
+      ...createStoredRow(1),
+      _data: JSON.stringify({ text: "x".repeat(4_000_000) }),
+    };
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        readResults: [{ version: 0, rows: [baseRow] }],
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "x".repeat(1_000_001) });
+
+    await expect(mutationDb.query("todos").collect()).rejects.toThrow(
+      "Query exceeded the internal scan budget; add a more selective filter"
+    );
+  });
+
   it("uses count-specific scan budget diagnostics", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({

@@ -577,12 +577,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     scanBudgetMessage = DEFAULT_SCAN_BUDGET_MESSAGE
   ): Promise<RuntimeDocument[]> {
     assertReadRulesConfigured(this.rules);
+    const budget: ScanBudget = { scannedBytes: 0, scannedRows: 0 };
     const shadowedBaseIds = this.getShadowedBaseIds(tableName);
     const baseDocuments = await this.collectBaseDocuments(
       tableName,
       state,
       cursor,
       shadowedBaseIds,
+      budget,
       scanBudgetMessage
     );
     if (state.limit === 0) {
@@ -595,6 +597,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       tableName,
       state,
       cursor,
+      budget,
       scanBudgetMessage
     )) {
       documents.push(document);
@@ -611,6 +614,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     state: QueryState,
     cursor: CursorPayload | null,
     shadowedBaseIds: Set<string>,
+    budget: ScanBudget,
     scanBudgetMessage: string
   ): Promise<RuntimeDocument[]> {
     const chunkSize = getMutationQueryChunkSize(state, shadowedBaseIds.size);
@@ -624,7 +628,6 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
     const documents: RuntimeDocument[] = [];
     let scanPosition: RuntimeScanPosition = { cursor, offset: 0 };
-    const budget: ScanBudget = { scannedBytes: 0, scannedRows: 0 };
 
     while (true) {
       const scanOptions = getRuntimeScanQueryOptions(scanPosition, cursor);
@@ -712,6 +715,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     tableName: string,
     state: QueryState,
     cursor: CursorPayload | null,
+    budget: ScanBudget,
     scanBudgetMessage: string
   ): Promise<RuntimeDocument[]> {
     const writes = this.pendingWrites.get(tableName);
@@ -720,17 +724,19 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     const documents: RuntimeDocument[] = [];
-    let scannedBytes = 0;
-    let scannedRows = 0;
     for (const write of writes.values()) {
       if (write.type === "delete" || !write.document) {
         continue;
       }
 
-      scannedRows += 1;
-      scannedBytes +=
+      budget.scannedRows += 1;
+      budget.scannedBytes +=
         write.serializedData?.length ?? JSON.stringify(write.document).length;
-      assertWithinScanBudget(scannedRows, scannedBytes, scanBudgetMessage);
+      assertWithinScanBudget(
+        budget.scannedRows,
+        budget.scannedBytes,
+        scanBudgetMessage
+      );
 
       if (!matchesFilter(state.filter, write.document)) {
         continue;
