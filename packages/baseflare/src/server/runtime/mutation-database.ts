@@ -1139,8 +1139,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         }
 
         if (changes !== operation.expectedChanges) {
-          // The guarded bump uses one global AND predicate, so D1 should report
-          // either zero changed rows or every mutated table-version row.
+          // Document writes are SQL-gated by changes(), so a failed plural
+          // bump means later writes were already no-ops inside the D1 batch.
+          // The guarded bump uses one global AND predicate, so D1 should
+          // report either zero rows or every mutated table-version row.
           if (operation.type === "bump-table-versions" && changes === 0) {
             throw new RetryableMutationConflictError();
           }

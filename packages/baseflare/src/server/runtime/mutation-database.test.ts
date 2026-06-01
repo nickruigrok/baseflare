@@ -445,6 +445,39 @@ describe("MutationDatabase", () => {
     expect(batchParams[0]?.[3]?.at(-1)).toBe(1);
   });
 
+  it("builds document writes behind the multi-table version gate", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+      })
+    );
+    const buildCommitOperations = (
+      mutationDb as unknown as {
+        buildCommitOperations(tableNames: readonly string[]): Array<{
+          readonly params: readonly unknown[];
+          readonly sql: string;
+          readonly type: string;
+        }>;
+      }
+    ).buildCommitOperations.bind(mutationDb);
+
+    await mutationDb.insert("todos", { text: "todo" });
+    await mutationDb.insert("labels", { text: "label" });
+
+    const operations = buildCommitOperations(["todos", "labels"]);
+
+    expect(operations.map((operation) => operation.type)).toEqual([
+      "assert-table-versions",
+      "bump-table-versions",
+      "insert",
+      "insert",
+    ]);
+    expect(operations[2]?.sql).toContain("WHERE changes() = ?");
+    expect(operations[2]?.params.at(-1)).toBe(2);
+    expect(operations[3]?.sql).toContain("WHERE changes() = ?");
+    expect(operations[3]?.params.at(-1)).toBe(1);
+  });
+
   it("checks stale read versions when a table is also mutated", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
