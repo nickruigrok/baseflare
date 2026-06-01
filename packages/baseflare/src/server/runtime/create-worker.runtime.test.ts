@@ -41,6 +41,10 @@ declare module "cloudflare:test" {
 }
 
 const schema = defineSchema({
+  labels: defineTable({
+    ownerToken: v.string(),
+    text: v.string(),
+  }),
   todos: defineTable({
     completed: v.boolean().default(false),
     deletedAt: v.number().optional(),
@@ -68,8 +72,18 @@ const missingTableRules = defineRules({
 let rowConflictAttempts = 0;
 let tableConflictAttempts = 0;
 let exhaustedConflictAttempts = 0;
+let multiTableConflictAttempts = 0;
 
 const rules = defineRules({
+  labels: {
+    delete: async ({ ctx, existingDoc }) =>
+      (await getToken(ctx)) === existingDoc.ownerToken,
+    insert: async ({ ctx, value }) =>
+      (await getToken(ctx)) === value.ownerToken,
+    read: async ({ ctx, doc }) => (await getToken(ctx)) === doc.ownerToken,
+    update: async ({ ctx, existingDoc }) =>
+      (await getToken(ctx)) === existingDoc.ownerToken,
+  },
   todos: {
     delete: async ({ ctx, existingDoc }) =>
       (await getToken(ctx)) === existingDoc.ownerToken,
@@ -424,6 +438,33 @@ const insertWithOneTableConflict = mutation({
   },
 });
 
+const createTodoAndLabelWithOneTableConflict = mutation({
+  args: { ownerToken: v.string(), text: v.string() },
+  returns: v.number(),
+  async handler(ctx, args) {
+    multiTableConflictAttempts += 1;
+    await ctx.db.query("todos").filter({ ownerToken: args.ownerToken }).count();
+
+    if (multiTableConflictAttempts === 1) {
+      await insertStoredTodo({
+        ownerToken: args.ownerToken,
+        text: "external-multi-table-conflict",
+      });
+    }
+
+    await ctx.db.insert("todos", {
+      ownerToken: args.ownerToken,
+      text: args.text,
+    });
+    await ctx.db.insert("labels", {
+      ownerToken: args.ownerToken,
+      text: args.text,
+    });
+
+    return multiTableConflictAttempts;
+  },
+});
+
 const patchAfterMissingTableVersion = mutation({
   args: { id: v.id("todos"), text: v.string() },
   async handler(ctx, args) {
@@ -592,6 +633,11 @@ function createManifest(
         modulePath: "todos",
       },
       {
+        definition: createTodoAndLabelWithOneTableConflict,
+        exportName: "createTodoAndLabelWithOneTableConflict",
+        modulePath: "todos",
+      },
+      {
         definition: patchAfterMissingTableVersion,
         exportName: "patchAfterMissingTableVersion",
         modulePath: "todos",
@@ -706,6 +752,22 @@ async function insertStoredTodo(doc: {
   return id;
 }
 
+async function countStoredDocuments(
+  tableName: "labels" | "todos",
+  ownerToken: string,
+  text: string
+): Promise<number> {
+  const row = await env.APP_DB.prepare(
+    `SELECT COUNT(*) AS count FROM ${tableName}
+     WHERE json_extract(_data, '$.ownerToken') = ?
+       AND json_extract(_data, '$.text') = ?`
+  )
+    .bind(ownerToken, text)
+    .first<{ count: number }>();
+
+  return row?.count ?? 0;
+}
+
 async function insertMalformedStoredTodo(text: string): Promise<void> {
   await env.APP_DB.batch([
     env.APP_DB.prepare(
@@ -724,13 +786,21 @@ describe("worker runtime", () => {
 
   beforeEach(async () => {
     exhaustedConflictAttempts = 0;
+    multiTableConflictAttempts = 0;
     rowConflictAttempts = 0;
     tableConflictAttempts = 0;
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await env.APP_DB.prepare("DELETE FROM labels").run();
     await env.APP_DB.prepare("DELETE FROM todos").run();
     await env.APP_DB.prepare(
+      "INSERT OR IGNORE INTO _bf_table_versions (table_name, version) VALUES ('labels', 0)"
+    ).run();
+    await env.APP_DB.prepare(
       "INSERT OR IGNORE INTO _bf_table_versions (table_name, version) VALUES ('todos', 0)"
+    ).run();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_table_versions SET version = 0 WHERE table_name = 'labels'"
     ).run();
     await env.APP_DB.prepare(
       "UPDATE _bf_table_versions SET version = 0 WHERE table_name = 'todos'"
@@ -1079,6 +1149,33 @@ describe("worker runtime", () => {
     expect(
       listBody.result.filter((todo) => todo.text === "after-table-conflict")
     ).toHaveLength(1);
+  });
+
+  it("retries multi-table conflicts without orphan or partial writes", async () => {
+    const marker = "after-multi-table-conflict";
+
+    const response = await invoke(
+      "/api/mutation/todos:createTodoAndLabelWithOneTableConflict",
+      {
+        body: rpcBody({
+          ownerToken: "owner-a",
+          text: marker,
+        }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      }
+    );
+    const body = (await response.json()) as { result: number };
+
+    expect(response.status).toBe(200);
+    expect(body.result).toBe(2);
+    expect(multiTableConflictAttempts).toBe(2);
+    await expect(
+      countStoredDocuments("todos", "owner-a", marker)
+    ).resolves.toBe(1);
+    await expect(
+      countStoredDocuments("labels", "owner-a", marker)
+    ).resolves.toBe(1);
   });
 
   it("returns conflict when mutation retries are exhausted", async () => {
