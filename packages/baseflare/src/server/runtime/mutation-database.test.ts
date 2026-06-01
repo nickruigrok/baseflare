@@ -936,6 +936,43 @@ describe("MutationDatabase", () => {
     );
   });
 
+  it("requires serialized data for pending overlay scan budgeting", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersion: 0,
+      })
+    );
+    const id = await mutationDb.insert("todos", { text: "pending" });
+    const pendingWrites = (
+      mutationDb as unknown as {
+        pendingWrites: Map<
+          string,
+          Map<
+            string,
+            {
+              document?: Record<string, unknown>;
+              serializedData?: string;
+              type: string;
+            }
+          >
+        >;
+      }
+    ).pendingWrites;
+    const writes = pendingWrites.get("todos");
+    const write = writes?.get(id);
+
+    expect(write).toBeDefined();
+    if (!(writes && write)) {
+      throw new Error("Expected pending write");
+    }
+    writes.set(id, { document: write.document, type: write.type });
+
+    await expect(mutationDb.query("todos").collect()).rejects.toThrow(
+      "Pending mutation write is missing serialized data"
+    );
+  });
+
   it("shares one scan budget across base and overlay documents", async () => {
     const baseRow = {
       ...createStoredRow(1),

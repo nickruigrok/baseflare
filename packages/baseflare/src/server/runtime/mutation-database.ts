@@ -729,9 +729,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         continue;
       }
 
+      if (write.serializedData === undefined) {
+        throw new InternalRuntimeError(
+          "Pending mutation write is missing serialized data"
+        );
+      }
+
       budget.scannedRows += 1;
-      budget.scannedBytes +=
-        write.serializedData?.length ?? JSON.stringify(write.document).length;
+      budget.scannedBytes += write.serializedData.length;
       assertWithinScanBudget(
         budget.scannedRows,
         budget.scannedBytes,

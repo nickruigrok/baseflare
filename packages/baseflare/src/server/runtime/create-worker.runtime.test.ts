@@ -1095,8 +1095,15 @@ describe("worker runtime", () => {
     const listBody = (await listResponse.json()) as {
       result: Array<{ text: string }>;
     };
+    const body = (await response.json()) as {
+      error: { code: ErrorCode; message: string };
+    };
 
     expect(response.status).toBe(400);
+    expect(body.error).toEqual({
+      code: ErrorCode.ValidationError,
+      message: "Invalid function return value: Value must be a finite number",
+    });
     expect(listBody.result.some((todo) => todo.text === "invalid-return")).toBe(
       false
     );

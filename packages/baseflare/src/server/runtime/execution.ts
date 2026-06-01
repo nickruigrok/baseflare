@@ -129,6 +129,8 @@ export function executeMutationDefinition<TResult>(
       };
 
       const result = await definition.handler(ctx, validatedArgs);
+      // Return validation is part of the atomic mutation contract: invalid
+      // returns abort the attempt before any pending writes are committed.
       const validatedResult = validateReturn(definition, result);
       await mutationDb.commit();
 

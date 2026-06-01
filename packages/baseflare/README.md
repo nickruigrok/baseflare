@@ -24,6 +24,8 @@ pattern covers the common cases.
 Mutations are atomic from the application point of view. The runtime detects
 write conflicts and retries mutation handlers when it can do so safely, so
 mutation handlers must be deterministic and retry-safe.
+Return value validation is part of that atomic contract: if a mutation returns
+an invalid value, its pending writes are rolled back.
 
 Keep external side effects in actions, not mutations. Actions are the right
 place for network calls, payments, email, webhooks, and other work that should
