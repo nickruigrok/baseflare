@@ -147,6 +147,53 @@ describe("D1 runtime helpers", () => {
     );
   });
 
+  it("uses count-specific scan budget diagnostics", async () => {
+    const database = createAdapter({
+      queryRows: Array.from({ length: 20_001 }, (_, index) =>
+        createStoredRow(
+          `019078e5-d29f-7000-8000-${index.toString(16).padStart(12, "0")}`
+        )
+      ),
+      rules: defineRules({
+        todos: {
+          read: () => true,
+        },
+      }),
+    });
+
+    await expect(database.query("todos").count()).rejects.toThrow(
+      "Count exceeded the internal scan budget; add a more selective filter before count()"
+    );
+  });
+
+  it("throws visibly when read rules are missing", async () => {
+    const database = createAdapter({
+      queryRows: [createStoredRow(testId)],
+    });
+
+    await expect(database.get("todos", testId)).rejects.toThrow(
+      "Read rules are not configured"
+    );
+    await expect(database.query("todos").collect()).rejects.toThrow(
+      "Read rules are not configured"
+    );
+  });
+
+  it("keeps configured denied reads filtered", async () => {
+    const database = createAdapter({
+      queryRows: [createStoredRow(testId)],
+      rules: defineRules({
+        todos: {
+          read: () => false,
+        },
+      }),
+    });
+
+    await expect(database.get("todos", testId)).resolves.toBeNull();
+    await expect(database.query("todos").collect()).resolves.toEqual([]);
+    await expect(database.query("todos").count()).resolves.toBe(0);
+  });
+
   it("validates runtime select table identifiers", () => {
     expect(() =>
       buildRuntimeSelectQuery("bad table", createBaseQueryState(), {

@@ -877,9 +877,15 @@ describe("worker runtime", () => {
       },
       workerWithoutRules
     );
-    const listBody = (await listResponse.json()) as { result: unknown[] };
+    const listBody = (await listResponse.json()) as {
+      error: { code: string; message: string };
+    };
 
-    expect(listBody.result).toEqual([]);
+    expect(listResponse.status).toBe(403);
+    expect(listBody.error).toEqual({
+      code: ErrorCode.PermissionDenied,
+      message: "Read rules are not configured",
+    });
   });
 
   it("supports mutation read-your-writes and rollback", async () => {

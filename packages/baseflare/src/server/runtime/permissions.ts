@@ -4,6 +4,14 @@ import type { Rules } from "../permissions/types";
 import { PermissionDeniedRuntimeError } from "./errors";
 import { logRuntimeEvent } from "./logging";
 
+export function assertReadRulesConfigured(
+  rules: Rules | undefined
+): asserts rules is Rules {
+  if (!rules) {
+    throw new PermissionDeniedRuntimeError("Read rules are not configured");
+  }
+}
+
 export async function canReadDocument(
   rules: Rules | undefined,
   tableName: string,

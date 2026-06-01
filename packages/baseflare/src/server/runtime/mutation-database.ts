@@ -25,8 +25,10 @@ import {
   assertWithinScanBudget,
   bindStatement,
   buildRuntimeSelectQuery,
+  COUNT_SCAN_BUDGET_MESSAGE,
   type CommitGuard,
   createGuardedTableVersionBumps,
+  DEFAULT_SCAN_BUDGET_MESSAGE,
   deserializeRuntimeDocument,
   deserializeVersionedRuntimeDocument,
   executeRowQuery,
@@ -49,6 +51,7 @@ import {
   assertCanDelete,
   assertCanInsert,
   assertCanUpdate,
+  assertReadRulesConfigured,
   canReadDocument,
 } from "./permissions";
 import type { D1DatabaseSession, D1Result, RuntimeDatabase } from "./types";
@@ -325,7 +328,8 @@ class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
       await this.database.collectQuery(
         this.tableName,
         { ...this.state, limit: undefined },
-        null
+        null,
+        COUNT_SCAN_BUDGET_MESSAGE
       )
     ).length;
   }
@@ -438,6 +442,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
   async get(tableName: string, id: string): Promise<RuntimeDocument | null> {
     assertKnownTable(this.schema, tableName);
+    assertReadRulesConfigured(this.rules);
 
     const pendingWrite = this.getPendingWrite(tableName, id);
     if (pendingWrite) {
@@ -562,14 +567,17 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   async collectQuery(
     tableName: string,
     state: QueryState,
-    cursor: CursorPayload | null
+    cursor: CursorPayload | null,
+    scanBudgetMessage = DEFAULT_SCAN_BUDGET_MESSAGE
   ): Promise<RuntimeDocument[]> {
+    assertReadRulesConfigured(this.rules);
     const shadowedBaseIds = this.getShadowedBaseIds(tableName);
     const baseDocuments = await this.collectBaseDocuments(
       tableName,
       state,
       cursor,
-      shadowedBaseIds
+      shadowedBaseIds,
+      scanBudgetMessage
     );
     if (state.limit === 0) {
       return [];
@@ -580,7 +588,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     for (const document of await this.getReadableOverlayDocuments(
       tableName,
       state,
-      cursor
+      cursor,
+      scanBudgetMessage
     )) {
       documents.push(document);
     }
@@ -595,7 +604,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     tableName: string,
     state: QueryState,
     cursor: CursorPayload | null,
-    shadowedBaseIds: Set<string>
+    shadowedBaseIds: Set<string>,
+    scanBudgetMessage: string
   ): Promise<RuntimeDocument[]> {
     const chunkSize = getMutationQueryChunkSize(state, shadowedBaseIds.size);
     if (chunkSize === 0) {
@@ -642,7 +652,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
           rows,
           shadowedBaseIds,
           documents,
-          budget
+          budget,
+          scanBudgetMessage
         )
       ) {
         return documents;
@@ -662,7 +673,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     rows: readonly StoredDocumentRow[],
     shadowedBaseIds: ReadonlySet<string>,
     documents: RuntimeDocument[],
-    budget: ScanBudget
+    budget: ScanBudget,
+    scanBudgetMessage: string
   ): Promise<boolean> {
     for (const row of rows) {
       if (shadowedBaseIds.has(row._id)) {
@@ -671,7 +683,11 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
       budget.scannedRows += 1;
       budget.scannedBytes += row._data.length;
-      assertWithinScanBudget(budget.scannedRows, budget.scannedBytes);
+      assertWithinScanBudget(
+        budget.scannedRows,
+        budget.scannedBytes,
+        scanBudgetMessage
+      );
 
       const document = deserializeRuntimeDocument(tableName, row);
       if (await this.canRead(tableName, document)) {
@@ -689,7 +705,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   private async getReadableOverlayDocuments(
     tableName: string,
     state: QueryState,
-    cursor: CursorPayload | null
+    cursor: CursorPayload | null,
+    scanBudgetMessage: string
   ): Promise<RuntimeDocument[]> {
     const writes = this.pendingWrites.get(tableName);
     if (!writes) {
@@ -707,7 +724,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       scannedRows += 1;
       scannedBytes +=
         write.serializedData?.length ?? JSON.stringify(write.document).length;
-      assertWithinScanBudget(scannedRows, scannedBytes);
+      assertWithinScanBudget(scannedRows, scannedBytes, scanBudgetMessage);
 
       if (!matchesFilter(state.filter, write.document)) {
         continue;
@@ -740,6 +757,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     const operations: CommitOperation[] = [
       createGuardedTableVersionBumps(mutatedTables, guard),
     ];
+    // The first document write is gated by the multi-table version bump, so it
+    // must observe changes() equal to every mutated table being bumped.
     let expectedPreviousChanges = mutatedTables.length;
 
     for (const tableName of mutatedTables) {

@@ -191,11 +191,17 @@ function createFakeDatabase(options: {
   };
 }
 
-function createMutationDatabase(database: D1Database): MutationDatabase {
+function createMutationDatabase(
+  database: D1Database,
+  options: {
+    readonly missingRules?: boolean;
+    readonly rules?: typeof rules;
+  } = {}
+): MutationDatabase {
   return new MutationDatabase({
     database,
     getContext: () => ({}) as never,
-    rules,
+    rules: options.missingRules ? undefined : (options.rules ?? rules),
     schema,
   });
 }
@@ -743,6 +749,38 @@ describe("MutationDatabase", () => {
 
     await expect(mutationDb.query("todos").collect()).rejects.toThrow(
       "Query exceeded the internal scan budget; add a more selective filter"
+    );
+  });
+
+  it("uses count-specific scan budget diagnostics", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersion: 0,
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "x".repeat(5_000_001) });
+
+    await expect(mutationDb.query("todos").count()).rejects.toThrow(
+      "Count exceeded the internal scan budget; add a more selective filter before count()"
+    );
+  });
+
+  it("throws visibly when mutation read rules are missing", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        readResults: [{ version: 0, rows: [createStoredRow(1)] }],
+      }),
+      { missingRules: true }
+    );
+
+    await expect(
+      mutationDb.get("todos", createStoredRow(1)._id)
+    ).rejects.toThrow("Read rules are not configured");
+    await expect(mutationDb.query("todos").collect()).rejects.toThrow(
+      "Read rules are not configured"
     );
   });
 });

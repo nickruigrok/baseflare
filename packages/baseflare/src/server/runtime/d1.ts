@@ -48,6 +48,7 @@ import {
   assertCanDelete,
   assertCanInsert,
   assertCanUpdate,
+  assertReadRulesConfigured,
   canReadDocument,
 } from "./permissions";
 import type {
@@ -97,6 +98,10 @@ type D1PrepareDatabase = Pick<RuntimeDatabase, "prepare">;
 const QUERY_SCAN_CHUNK_SIZE = 256;
 const QUERY_SCAN_BYTE_LIMIT = 5_000_000;
 const QUERY_SCAN_ROW_LIMIT = 20_000;
+export const DEFAULT_SCAN_BUDGET_MESSAGE =
+  "Query exceeded the internal scan budget; add a more selective filter";
+export const COUNT_SCAN_BUDGET_MESSAGE =
+  "Count exceeded the internal scan budget; add a more selective filter before count()";
 
 function appendGuardCondition(
   conditions: string[],
@@ -458,7 +463,9 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
   }
 
   async count(): Promise<number> {
-    return (await this.collectReadable(undefined, null)).length;
+    return (
+      await this.collectReadable(undefined, null, COUNT_SCAN_BUDGET_MESSAGE)
+    ).length;
   }
 
   async paginate(options: {
@@ -498,11 +505,10 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
 
   private async collectReadable(
     readableLimit: number | undefined,
-    cursor: CursorPayload | null
+    cursor: CursorPayload | null,
+    scanBudgetMessage = DEFAULT_SCAN_BUDGET_MESSAGE
   ): Promise<RuntimeDocument[]> {
-    if (!this.options.rules) {
-      return [];
-    }
+    assertReadRulesConfigured(this.options.rules);
 
     const documents: RuntimeDocument[] = [];
     let scanPosition: RuntimeScanPosition = { cursor, offset: 0 };
@@ -533,7 +539,7 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
       for (const row of rows) {
         scannedRows += 1;
         scannedBytes += row._data.length;
-        assertWithinScanBudget(scannedRows, scannedBytes);
+        assertWithinScanBudget(scannedRows, scannedBytes, scanBudgetMessage);
 
         const document = deserializeRuntimeDocument(
           this.options.tableName,
@@ -566,15 +572,14 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
 
 export function assertWithinScanBudget(
   scannedRows: number,
-  scannedBytes: number
+  scannedBytes: number,
+  message = DEFAULT_SCAN_BUDGET_MESSAGE
 ): void {
   if (
     scannedRows > QUERY_SCAN_ROW_LIMIT ||
     scannedBytes > QUERY_SCAN_BYTE_LIMIT
   ) {
-    throw new ValidationRuntimeError(
-      "Query exceeded the internal scan budget; add a more selective filter"
-    );
+    throw new ValidationRuntimeError(message);
   }
 }
 
@@ -636,6 +641,7 @@ export class D1DatabaseAdapter<TContext = unknown>
 
   async get(tableName: string, id: string): Promise<RuntimeDocument | null> {
     assertKnownTable(this.schema, tableName);
+    assertReadRulesConfigured(this.rules);
     const versioned = await fetchVersionedDocument(
       this.database,
       tableName,

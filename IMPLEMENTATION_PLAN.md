@@ -131,6 +131,8 @@ npx baseflare deploy --env production →
 
 First deploy to a new environment auto-provisions all CF resources. Subsequent deploys update the Worker and schema. `npx baseflare env destroy` deletes all resources.
 
+Environment names are project-scoped slugs and must be unique within a Baseflare project. Baseflare-managed Cloudflare resources keep the `bf-` prefix (`bf-{project}-{env}`) so CLI discovery and destructive operations can safely distinguish them from user-created resources. After provisioning, commands resolve environments by stored Cloudflare resource IDs, not fuzzy name matching. Cloudflare name lookup is only a recovery/linking fallback; if multiple matching resources exist, the CLI fails closed and asks the user to link the environment by explicit resource ID.
+
 ### 1.4 Management Architecture
 
 No hosted control plane. The CLI (`baseflare`) talks directly to the Cloudflare API for all management operations. The dashboard runs locally.
@@ -849,7 +851,10 @@ Each environment has one `SubscriptionDO` instance (singleton per environment, a
 4. Lazy config resolver — checks `baseflare.config.ts` + `.env.local`, prompts for missing values (profile, account, project name), writes files on first resolution
 4. Cloudflare API client for resource provisioning:
    - Create/delete Workers, D1 databases, R2 buckets, DO namespaces, and Vectorize indexes
-   - List environments by querying CF API for `bf-{project}-*` resources
+   - Store provisioned resource IDs in `.baseflare/project.json` after first deploy
+   - Resolve `--env <name>` through the project environment registry before Cloudflare calls
+   - List environments from the registry, with CF API `bf-{project}-*` discovery as a strict recovery/linking fallback
+   - Reject duplicate environment slugs within a project and fail closed on ambiguous Cloudflare name matches
 
 **"Done" criteria:**
 
@@ -1706,6 +1711,11 @@ const cf = new CloudflareClient({ credentials: loadCredentials() })
 const d1 = await cf.d1.create({ name: `bf-${project}-${envName}-db` })
 const r2 = await cf.r2.create({ name: `bf-${project}-${envName}-files` })
 const worker = await cf.workers.deploy({ name: `bf-${project}-${envName}`, script, bindings })
+await saveEnvironmentResources(envName, {
+  databaseId: d1.id,
+  bucketName: r2.name,
+  workerName: worker.name,
+})
 
 // Deploy code
 await cf.workers.deploy({ name: workerName, script: bundledWorker, bindings })
