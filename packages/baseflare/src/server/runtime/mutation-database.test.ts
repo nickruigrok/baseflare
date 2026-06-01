@@ -436,9 +436,9 @@ describe("MutationDatabase", () => {
       "SELECT table_name, version FROM _bf_table_versions"
     );
     expect(batchQueries[0]?.[0]).toContain("table_name IN (?, ?)");
-    expect(batchParams[0]?.[0]?.slice(0, 2)).toEqual(["todos", "labels"]);
+    expect(batchParams[0]?.[0]?.slice(0, 2)).toEqual(["labels", "todos"]);
     expect(batchQueries[0]?.[1]).toContain("UPDATE _bf_table_versions");
-    expect(batchParams[0]?.[1]?.slice(0, 2)).toEqual(["todos", "labels"]);
+    expect(batchParams[0]?.[1]?.slice(0, 2)).toEqual(["labels", "todos"]);
     expect(batchQueries[0]?.[2]).toContain("WHERE changes() = ?");
     expect(batchParams[0]?.[2]?.at(-1)).toBe(2);
     expect(batchQueries[0]?.[3]).toContain("WHERE changes() = ?");

@@ -827,6 +827,8 @@ export class D1DatabaseAdapter<TContext = unknown>
     tableName: string,
     id: string
   ): Promise<VersionedRuntimeDocument> {
+    // Direct action writes check permissions against this fetched revision.
+    // If the row changes before commit, the guarded write fails with conflict.
     const existing = await fetchVersionedDocument(this.database, tableName, id);
     if (!existing) {
       throw new NotFoundRuntimeError(

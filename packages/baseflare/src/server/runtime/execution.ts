@@ -92,7 +92,6 @@ export function executeMutationDefinition<TResult>(
   options: InvocationOptions,
   args: unknown
 ): Promise<TResult> {
-  const auth = createAuth(options.requestHeaders);
   const validatedArgs = validateArgs(definition, args);
 
   return withMutationRetry(
@@ -107,7 +106,7 @@ export function executeMutationDefinition<TResult>(
       });
 
       ctx = {
-        auth,
+        auth: createAuth(options.requestHeaders),
         db: mutationDb,
         runQuery(ref, nestedArgs) {
           const entry = options.functionIndex.getByReference("query", ref);

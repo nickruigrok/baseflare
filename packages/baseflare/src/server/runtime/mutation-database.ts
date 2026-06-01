@@ -989,6 +989,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       }
     }
 
+    tableNames.sort();
     return tableNames;
   }
 
