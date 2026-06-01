@@ -153,8 +153,14 @@ export async function executeActionDefinition<TResult>(
 
 export function createActionContext(options: InvocationOptions): ActionCtx {
   const auth = createAuth(options.requestHeaders);
-  const actionDatabase = createMutationDatabaseSession(options.database);
-  const actionOptions = { ...options, database: actionDatabase };
+  let actionOptions: InvocationOptions | undefined;
+  const getActionOptions = (): InvocationOptions => {
+    actionOptions ??= {
+      ...options,
+      database: createMutationDatabaseSession(options.database),
+    };
+    return actionOptions;
+  };
   const ctx: ActionCtx = {
     auth,
     runAction(ref, nestedArgs) {
@@ -165,7 +171,7 @@ export function createActionContext(options: InvocationOptions): ActionCtx {
 
       return executeActionDefinition(
         entry.definition as ActionDefinition,
-        actionOptions,
+        getActionOptions(),
         nestedArgs
       );
     },
@@ -178,7 +184,7 @@ export function createActionContext(options: InvocationOptions): ActionCtx {
       return executeMutationDefinition(
         entry.definition as MutationDefinition,
         {
-          ...actionOptions,
+          ...getActionOptions(),
           invocationName: entry.name,
         },
         nestedArgs
@@ -192,7 +198,7 @@ export function createActionContext(options: InvocationOptions): ActionCtx {
 
       return executeQueryDefinition(
         entry.definition as QueryDefinition,
-        actionOptions,
+        getActionOptions(),
         nestedArgs
       );
     },

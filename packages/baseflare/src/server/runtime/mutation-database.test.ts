@@ -316,6 +316,38 @@ describe("MutationDatabase", () => {
     expect(nestedSessionCalled).toBe(false);
   });
 
+  it("requires D1 Sessions for mutation consistency", () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const database: D1Database = {
+      batch() {
+        return Promise.resolve([]);
+      },
+      prepare(query) {
+        return new FakePreparedStatement(query, () => ({
+          results: [],
+          success: true,
+        }));
+      },
+    };
+
+    try {
+      expect(() => createMutationDatabaseSession(database)).toThrow(
+        "Baseflare runtime misconfiguration: APP_DB does not support D1 Sessions required for consistent mutations."
+      );
+      expect(consoleError).toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          component: "baseflare-runtime",
+          event: "runtime.d1_session_required",
+        })
+      );
+    } finally {
+      consoleError.mockRestore();
+    }
+  });
+
   it("requires D1 change counts for commit write operations", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({

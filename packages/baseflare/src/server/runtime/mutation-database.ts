@@ -98,6 +98,8 @@ type CommitOperation =
     };
 
 const MUTATION_QUERY_CHUNK_SIZE = 256;
+const D1_SESSION_REQUIRED_MESSAGE =
+  "Baseflare runtime misconfiguration: APP_DB does not support D1 Sessions required for consistent mutations.";
 const missingTableVersionRowMessage = (tableName: string): string =>
   `Missing internal table version row for "${tableName}"; run applyRuntimeSchema before handling runtime traffic`;
 
@@ -1284,9 +1286,12 @@ export function createMutationDatabaseSession(
     return database;
   }
 
-  // D1 Sessions provide the strongest mutation read consistency. Runtimes
-  // without sessions fall back to the raw binding and rely on OCC at commit.
-  return database.withSession?.("first-primary") ?? database;
+  if (!database.withSession) {
+    logRuntimeEvent("error", "runtime.d1_session_required");
+    throw new InternalRuntimeError(D1_SESSION_REQUIRED_MESSAGE);
+  }
+
+  return database.withSession("first-primary");
 }
 
 export async function withMutationRetry<TResult>(

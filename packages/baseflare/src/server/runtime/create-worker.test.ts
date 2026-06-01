@@ -1,5 +1,5 @@
-import { v } from "baseflare/values";
-import { describe, expect, it } from "vitest";
+import { ErrorCode, v } from "baseflare/values";
+import { describe, expect, it, vi } from "vitest";
 
 import { action } from "../functions/action";
 import { mutation } from "../functions/mutation";
@@ -7,6 +7,7 @@ import { query } from "../functions/query";
 import { defineRules } from "../permissions/define-rules";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
+import { createWorker } from "./create-worker";
 import { PayloadTooLargeRuntimeError } from "./errors";
 import { createActionContext } from "./execution";
 import { createFunctionIndex } from "./function-index";
@@ -98,6 +99,101 @@ describe("worker request body reader", () => {
     await expect(readRequestBodyText(request, 1)).rejects.toBeInstanceOf(
       PayloadTooLargeRuntimeError
     );
+  });
+
+  it("does not require D1 Sessions until an action calls a nested function", () => {
+    const database: D1Database = {
+      batch() {
+        throw new Error("Expected no D1 batch");
+      },
+      prepare() {
+        throw new Error("Expected no D1 prepare");
+      },
+    };
+    const pureAction = action({
+      args: {},
+      handler: () => "ok",
+    });
+    const ctx = createActionContext({
+      database,
+      executionContext: {
+        waitUntil() {
+          // Test execution context stub.
+        },
+      },
+      functionIndex: createFunctionIndex(buildBaseflareManifest({ schema })),
+      requestHeaders: new Headers(),
+      rules: defineRules({
+        todos: {
+          read: () => true,
+        },
+      }),
+      schema,
+    });
+
+    expect(pureAction.handler(ctx, {})).toBe("ok");
+  });
+
+  it("sanitizes missing D1 Session errors in API responses", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const database: D1Database = {
+      batch() {
+        return Promise.resolve([]);
+      },
+      prepare() {
+        throw new Error("Expected mutation execution to fail before queries");
+      },
+    };
+    const createTodo = mutation({
+      args: {},
+      handler: (ctx) => ctx.db.insert("todos", { text: "session-required" }),
+    });
+    const worker = createWorker(
+      buildBaseflareManifest({
+        mutations: [
+          {
+            definition: createTodo,
+            exportName: "create",
+            modulePath: "todos",
+          },
+        ],
+        rules: defineRules({
+          todos: {
+            insert: () => true,
+            read: () => true,
+          },
+        }),
+        schema,
+      })
+    );
+
+    try {
+      const response = await worker.fetch(
+        new Request("http://example.com/api/mutation/todos:create", {
+          body: JSON.stringify({ args: {} }),
+          method: "POST",
+        }),
+        { APP_DB: database },
+        {
+          waitUntil() {
+            // Test execution context stub.
+          },
+        }
+      );
+      const body = (await response.json()) as {
+        error: { code: ErrorCode; message: string };
+      };
+
+      expect(response.status).toBe(500);
+      expect(body.error).toEqual({
+        code: ErrorCode.InternalError,
+        message: "Internal error",
+      });
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("uses a primary D1 session for action database access and nested calls", async () => {

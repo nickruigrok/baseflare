@@ -37,6 +37,11 @@ Keep mutations focused on a bounded set of documents. For large datasets, use
 selective filters and pagination; future bulk/import workflows will cover very
 large write jobs explicitly.
 
+Baseflare-managed deployments provide the D1 Sessions support required for
+consistent mutations. Local tests and custom bindings should expose
+`withSession("first-primary")` and return a session with `prepare`, `batch`, and
+`getBookmark`.
+
 ## Query filter semantics
 
 Object filters treat `null` as the JSON-safe nullish query value for document
