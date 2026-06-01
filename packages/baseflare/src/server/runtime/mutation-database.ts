@@ -757,8 +757,9 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     const operations: CommitOperation[] = [
       createGuardedTableVersionBumps(mutatedTables, guard),
     ];
-    // The first document write is gated by the multi-table version bump, so it
-    // must observe changes() equal to every mutated table being bumped.
+    // Mutation commits use the plural multi-table gate. The first document
+    // write must observe changes() equal to every mutated table being bumped.
+    // The singular guarded bump with ignoredTables is only for direct writes.
     let expectedPreviousChanges = mutatedTables.length;
 
     for (const tableName of mutatedTables) {
