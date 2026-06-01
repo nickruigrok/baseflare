@@ -122,6 +122,10 @@ describe("worker request body reader", () => {
       batch() {
         sessionBatchCalled = true;
         return Promise.resolve([
+          {
+            results: [{ table_name: "todos", version: 0 }],
+            success: true,
+          },
           { meta: { changes: 1 }, success: true },
           { meta: { changes: 1 }, success: true },
         ]);

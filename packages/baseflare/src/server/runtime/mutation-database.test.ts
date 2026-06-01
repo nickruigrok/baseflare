@@ -214,11 +214,28 @@ function createStoredRow(index: number): StoredDocumentRow {
   };
 }
 
+function tableVersionResult(
+  tableVersions: Readonly<Record<string, number>>
+): D1Result {
+  return {
+    results: Object.entries(tableVersions).map(([table_name, version]) => ({
+      table_name,
+      version,
+    })),
+    success: true,
+  };
+}
+
 describe("MutationDatabase", () => {
   it("fails closed when a mutated table has no committed writes", () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({ batchResults: [] })
     );
+    const buildCommitOperations = (
+      mutationDb as unknown as {
+        buildCommitOperations(tableNames: readonly string[]): unknown[];
+      }
+    ).buildCommitOperations.bind(mutationDb);
     const appendWriteStatements = (
       mutationDb as unknown as {
         appendWriteStatementsForTable(
@@ -229,6 +246,9 @@ describe("MutationDatabase", () => {
       }
     ).appendWriteStatementsForTable.bind(mutationDb);
 
+    expect(() => buildCommitOperations(["todos"])).toThrow(
+      'Mutated table "todos" has no committed writes'
+    );
     expect(() => appendWriteStatements([], "todos", 1)).toThrow(
       'Mutated table "todos" has no committed writes'
     );
@@ -295,7 +315,11 @@ describe("MutationDatabase", () => {
   it("requires D1 change counts for commit write operations", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
-        batchResults: [{ success: true }, { success: true }],
+        batchResults: [
+          tableVersionResult({ todos: 0 }),
+          { success: true },
+          { success: true },
+        ],
       })
     );
 
@@ -327,6 +351,7 @@ describe("MutationDatabase", () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
         batchResults: [
+          tableVersionResult({ todos: 0 }),
           { meta: { changes: 0 }, success: true },
           { meta: { changes: 0 }, success: true },
         ],
@@ -343,8 +368,11 @@ describe("MutationDatabase", () => {
   it("requires internal table version rows before committing", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
-        batchResults: [],
-        tableVersion: null,
+        batchResults: [
+          { results: [], success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
       })
     );
 
@@ -361,6 +389,7 @@ describe("MutationDatabase", () => {
       createFakeDatabase({
         batchParams,
         batchResults: [
+          tableVersionResult({ labels: 0, todos: 0 }),
           { meta: { changes: 0 }, success: true },
           { meta: { changes: 0 }, success: true },
           { meta: { changes: 1 }, success: true },
@@ -374,8 +403,8 @@ describe("MutationDatabase", () => {
     await expect(mutationDb.commit()).rejects.toThrow(
       RetryableMutationConflictError
     );
-    expect(batchParams[0]?.[1]?.at(-1)).toBe(2);
-    expect(batchParams[0]?.[2]?.at(-1)).toBe(1);
+    expect(batchParams[0]?.[2]?.at(-1)).toBe(2);
+    expect(batchParams[0]?.[3]?.at(-1)).toBe(1);
   });
 
   it("commits successful multi-table writes behind one table-version gate", async () => {
@@ -386,6 +415,7 @@ describe("MutationDatabase", () => {
         batchParams,
         batchQueries,
         batchResults: [
+          tableVersionResult({ labels: 0, todos: 0 }),
           { meta: { changes: 2 }, success: true },
           { meta: { changes: 1 }, success: true },
           { meta: { changes: 1 }, success: true },
@@ -397,19 +427,24 @@ describe("MutationDatabase", () => {
     await mutationDb.insert("labels", { text: "label" });
     await mutationDb.commit();
 
-    expect(batchQueries[0]).toHaveLength(3);
+    expect(batchQueries[0]).toHaveLength(4);
     expect(batchQueries[0]?.[0]).toContain("table_name IN (?, ?)");
     expect(batchParams[0]?.[0]?.slice(0, 2)).toEqual(["todos", "labels"]);
-    expect(batchParams[0]?.[1]?.at(-1)).toBe(2);
-    expect(batchParams[0]?.[2]?.at(-1)).toBe(1);
+    expect(batchQueries[0]?.[1]).toContain("UPDATE _bf_table_versions");
+    expect(batchParams[0]?.[1]?.slice(0, 2)).toEqual(["todos", "labels"]);
+    expect(batchParams[0]?.[2]?.at(-1)).toBe(2);
+    expect(batchParams[0]?.[3]?.at(-1)).toBe(1);
   });
 
   it("checks stale read versions when a table is also mutated", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
-        batchResults: [],
+        batchResults: [
+          tableVersionResult({ todos: 1 }),
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
         readResults: [{ version: 0, rows: [] }],
-        tableVersions: { todos: 1 },
       })
     );
 
@@ -421,11 +456,12 @@ describe("MutationDatabase", () => {
     );
   });
 
-  it("checks all table versions with one pre-commit query", async () => {
+  it("batches table version assertions with commit operations", async () => {
     const queryLog: string[] = [];
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
         batchResults: [
+          tableVersionResult({ todos: 0 }),
           { meta: { changes: 1 }, success: true },
           { meta: { changes: 1 }, success: true },
         ],
@@ -596,8 +632,12 @@ describe("MutationDatabase", () => {
   it("retries stale writes after zero-limit mutation queries", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
-        batchResults: [],
-        tableVersionReads: [0, 1],
+        batchResults: [
+          tableVersionResult({ todos: 1 }),
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+        tableVersionReads: [0],
       })
     );
 
@@ -636,6 +676,7 @@ describe("MutationDatabase", () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
         batchResults: [
+          tableVersionResult({ todos: 1 }),
           { meta: { changes: 0 }, success: true },
           { meta: { changes: 0 }, success: true },
         ],

@@ -77,6 +77,13 @@ interface ScanBudget {
 
 type CommitOperation =
   | {
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+      readonly tableNames: readonly string[];
+      readonly tableVersions: ReadonlyMap<string, number>;
+      readonly type: "assert-table-versions";
+    }
+  | {
       readonly conflictOnZero: true;
       readonly expectedChanges: number;
       readonly params: readonly (string | number | null)[];
@@ -417,8 +424,6 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       return;
     }
 
-    await this.assertTableVersions(mutatedTables);
-
     const operations = this.buildCommitOperations(mutatedTables);
     if (operations.length === 0) {
       return;
@@ -753,8 +758,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   private buildCommitOperations(
     mutatedTables: readonly string[]
   ): CommitOperation[] {
+    this.assertMutatedTablesHaveCommittedWrites(mutatedTables);
+
     const guard = this.createCommitGuard();
+    const checkedTableNames = [
+      ...new Set([...mutatedTables, ...this.tableReadVersions.keys()]),
+    ];
     const operations: CommitOperation[] = [
+      this.createTableVersionAssertionOperation(checkedTableNames),
       createGuardedTableVersionBumps(mutatedTables, guard),
     ];
     // Mutation commits use the plural multi-table gate. The first document
@@ -771,6 +782,32 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     return operations;
+  }
+
+  private assertMutatedTablesHaveCommittedWrites(
+    mutatedTables: readonly string[]
+  ): void {
+    for (const tableName of mutatedTables) {
+      const writes = this.pendingWrites.get(tableName);
+      if (!(writes && [...writes.values()].some(hasCommittedEffect))) {
+        throw new InternalRuntimeError(
+          `Mutated table "${tableName}" has no committed writes`
+        );
+      }
+    }
+  }
+
+  private createTableVersionAssertionOperation(
+    tableNames: readonly string[]
+  ): CommitOperation {
+    const placeholders = tableNames.map(() => "?").join(", ");
+    return {
+      type: "assert-table-versions",
+      sql: `SELECT table_name, version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name IN (${placeholders})`,
+      params: tableNames,
+      tableNames,
+      tableVersions: this.tableReadVersions,
+    };
   }
 
   private createRuntimeDocument(
@@ -1081,6 +1118,11 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         );
       }
 
+      if (operation.type === "assert-table-versions") {
+        this.validateTableVersionAssertion(operation, result);
+        continue;
+      }
+
       const changes = result.meta?.changes;
       if (requiresChangeCount(operation)) {
         if (changes === undefined) {
@@ -1104,35 +1146,19 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
   }
 
-  private async assertTableVersions(
-    tableNames: readonly string[]
-  ): Promise<void> {
-    // This precheck catches missing metadata and obvious stale reads early.
-    // The guarded commit batch remains the authoritative OCC boundary, so
-    // concurrent writes after this point still retry at commit time.
-    const checkedTables = new Set([
-      ...tableNames,
-      ...this.tableReadVersions.keys(),
-    ]);
-    if (checkedTables.size === 0) {
-      return;
-    }
-
-    const checkedTableNames = [...checkedTables];
-    const placeholders = checkedTableNames.map(() => "?").join(", ");
-    const rows = await executeRowQuery<{
-      table_name: string;
-      version: number;
-    }>(this.database, {
-      sql: `SELECT table_name, version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name IN (${placeholders})`,
-      params: checkedTableNames,
-    });
-
+  private validateTableVersionAssertion(
+    operation: Extract<CommitOperation, { type: "assert-table-versions" }>,
+    result: D1Result
+  ): void {
     const versions = new Map(
-      rows.map((row) => [row.table_name, row.version] as const)
+      (result.results ?? []).flatMap((row) =>
+        typeof row.table_name === "string" && typeof row.version === "number"
+          ? ([[row.table_name, row.version]] as const)
+          : []
+      )
     );
 
-    for (const tableName of checkedTableNames) {
+    for (const tableName of operation.tableNames) {
       const version = versions.get(tableName);
       if (typeof version !== "number") {
         throw new InternalRuntimeError(
@@ -1140,7 +1166,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         );
       }
 
-      const readVersion = this.tableReadVersions.get(tableName);
+      const readVersion = operation.tableVersions.get(tableName);
       if (readVersion !== undefined && version !== readVersion) {
         throw new RetryableMutationConflictError();
       }
