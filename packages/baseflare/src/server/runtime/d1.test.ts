@@ -74,18 +74,11 @@ function createStoredRow(
 }
 
 function createFakeDatabase(options: {
-  readonly batchQueries?: string[][];
-  readonly batchResults: readonly D1Result[];
   readonly queryRows?: readonly Record<string, unknown>[];
 }): D1Database {
   return {
-    batch(statements) {
-      options.batchQueries?.push(
-        statements.map((statement) =>
-          statement instanceof FakePreparedStatement ? statement.query : ""
-        )
-      );
-      return Promise.resolve(options.batchResults);
+    batch() {
+      return Promise.resolve([]);
     },
     prepare(query) {
       return new FakePreparedStatement(
@@ -110,15 +103,11 @@ function createTodoSchema() {
 }
 
 function createAdapter(options?: {
-  readonly batchQueries?: string[][];
-  readonly batchResults?: readonly D1Result[];
   readonly queryRows?: readonly Record<string, unknown>[];
   readonly rules?: ReturnType<typeof defineRules>;
 }): D1DatabaseAdapter {
   return new D1DatabaseAdapter({
     database: createFakeDatabase({
-      batchQueries: options?.batchQueries,
-      batchResults: options?.batchResults ?? [],
       queryRows: options?.queryRows,
     }),
     getContext: () => ({}),
@@ -312,221 +301,5 @@ describe("D1 runtime helpers", () => {
     await expect(database.query("todos").unique()).rejects.toThrow(
       'Expected exactly one document from "todos", received 2'
     );
-  });
-
-  it("requires D1 change counts for direct write operations", async () => {
-    const rules = defineRules({
-      todos: {
-        update: () => true,
-      },
-    });
-    const database = createAdapter({
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { success: true },
-        { meta: { changes: 1 }, success: true },
-      ],
-      rules,
-    });
-
-    await expect(
-      database.patch("todos", testId, { text: "after" })
-    ).rejects.toThrow(
-      "D1 did not report a change count for the write operation"
-    );
-  });
-
-  it("requires D1 write batches to return one result per operation", async () => {
-    const database = createAdapter({
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { meta: { changes: 1 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          insert: () => true,
-        },
-      }),
-    });
-
-    await expect(database.insert("todos", { text: "after" })).rejects.toThrow(
-      "D1 write batch returned an unexpected number of results"
-    );
-  });
-
-  it("requires D1 change counts for direct inserts", async () => {
-    const database = createAdapter({
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { success: true },
-        { meta: { changes: 1 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          insert: () => true,
-        },
-      }),
-    });
-
-    await expect(database.insert("todos", { text: "after" })).rejects.toThrow(
-      "D1 did not report a change count for the write operation"
-    );
-  });
-
-  it("accepts direct inserts with one reported D1 change", async () => {
-    const database = createAdapter({
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { meta: { changes: 1 }, success: true },
-        { meta: { changes: 1 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          insert: () => true,
-        },
-      }),
-    });
-
-    await expect(database.insert("todos", { text: "after" })).resolves.toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/
-    );
-  });
-
-  it("gates direct inserts behind table-version bumps", async () => {
-    const batchQueries: string[][] = [];
-    const database = createAdapter({
-      batchQueries,
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { meta: { changes: 1 }, success: true },
-        { meta: { changes: 1 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          insert: () => true,
-        },
-      }),
-    });
-
-    await database.insert("todos", { text: "after" });
-
-    expect(batchQueries[0]?.[0]).toContain("SELECT version");
-    expect(batchQueries[0]?.[1]).toContain("UPDATE _bf_table_versions");
-    expect(batchQueries[0]?.[1]).toContain("NOT EXISTS");
-    expect(batchQueries[0]?.[2]).toContain("WHERE changes() = 1");
-  });
-
-  it("reports missing direct write table versions as internal errors", async () => {
-    const database = createAdapter({
-      batchResults: [
-        { results: [], success: true },
-        { meta: { changes: 0 }, success: true },
-        { meta: { changes: 0 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          insert: () => true,
-        },
-      }),
-    });
-
-    await expect(database.insert("todos", { text: "after" })).rejects.toThrow(
-      'Missing internal table version row for "todos"'
-    );
-  });
-
-  it("reports direct write guard misses as conflicts", async () => {
-    const database = createAdapter({
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { meta: { changes: 0 }, success: true },
-        { meta: { changes: 0 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          update: () => true,
-        },
-      }),
-    });
-
-    await expect(
-      database.patch("todos", testId, { text: "after" })
-    ).rejects.toThrow("Document changed concurrently");
-  });
-
-  it("reports guarded direct write multi-change anomalies as internal errors", async () => {
-    const database = createAdapter({
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { meta: { changes: 2 }, success: true },
-        { meta: { changes: 0 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          update: () => true,
-        },
-      }),
-    });
-
-    await expect(
-      database.patch("todos", testId, { text: "after" })
-    ).rejects.toThrow(
-      'D1 write operation "bump-table-version" did not apply after its guard passed'
-    );
-  });
-
-  it("reports unguarded direct write change anomalies as internal errors", async () => {
-    const database = createAdapter({
-      batchResults: [
-        { results: [{ version: 0 }], success: true },
-        { meta: { changes: 1 }, success: true },
-        { meta: { changes: 2 }, success: true },
-      ],
-      rules: defineRules({
-        todos: {
-          update: () => true,
-        },
-      }),
-    });
-
-    await expect(
-      database.patch("todos", testId, { text: "after" })
-    ).rejects.toThrow(
-      'D1 write operation "update" did not apply after its guard passed'
-    );
-  });
-
-  it("coerces direct insert validation errors", async () => {
-    await expect(createAdapter().insert("todos", {})).rejects.toThrow(
-      "Invalid insert document"
-    );
-  });
-
-  it("coerces direct patch validation errors", async () => {
-    const database = createAdapter({
-      rules: defineRules({
-        todos: {
-          update: () => true,
-        },
-      }),
-    });
-
-    await expect(
-      database.patch("todos", testId, { text: 123 })
-    ).rejects.toThrow("Invalid patch document");
-  });
-
-  it("coerces direct replace validation errors", async () => {
-    const database = createAdapter({
-      rules: defineRules({
-        todos: {
-          update: () => true,
-        },
-      }),
-    });
-
-    await expect(
-      database.replace("todos", testId, { text: 123 })
-    ).rejects.toThrow("Invalid replacement document");
   });
 });

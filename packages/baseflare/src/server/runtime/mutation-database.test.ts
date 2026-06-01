@@ -369,6 +369,44 @@ describe("MutationDatabase", () => {
     );
   });
 
+  it("treats under-applied multi-table bumps as retryable conflicts", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          tableVersionResult({ labels: 0, todos: 0 }),
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "todo" });
+    await mutationDb.insert("labels", { text: "label" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
+  });
+
+  it("reports over-applied multi-table bumps as internal errors", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          tableVersionResult({ labels: 0, todos: 0 }),
+          { meta: { changes: 3 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+      })
+    );
+
+    await mutationDb.insert("todos", { text: "todo" });
+    await mutationDb.insert("labels", { text: "label" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
+  });
+
   it("requires internal table version rows before committing", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
@@ -383,7 +421,7 @@ describe("MutationDatabase", () => {
     await mutationDb.insert("todos", { text: "assertion-validation" });
 
     await expect(mutationDb.commit()).rejects.toThrow(
-      'Missing internal table version row for "todos"'
+      'Missing internal table version row for "todos"; run applyRuntimeSchema before handling runtime traffic'
     );
   });
 
@@ -734,6 +772,7 @@ describe("MutationDatabase", () => {
     );
     expect(queryLog).toEqual([
       "SELECT version FROM _bf_table_versions WHERE table_name = ? LIMIT 1",
+      "SELECT _id, _data, _rev FROM todos LIMIT 0",
     ]);
   });
 
@@ -745,7 +784,7 @@ describe("MutationDatabase", () => {
           { meta: { changes: 0 }, success: true },
           { meta: { changes: 0 }, success: true },
         ],
-        tableVersionReads: [0],
+        readResults: [{ version: 0, rows: [] }],
       })
     );
 
@@ -918,6 +957,7 @@ describe("MutationDatabase", () => {
     );
     expect(queryLog).toEqual([
       "SELECT version FROM _bf_table_versions WHERE table_name = ? LIMIT 1",
+      "SELECT _id, _data, _rev FROM todos LIMIT 0",
     ]);
   });
 

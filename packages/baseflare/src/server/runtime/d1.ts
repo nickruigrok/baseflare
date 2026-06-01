@@ -1,5 +1,3 @@
-import { generateId } from "baseflare/values";
-
 import {
   buildCursorPredicate,
   type CursorPayload,
@@ -19,13 +17,6 @@ import {
   type QueryState,
 } from "../db/query-builder";
 import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
-import { serialize } from "../db/serialize";
-import {
-  validateInsertData,
-  validatePatchData,
-  validateReplaceData,
-} from "../db/write-validation";
-import type { DatabaseWriter } from "../db/writer";
 import type { Rules } from "../permissions/types";
 import {
   type Schema,
@@ -34,27 +25,18 @@ import {
 } from "../schema/types";
 
 import {
-  ConflictRuntimeError,
   coerceDatabaseError,
   coerceMalformedDocumentError,
-  coerceValidationError,
   ensureSuccessfulD1Result,
   InternalRuntimeError,
   NotFoundRuntimeError,
   ValidationRuntimeError,
   withDatabaseErrorHandling,
 } from "./errors";
-import {
-  assertCanDelete,
-  assertCanInsert,
-  assertCanUpdate,
-  assertReadRulesConfigured,
-  canReadDocument,
-} from "./permissions";
+import { assertReadRulesConfigured, canReadDocument } from "./permissions";
 import type {
   D1BindingValue,
   D1PreparedStatement,
-  D1Result,
   RuntimeDatabase,
 } from "./types";
 
@@ -601,45 +583,7 @@ export function assertWithinScanBudget(
   }
 }
 
-function ensureSingleChange(
-  changes: number | undefined,
-  operation: {
-    readonly conflictOnZero?: boolean;
-    readonly type: string;
-  }
-): void {
-  if (changes === undefined) {
-    throw new InternalRuntimeError(
-      "D1 did not report a change count for the write operation"
-    );
-  }
-
-  if (changes !== 1) {
-    if (operation.conflictOnZero && changes === 0) {
-      throw new ConflictRuntimeError("Document changed concurrently");
-    }
-
-    throw new InternalRuntimeError(
-      `D1 write operation "${operation.type}" did not apply after its guard passed`
-    );
-  }
-}
-
-function assertTableVersionResult(
-  result: D1Result,
-  operation: { readonly tableName?: string }
-): void {
-  const row = result.results?.[0];
-  if (typeof row?.version !== "number") {
-    throw new InternalRuntimeError(
-      `Missing internal table version row for "${operation.tableName ?? "unknown"}"`
-    );
-  }
-}
-
-export class D1DatabaseAdapter<TContext = unknown>
-  implements DatabaseWriter<RuntimeDocument>
-{
+export class D1DatabaseAdapter<TContext = unknown> {
   private readonly database: RuntimeDatabase;
   private readonly getContext: () => TContext;
   private readonly rules?: Rules;
@@ -689,299 +633,6 @@ export class D1DatabaseAdapter<TContext = unknown>
       tableName,
     });
   }
-
-  async insert(
-    tableName: string,
-    doc: Record<string, unknown>
-  ): Promise<string> {
-    const table = assertKnownTable(this.schema, tableName);
-    const validated = this.validateInsert(table, doc);
-    await assertCanInsert(this.rules, tableName, this.getContext(), validated);
-
-    const id = generateId();
-    const serialized = serialize(validated);
-    await this.runWriteBatch([
-      createTableVersionAssertion(tableName),
-      createGuardedTableVersionBump(
-        tableName,
-        createDirectWriteGuard(tableName, {
-          insertId: id,
-        })
-      ),
-      {
-        type: "insert",
-        sql: `INSERT INTO ${tableName} (_id, _data, _rev)
-              SELECT ?, ?, 0 WHERE changes() = 1`,
-        params: [id, serialized._data],
-        requireSingleChange: true,
-      },
-    ]);
-
-    return id;
-  }
-
-  async patch(
-    tableName: string,
-    id: string,
-    partial: Record<string, unknown>
-  ): Promise<void> {
-    const table = assertKnownTable(this.schema, tableName);
-    const existing = await this.getWritableDocument(tableName, id);
-    const validated = this.validatePatch(table, existing.document, partial);
-    await assertCanUpdate(
-      this.rules,
-      tableName,
-      this.getContext(),
-      existing.document,
-      validated
-    );
-
-    const serialized = serialize(validated);
-    await this.runWriteBatch([
-      createTableVersionAssertion(tableName),
-      createGuardedTableVersionBump(
-        tableName,
-        createDirectWriteGuard(tableName, {
-          rowId: id,
-          rev: existing.rev,
-        })
-      ),
-      {
-        type: "update",
-        sql: `UPDATE ${tableName}
-              SET _data = ?, _rev = _rev + 1
-              WHERE _id = ? AND _rev = ? AND changes() = 1`,
-        params: [serialized._data, id, existing.rev],
-        requireSingleChange: true,
-      },
-    ]);
-  }
-
-  async replace(
-    tableName: string,
-    id: string,
-    doc: Record<string, unknown>
-  ): Promise<void> {
-    const table = assertKnownTable(this.schema, tableName);
-    const existing = await this.getWritableDocument(tableName, id);
-    const validated = this.validateReplace(table, doc);
-    await assertCanUpdate(
-      this.rules,
-      tableName,
-      this.getContext(),
-      existing.document,
-      validated
-    );
-
-    const serialized = serialize(validated);
-    await this.runWriteBatch([
-      createTableVersionAssertion(tableName),
-      createGuardedTableVersionBump(
-        tableName,
-        createDirectWriteGuard(tableName, {
-          rowId: id,
-          rev: existing.rev,
-        })
-      ),
-      {
-        type: "update",
-        sql: `UPDATE ${tableName}
-              SET _data = ?, _rev = _rev + 1
-              WHERE _id = ? AND _rev = ? AND changes() = 1`,
-        params: [serialized._data, id, existing.rev],
-        requireSingleChange: true,
-      },
-    ]);
-  }
-
-  async delete(tableName: string, id: string): Promise<void> {
-    assertKnownTable(this.schema, tableName);
-    const existing = await this.getWritableDocument(tableName, id);
-    await assertCanDelete(
-      this.rules,
-      tableName,
-      this.getContext(),
-      existing.document
-    );
-
-    await this.runWriteBatch([
-      createTableVersionAssertion(tableName),
-      createGuardedTableVersionBump(
-        tableName,
-        createDirectWriteGuard(tableName, {
-          rowId: id,
-          rev: existing.rev,
-        })
-      ),
-      {
-        type: "delete",
-        sql: `DELETE FROM ${tableName}
-              WHERE _id = ? AND _rev = ? AND changes() = 1`,
-        params: [id, existing.rev],
-        requireSingleChange: true,
-      },
-    ]);
-  }
-
-  private async getWritableDocument(
-    tableName: string,
-    id: string
-  ): Promise<VersionedRuntimeDocument> {
-    // Direct action writes check permissions against this fetched revision.
-    // If the row changes before commit, the guarded write fails with conflict.
-    const existing = await fetchVersionedDocument(this.database, tableName, id);
-    if (!existing) {
-      throw new NotFoundRuntimeError(
-        `Document "${id}" was not found in table "${tableName}"`
-      );
-    }
-
-    return existing;
-  }
-
-  private validateInsert(
-    table: Parameters<typeof validateInsertData>[0],
-    value: Record<string, unknown>
-  ): Record<string, unknown> {
-    try {
-      return validateInsertData(table, value);
-    } catch (error) {
-      return coerceValidationError(error, "Invalid insert document");
-    }
-  }
-
-  private validatePatch(
-    table: Parameters<typeof validatePatchData>[0],
-    current: Record<string, unknown>,
-    patch: Record<string, unknown>
-  ): Record<string, unknown> {
-    try {
-      return validatePatchData(table, current, patch);
-    } catch (error) {
-      return coerceValidationError(error, "Invalid patch document");
-    }
-  }
-
-  private validateReplace(
-    table: Parameters<typeof validateReplaceData>[0],
-    value: Record<string, unknown>
-  ): Record<string, unknown> {
-    try {
-      return validateReplaceData(table, value);
-    } catch (error) {
-      return coerceValidationError(error, "Invalid replacement document");
-    }
-  }
-
-  private async runWriteBatch(
-    operations: readonly {
-      readonly conflictOnZero?: boolean;
-      readonly params: readonly (string | number | null)[];
-      readonly requireSingleChange?: boolean;
-      readonly sql: string;
-      readonly tableName?: string;
-      readonly type:
-        | "assert-table-version"
-        | "bump-table-version"
-        | "delete"
-        | "insert"
-        | "update";
-    }[]
-  ): Promise<void> {
-    const statements = operations.map((operation) =>
-      bindStatement(this.database, operation.sql, operation.params)
-    );
-    const results = await withDatabaseErrorHandling(
-      "Failed to commit D1 write",
-      async () => this.database.batch(statements)
-    );
-
-    if (results.length !== operations.length) {
-      throw new InternalRuntimeError(
-        "D1 write batch returned an unexpected number of results"
-      );
-    }
-
-    for (const [index, result] of results.entries()) {
-      const operation = operations[index];
-      ensureSuccessfulD1Result(result, "Failed to commit D1 write");
-      if (!operation) {
-        continue;
-      }
-
-      if (operation.type === "assert-table-version") {
-        assertTableVersionResult(result, operation);
-        continue;
-      }
-
-      if (operation.requireSingleChange) {
-        ensureSingleChange(result.meta?.changes, operation);
-      }
-    }
-  }
-}
-
-function createDirectWriteGuard(
-  tableName: string,
-  options:
-    | {
-        readonly insertId: string;
-      }
-    | {
-        readonly rev: number;
-        readonly rowId: string;
-      }
-): CommitGuard {
-  if ("insertId" in options) {
-    return { insertedIds: new Map([[tableName, new Set([options.insertId])]]) };
-  }
-
-  return {
-    rowRevisions: new Map([
-      [tableName, new Map([[options.rowId, options.rev]])],
-    ]),
-  };
-}
-
-function createTableVersionAssertion(tableName: string): {
-  readonly params: readonly string[];
-  readonly sql: string;
-  readonly tableName: string;
-  readonly type: "assert-table-version";
-} {
-  return {
-    sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
-    params: [tableName],
-    tableName,
-    type: "assert-table-version",
-  };
-}
-
-export function createGuardedTableVersionBump(
-  tableName: string,
-  guard: CommitGuard,
-  options: {
-    readonly ignoredTables?: ReadonlySet<string>;
-  } = {}
-): {
-  readonly conflictOnZero: true;
-  readonly params: readonly (string | number | null)[];
-  readonly requireSingleChange: true;
-  readonly sql: string;
-  readonly type: "bump-table-version";
-} {
-  const guardConditions = buildCommitGuardConditions(guard, options);
-  const conditions = ["table_name = ?", ...guardConditions.conditions];
-
-  return {
-    sql: `UPDATE ${TABLE_VERSION_TABLE_NAME}
-          SET version = version + 1
-          WHERE ${conditions.join(" AND ")}`,
-    params: [tableName, ...guardConditions.params],
-    conflictOnZero: true,
-    requireSingleChange: true,
-    type: "bump-table-version",
-  };
 }
 
 export function createGuardedTableVersionBumps(

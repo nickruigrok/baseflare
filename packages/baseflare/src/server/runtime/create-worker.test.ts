@@ -147,7 +147,7 @@ describe("worker request body reader", () => {
         return Promise.resolve([]);
       },
       prepare() {
-        throw new Error("Expected action db to use a session");
+        throw new Error("Expected nested action calls to use a session");
       },
       withSession(constraint) {
         rootSessionCalls += 1;
@@ -161,8 +161,7 @@ describe("worker request body reader", () => {
     });
     const getTodoAction = action({
       args: {},
-      handler: (ctx) =>
-        ctx.db.get("todos", "019078e5-d29f-7000-8000-000000000001"),
+      handler: (ctx) => ctx.runQuery(getTodoQuery, {}),
     });
     const insertTodoMutation = mutation({
       args: {},
@@ -171,7 +170,6 @@ describe("worker request body reader", () => {
     const getTodo = action({
       args: {},
       async handler(ctx) {
-        await ctx.db.get("todos", "019078e5-d29f-7000-8000-000000000001");
         const nestedQueryResult = await ctx.runQuery(getTodoQuery, {});
         expect(nestedQueryResult).toEqual([]);
         await ctx.runAction(getTodoAction, {});

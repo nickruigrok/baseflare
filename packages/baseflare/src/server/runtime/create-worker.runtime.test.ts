@@ -498,10 +498,10 @@ const relayAction = action({
   },
 });
 
-const directWriteAction = action({
+const mutationWriteAction = action({
   args: { ownerToken: v.string(), text: v.string() },
   async handler(ctx, args) {
-    const id = await ctx.db.insert("todos", args);
+    const id = await ctx.runMutation(createTodoInternal, args);
     return { id };
   },
 });
@@ -651,8 +651,8 @@ function createManifest(
     actions: [
       { definition: relayAction, exportName: "relay", modulePath: "todos" },
       {
-        definition: directWriteAction,
-        exportName: "directWrite",
+        definition: mutationWriteAction,
+        exportName: "writeViaMutation",
         modulePath: "todos",
       },
       {
@@ -1626,12 +1626,12 @@ describe("worker runtime", () => {
     });
   });
 
-  it("bumps table versions for direct action writes", async () => {
+  it("writes from actions through runMutation", async () => {
     const before = await env.APP_DB.prepare(
       "SELECT version FROM _bf_table_versions WHERE table_name = 'todos'"
     ).first<{ version: number }>();
 
-    const response = await invoke("/api/action/todos:directWrite", {
+    const response = await invoke("/api/action/todos:writeViaMutation", {
       body: rpcBody({ ownerToken: "owner-a", text: "action-write" }),
       headers: { authorization: "Bearer owner-a" },
       method: "POST",

@@ -31,7 +31,6 @@ import {
   DEFAULT_SCAN_BUDGET_MESSAGE,
   deserializeRuntimeDocument,
   deserializeVersionedRuntimeDocument,
-  executeRowQuery,
   getNextRuntimeScanPosition,
   getRuntimeScanQueryOptions,
   type RuntimeDocument,
@@ -99,6 +98,8 @@ type CommitOperation =
     };
 
 const MUTATION_QUERY_CHUNK_SIZE = 256;
+const missingTableVersionRowMessage = (tableName: string): string =>
+  `Missing internal table version row for "${tableName}"; run applyRuntimeSchema before handling runtime traffic`;
 
 function createBaseQueryState(): QueryState {
   return { order: { field: "_id", direction: "asc" } };
@@ -619,10 +620,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   ): Promise<RuntimeDocument[]> {
     const chunkSize = getMutationQueryChunkSize(state, shadowedBaseIds.size);
     if (chunkSize === 0) {
-      this.recordTableReadVersion(
+      const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
         tableName,
-        await this.fetchTableVersion(tableName)
+        {
+          sql: `SELECT _id, _data, _rev FROM ${tableName} LIMIT 0`,
+          params: [],
+        }
       );
+      this.recordTableReadVersion(tableName, read.version);
       return [];
     }
 
@@ -759,14 +764,6 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     return documents;
   }
 
-  private async fetchTableVersion(tableName: string): Promise<unknown> {
-    const rows = await executeRowQuery<{ version: number }>(this.database, {
-      sql: `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`,
-      params: [tableName],
-    });
-    return rows[0]?.version;
-  }
-
   private buildCommitOperations(
     mutatedTables: readonly string[]
   ): CommitOperation[] {
@@ -782,7 +779,6 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     ];
     // Mutation commits use the plural multi-table gate. The first document
     // write must observe changes() equal to every mutated table being bumped.
-    // The singular guarded bump with ignoredTables is only for direct writes.
     let expectedPreviousChanges = mutatedTables.length;
 
     for (const tableName of mutatedTables) {
@@ -1145,11 +1141,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         }
 
         if (changes !== operation.expectedChanges) {
-          // Document writes are SQL-gated by changes(), so a failed plural
-          // bump means later writes were already no-ops inside the D1 batch.
-          // The guarded bump uses one global AND predicate, so D1 should
-          // report either zero rows or every mutated table-version row.
-          if (operation.type === "bump-table-versions" && changes === 0) {
+          // Document writes are SQL-gated by changes(), so an under-applied
+          // plural bump means later writes were already no-ops inside the D1
+          // batch. The global SQL guard should be binary today, but any
+          // under-application is still safest to retry.
+          if (
+            operation.type === "bump-table-versions" &&
+            changes < operation.expectedChanges
+          ) {
             throw new RetryableMutationConflictError();
           }
 
@@ -1177,7 +1176,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       const version = versions.get(tableName);
       if (typeof version !== "number") {
         throw new InternalRuntimeError(
-          `Missing internal table version row for "${tableName}"`
+          missingTableVersionRowMessage(tableName)
         );
       }
 
@@ -1249,9 +1248,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
   private recordTableReadVersion(tableName: string, version: unknown): void {
     if (typeof version !== "number") {
-      throw new InternalRuntimeError(
-        `Missing internal table version row for "${tableName}"`
-      );
+      throw new InternalRuntimeError(missingTableVersionRowMessage(tableName));
     }
 
     const existing = this.tableReadVersions.get(tableName);

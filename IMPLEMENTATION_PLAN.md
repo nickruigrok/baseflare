@@ -33,7 +33,7 @@ Baseflare bridges that gap: Convex's developer experience on Cloudflare's infras
 - **Zero infrastructure abstraction** — No control plane Worker, no system database, no management layer. The CLI talks directly to the Cloudflare API. Your app is just Workers + D1 + R2 + DOs. Nothing between you and the platform.
 - **Document model** — Every collection table stores `_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0`. Schema validation at write time. No migrations for field changes. Only table creation and index changes touch D1.
 - **Deny-by-default permissions** — Built-in `defineRules()` with no access unless explicitly granted. Convex has no native permission system — developers roll their own. Baseflare has it out of the box.
-- **Actions can touch the database** — Unlike Convex, actions have direct `ctx.db` access (non-transactional). Less boilerplate for common patterns like "call API, save result." Use mutations when you need atomicity.
+- **Convex-style action boundaries** — Actions handle side effects and call `ctx.runQuery()` / `ctx.runMutation()` for database work. Mutations remain the atomic database write primitive.
 - **No Hono, no wrangler** — Native Workers `fetch()` handler with path-based routing. CLI deploys via CF API directly. Minimal dependency surface.
 - **Own your infrastructure** — Everything runs on your Cloudflare account. $0/month on free plan, $5/month flat on paid. No per-seat pricing. No vendor between you and Cloudflare.
 
@@ -746,7 +746,7 @@ const createdAt = getCreatedAtFromId(id)
 2. Worker entry point factory (`createWorker()`) — native `fetch()` handler with path-based routing
 3. RPC routes: `POST /api/query/:name`, `POST /api/mutation/:name`, `POST /api/action/:name`; bodies must be exact JSON objects shaped as `{ "args": ... }`
 4. Internal function routing — `internalQuery`/`internalMutation`/`internalAction` not exposed via RPC, only callable via `ctx.runQuery()`/`ctx.runMutation()`/`ctx.runAction()`
-5. Action context — `ActionCtx` with `db` (non-transactional), `runQuery`, `runMutation`, `runAction`, `scheduler`, `storage`, `auth`
+5. Action context — `ActionCtx` with `runQuery`, `runMutation`, `runAction`, `scheduler`, `storage`, `auth`
 6. Mutation context — `MutationCtx` with `db`, `auth`, `storage`, `scheduler`, `runQuery`
 7. Auth token extraction from headers, `ctx.auth` population
 8. Permission enforcement on every operation
@@ -1495,9 +1495,8 @@ interface MutationCtx extends QueryCtx {
   runQuery(ref, args): Promise<T>;  // call a query within same transaction
 }
 
-// ActionCtx (available in actions — db access is non-transactional, use mutations for atomicity)
+// ActionCtx (available in actions)
 interface ActionCtx {
-  db: DatabaseWriter;             // non-transactional: each operation is independent
   auth: Auth;
   storage: StorageActionWriter;   // ctx.storage.store(blob), .getUrl(), .delete()
   scheduler: Scheduler;
@@ -1580,7 +1579,7 @@ export function createWorker(userCode: UserCodeBundle): ExportedHandler
 export class SubscriptionDO implements DurableObject { ... }
 ```
 
-**Key design note:** Actions have `ctx.db` access for convenience, but each operation is independent (non-transactional). For atomic multi-step writes, use a mutation — mutations run as a single transaction via D1 `batch()`. `ctx.runQuery()`/`ctx.runMutation()` remain available for calling other functions from actions.
+**Key design note:** Actions do not have direct `ctx.db` access. Use `ctx.runQuery()` and `ctx.runMutation()` for database work from actions. Each `ctx.runMutation()` call is its own mutation transaction, so atomic multi-write workflows should live in one mutation.
 
 **Worker bindings (configured via CF API on deploy, no wrangler.toml):**
 ```typescript
@@ -1879,7 +1878,7 @@ These tests span multiple packages and define end-to-end correctness. They must 
 3. Call same function from client via RPC — rejected (not in `api` object)
 4. Codegen produces `_generated/internal.ts` with typed references
 
-### 7.14 Database Write Operations
+### 7.14 Mutation Database Write Operations
 1. `ctx.db.insert('todos', { text: 'hello' })` → returns `_id`, document in D1
 2. `ctx.db.patch('todos', id, { text: 'updated' })` → shallow merge, field updated
 3. `ctx.db.patch('todos', id, { tag: undefined })` → field removed from document
@@ -1905,8 +1904,8 @@ These tests span multiple packages and define end-to-end correctness. They must 
 ### 7.17 Action Behavior
 1. Action handler accesses `ctx.runQuery(api.todos.list)` — works
 2. Action handler accesses `ctx.runMutation(internal.todos.create, args)` — works
-3. Action handler accesses `ctx.db.query('todos')` — works (non-transactional, each op independent)
-4. Action handler accesses `ctx.db.insert('todos', doc)` + `ctx.db.insert('logs', doc)` — both succeed independently (not atomic)
+3. Action handler accesses `ctx.db.query('todos')` — TypeScript error
+4. Action handler writes multiple documents by calling one mutation that performs the atomic workflow
 
 ### 7.18 Return Value Validation
 1. Query with `returns: v.string()` returns a string — passes

@@ -58,7 +58,6 @@ export interface MutationCtx extends QueryCtx {
 
 export interface ActionCtx {
   auth: Auth;
-  db: DatabaseWriter;
   runAction<TArgs, TResult>(
     ref: FunctionReference<TArgs, TResult>,
     args: TArgs

@@ -29,8 +29,9 @@ an invalid value, its pending writes are rolled back.
 
 Keep external side effects in actions, not mutations. Actions are the right
 place for network calls, payments, email, webhooks, and other work that should
-not be retried automatically. If an action needs atomic database writes, call a
-mutation with `ctx.runMutation()`.
+not be retried automatically. Actions access the database by calling
+`ctx.runQuery()` and `ctx.runMutation()`. Each `ctx.runMutation()` call is its
+own mutation transaction, so put atomic multi-write workflows in one mutation.
 
 Keep mutations focused on a bounded set of documents. For large datasets, use
 selective filters and pagination; future bulk/import workflows will cover very

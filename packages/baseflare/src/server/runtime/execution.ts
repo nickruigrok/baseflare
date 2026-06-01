@@ -157,12 +157,6 @@ export function createActionContext(options: InvocationOptions): ActionCtx {
   const actionOptions = { ...options, database: actionDatabase };
   const ctx: ActionCtx = {
     auth,
-    db: new D1DatabaseAdapter<ActionCtx>({
-      database: actionDatabase,
-      getContext: () => ctx,
-      rules: options.rules,
-      schema: options.schema,
-    }),
     runAction(ref, nestedArgs) {
       const entry = options.functionIndex.getByReference("action", ref);
       if (!entry) {
