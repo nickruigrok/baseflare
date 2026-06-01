@@ -12,6 +12,7 @@ import {
   buildRuntimeSelectQuery,
   D1DatabaseAdapter,
   getNextRuntimeScanPosition,
+  getRuntimeScanQueryOptions,
   type RuntimeScanPosition,
 } from "./d1";
 import type { D1Database, D1PreparedStatement, D1Result } from "./types";
@@ -263,6 +264,36 @@ describe("D1 runtime helpers", () => {
     expect(position.cursor).toBeNull();
     expect(query.sql).toContain("OFFSET ?");
     expect(query.params).toEqual([256, 1]);
+  });
+
+  it("preserves the base cursor when runtime scans fall back to offsets", () => {
+    const state = {
+      ...createBaseQueryState(),
+      order: { field: "text", direction: "asc" } as const,
+    };
+    const baseCursor = {
+      id: testId,
+      orderDirection: "asc",
+      orderField: "text",
+      v: "alpha",
+    } as const;
+    const position = getNextRuntimeScanPosition(
+      "todos",
+      state,
+      { cursor: baseCursor, offset: 0 },
+      [createStoredRow(nextTestId, { text: { nested: true } })]
+    );
+    const query = buildRuntimeSelectQuery("todos", state, {
+      ...getRuntimeScanQueryOptions(position, baseCursor),
+      limit: 256,
+    });
+
+    expect(position.cursor).toBeNull();
+    expect(query.sql).toContain(
+      "(json_extract(_data, '$.text') > ? OR (json_extract(_data, '$.text') = ? AND _id > ?))"
+    );
+    expect(query.sql).toContain("OFFSET ?");
+    expect(query.params).toEqual(["alpha", "alpha", testId, 256, 1]);
   });
 
   it("includes the table name in duplicate unique errors", async () => {

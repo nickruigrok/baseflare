@@ -1,7 +1,11 @@
 import { v } from "baseflare/values";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
+import type { CursorPayload } from "../db/cursor";
+import type { QueryState } from "../db/query-builder";
+import { createBaseQueryState } from "../db/query-builder";
 import { defineRules } from "../permissions/define-rules";
+import type { Rules } from "../permissions/types";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
 import { TABLE_VERSION_TABLE_NAME } from "../schema/types";
@@ -195,7 +199,7 @@ function createMutationDatabase(
   database: D1Database,
   options: {
     readonly missingRules?: boolean;
-    readonly rules?: typeof rules;
+    readonly rules?: Rules;
   } = {}
 ): MutationDatabase {
   return new MutationDatabase({
@@ -428,11 +432,16 @@ describe("MutationDatabase", () => {
     await mutationDb.commit();
 
     expect(batchQueries[0]).toHaveLength(4);
+    expect(batchQueries[0]?.[0]).toContain(
+      "SELECT table_name, version FROM _bf_table_versions"
+    );
     expect(batchQueries[0]?.[0]).toContain("table_name IN (?, ?)");
     expect(batchParams[0]?.[0]?.slice(0, 2)).toEqual(["todos", "labels"]);
     expect(batchQueries[0]?.[1]).toContain("UPDATE _bf_table_versions");
     expect(batchParams[0]?.[1]?.slice(0, 2)).toEqual(["todos", "labels"]);
+    expect(batchQueries[0]?.[2]).toContain("WHERE changes() = ?");
     expect(batchParams[0]?.[2]?.at(-1)).toBe(2);
+    expect(batchQueries[0]?.[3]).toContain("WHERE changes() = ?");
     expect(batchParams[0]?.[3]?.at(-1)).toBe(1);
   });
 
@@ -523,6 +532,72 @@ describe("MutationDatabase", () => {
 
     expect(batchQueries[1]?.[1]).toContain("_id > ?");
     expect(batchQueries[1]?.[1]).not.toContain("OFFSET");
+  });
+
+  it("preserves the base cursor when mutation scans fall back to offsets", async () => {
+    const batchQueries: string[][] = [];
+    const batchParams: D1BindingValue[][][] = [];
+    const rows = Array.from({ length: 256 }, (_, index) => ({
+      ...createStoredRow(index + 1),
+      _data: JSON.stringify({ text: { nested: true } }),
+    }));
+    const denyRules = defineRules({
+      labels: {
+        delete: () => false,
+        insert: () => false,
+        read: () => false,
+        update: () => false,
+      },
+      todos: {
+        delete: () => false,
+        insert: () => false,
+        read: () => false,
+        update: () => false,
+      },
+    });
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchQueries,
+        batchResults: [],
+        readResults: [
+          { version: 0, rows },
+          { version: 0, rows: [] },
+        ],
+      }),
+      { rules: denyRules }
+    );
+    const collectQuery = (
+      mutationDb as unknown as {
+        collectQuery(
+          tableName: string,
+          state: QueryState,
+          cursor: CursorPayload
+        ): Promise<unknown[]>;
+      }
+    ).collectQuery.bind(mutationDb);
+
+    await expect(
+      collectQuery(
+        "todos",
+        {
+          ...createBaseQueryState(),
+          order: { field: "text", direction: "asc" },
+        },
+        {
+          id: "019078e5-d29f-7000-8000-000000000000",
+          orderDirection: "asc",
+          orderField: "text",
+          v: "alpha",
+        }
+      )
+    ).resolves.toEqual([]);
+
+    expect(batchQueries[1]?.[1]).toContain(
+      "(json_extract(_data, '$.text') > ? OR (json_extract(_data, '$.text') = ? AND _id > ?))"
+    );
+    expect(batchQueries[1]?.[1]).toContain("OFFSET ?");
+    expect(batchParams[1]?.[1]?.slice(-2)).toEqual([256, 256]);
   });
 
   it("uses limited D1 chunks for limited mutation queries", async () => {
@@ -735,6 +810,41 @@ describe("MutationDatabase", () => {
     await expect(withMutationRetry(async () => "ok", 0)).rejects.toThrow(
       "withMutationRetry requires at least one attempt"
     );
+  });
+
+  it("logs remaining attempts when scheduling mutation retries", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    let attempts = 0;
+
+    try {
+      await expect(
+        withMutationRetry(
+          () => {
+            attempts += 1;
+            if (attempts === 1) {
+              throw new RetryableMutationConflictError();
+            }
+
+            return Promise.resolve("ok");
+          },
+          2,
+          "todos:create"
+        )
+      ).resolves.toBe("ok");
+
+      expect(warn).toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          attempt: 1,
+          event: "mutation.retry_scheduled",
+          functionName: "todos:create",
+          maxAttempts: 2,
+          remainingAttempts: 1,
+        })
+      );
+    } finally {
+      warn.mockRestore();
+    }
   });
 
   it("keeps the sorted top documents when limiting overlay reads", async () => {

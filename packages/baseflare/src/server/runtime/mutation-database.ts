@@ -33,6 +33,7 @@ import {
   deserializeVersionedRuntimeDocument,
   executeRowQuery,
   getNextRuntimeScanPosition,
+  getRuntimeScanQueryOptions,
   type RuntimeDocument,
   type RuntimeScanPosition,
   type StoredDocumentRow,
@@ -626,13 +627,13 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     const budget: ScanBudget = { scannedBytes: 0, scannedRows: 0 };
 
     while (true) {
-      const hasScanCursor = scanPosition.cursor !== null;
+      const scanOptions = getRuntimeScanQueryOptions(scanPosition, cursor);
       const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
         tableName,
         buildRuntimeSelectQuery(tableName, state, {
-          cursor: scanPosition.cursor ?? cursor,
+          cursor: scanOptions.cursor,
           limit: chunkSize,
-          offset: hasScanCursor ? undefined : scanPosition.offset,
+          offset: scanOptions.offset,
         })
       );
       const { rows } = read;
@@ -1194,6 +1195,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       readonly sql: string;
     }
   ): Promise<TableVersionReadResult<TRow>> {
+    // Each mutation read batches the table-version row with the data read so
+    // OCC records the version that belongs to that specific result set.
     const versionSql = `SELECT version FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? LIMIT 1`;
     const versionStatement = bindStatement(this.database, versionSql, [
       tableName,
@@ -1317,6 +1320,7 @@ export async function withMutationRetry<TResult>(
         delayMs,
         functionName,
         maxAttempts,
+        remainingAttempts: maxAttempts - attempt - 1,
       });
       await delay(delayMs);
     }

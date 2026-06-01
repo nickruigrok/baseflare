@@ -85,6 +85,11 @@ export interface RuntimeScanPosition {
   readonly offset: number;
 }
 
+export interface RuntimeScanQueryOptions {
+  readonly cursor: CursorPayload | null;
+  readonly offset?: number;
+}
+
 interface RuntimeQueryOptions<TContext> {
   readonly database: RuntimeDatabase;
   readonly getContext: () => TContext;
@@ -378,6 +383,19 @@ export function getNextRuntimeScanPosition(
   };
 }
 
+export function getRuntimeScanQueryOptions(
+  position: RuntimeScanPosition,
+  baseCursor: CursorPayload | null
+): RuntimeScanQueryOptions {
+  if (position.cursor) {
+    return { cursor: position.cursor };
+  }
+
+  // Non-scalar ordered values cannot produce a safe keyset cursor, so keep the
+  // caller's cursor as the base boundary and advance later chunks by offset.
+  return { cursor: baseCursor, offset: position.offset };
+}
+
 class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
   private readonly options: RuntimeQueryOptions<TContext>;
   private readonly state: QueryState;
@@ -516,13 +534,13 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
     let scannedRows = 0;
 
     while (true) {
-      const hasScanCursor = scanPosition.cursor !== null;
+      const scanOptions = getRuntimeScanQueryOptions(scanPosition, cursor);
       const rows = await executeRowQuery<StoredDocumentRow>(
         this.options.database,
         buildRuntimeSelectQuery(this.options.tableName, this.state, {
-          cursor: scanPosition.cursor ?? cursor,
+          cursor: scanOptions.cursor,
           limit: QUERY_SCAN_CHUNK_SIZE,
-          offset: hasScanCursor ? undefined : scanPosition.offset,
+          offset: scanOptions.offset,
         })
       );
       if (rows.length === 0) {
