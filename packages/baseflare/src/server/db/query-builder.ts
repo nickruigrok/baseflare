@@ -21,25 +21,25 @@ import {
 } from "./filters";
 import type { QueryBuilder } from "./reader";
 
-interface QueryState {
+export interface QueryState {
   readonly filter?: FilterObject;
   readonly limit?: number;
   readonly order: OrderSpec;
 }
 
-interface BuiltQuery {
+export interface BuiltQuery {
   readonly params: readonly (string | number | null)[];
   readonly sql: string;
 }
 
-interface QueryExecutor<TDocument> {
+export interface QueryExecutor<TDocument> {
   collect(query: BuiltQuery): Promise<TDocument[]>;
   count?(query: BuiltQuery): Promise<number>;
 }
 
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 
-function assertTableIdentifier(tableName: string): void {
+export function assertTableIdentifier(tableName: string): void {
   if (!IDENTIFIER_PATTERN.test(tableName) || tableName.startsWith("_")) {
     throw new ValidationError(
       tableName,
@@ -57,11 +57,11 @@ function assertDirection(value: string): asserts value is OrderDirection {
   }
 }
 
-function createBaseState(): QueryState {
+export function createBaseQueryState(): QueryState {
   return { order: { field: "_id", direction: "asc" } };
 }
 
-function buildOrderClause(order: OrderSpec): string {
+export function buildOrderClause(order: OrderSpec): string {
   const direction = order.direction.toUpperCase();
   if (order.field === "_id") {
     return `ORDER BY _id ${direction}`;
@@ -79,7 +79,7 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
 
   constructor(
     tableName: string,
-    state: QueryState = createBaseState(),
+    state: QueryState = createBaseQueryState(),
     executor?: QueryExecutor<TDocument>
   ) {
     assertTableIdentifier(tableName);
@@ -205,47 +205,11 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
   }
 
   toSQL(cursor: CursorPayload | null = null): BuiltQuery {
-    const clauses: string[] = [];
-    const params: Array<string | number | null> = [];
-
-    if (this.state.filter) {
-      const compiled = compileFilter(this.state.filter);
-      clauses.push(compiled.sql);
-      params.push(...compiled.params);
-    }
-
-    if (cursor) {
-      const predicate = buildCursorPredicate(this.state.order, cursor);
-      clauses.push(predicate.sql);
-      params.push(...predicate.params);
-    }
-
-    let sql = `SELECT _id, _data FROM ${this.tableName}`;
-    if (clauses.length > 0) {
-      sql += ` WHERE ${clauses.join(" AND ")}`;
-    }
-
-    sql += ` ${buildOrderClause(this.state.order)}`;
-
-    if (this.state.limit !== undefined) {
-      sql += " LIMIT ?";
-      params.push(this.state.limit);
-    }
-
-    return { sql, params };
+    return buildSelectQuery(this.tableName, this.state, cursor);
   }
 
   toCountSQL(): BuiltQuery {
-    const params: Array<string | number | null> = [];
-    let sql = `SELECT COUNT(*) AS count FROM ${this.tableName}`;
-
-    if (this.state.filter) {
-      const compiled = compileFilter(this.state.filter);
-      sql += ` WHERE ${compiled.sql}`;
-      params.push(...compiled.params);
-    }
-
-    return { sql, params };
+    return buildCountQuery(this.tableName, this.state);
   }
 
   private clone(
@@ -277,5 +241,58 @@ export function createQueryBuilder<TDocument extends Record<string, unknown>>(
   toSQL(cursor?: CursorPayload | null): BuiltQuery;
   toCountSQL(): BuiltQuery;
 } {
-  return new BaseflareQueryBuilder(tableName, createBaseState(), executor);
+  return new BaseflareQueryBuilder(tableName, createBaseQueryState(), executor);
+}
+
+export function buildSelectQuery(
+  tableName: string,
+  state: QueryState,
+  cursor: CursorPayload | null = null
+): BuiltQuery {
+  assertTableIdentifier(tableName);
+  const clauses: string[] = [];
+  const params: Array<string | number | null> = [];
+
+  if (state.filter) {
+    const compiled = compileFilter(state.filter);
+    clauses.push(compiled.sql);
+    params.push(...compiled.params);
+  }
+
+  if (cursor) {
+    const predicate = buildCursorPredicate(state.order, cursor);
+    clauses.push(predicate.sql);
+    params.push(...predicate.params);
+  }
+
+  let sql = `SELECT _id, _data FROM ${tableName}`;
+  if (clauses.length > 0) {
+    sql += ` WHERE ${clauses.join(" AND ")}`;
+  }
+
+  sql += ` ${buildOrderClause(state.order)}`;
+
+  if (state.limit !== undefined) {
+    sql += " LIMIT ?";
+    params.push(state.limit);
+  }
+
+  return { sql, params };
+}
+
+export function buildCountQuery(
+  tableName: string,
+  state: QueryState
+): BuiltQuery {
+  assertTableIdentifier(tableName);
+  const params: Array<string | number | null> = [];
+  let sql = `SELECT COUNT(*) AS count FROM ${tableName}`;
+
+  if (state.filter) {
+    const compiled = compileFilter(state.filter);
+    sql += ` WHERE ${compiled.sql}`;
+    params.push(...compiled.params);
+  }
+
+  return { sql, params };
 }

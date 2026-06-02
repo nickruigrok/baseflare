@@ -1,9 +1,9 @@
 import { describe, expect, it } from "vitest";
 
 import { defineRules } from "./define-rules";
-import { evaluate } from "./evaluate";
+import { evaluateRules } from "./evaluate-rules";
 
-describe("evaluate", () => {
+describe("evaluateRules", () => {
   it("denies by default and respects explicit rules", async () => {
     const rules = defineRules({
       todos: {
@@ -13,7 +13,7 @@ describe("evaluate", () => {
     });
 
     await expect(
-      evaluate(rules, {
+      evaluateRules(rules, {
         tableName: "todos",
         operation: "read",
         ctx: {},
@@ -22,7 +22,7 @@ describe("evaluate", () => {
     ).resolves.toBe(true);
 
     await expect(
-      evaluate(rules, {
+      evaluateRules(rules, {
         tableName: "todos",
         operation: "insert",
         ctx: {},
@@ -31,7 +31,7 @@ describe("evaluate", () => {
     ).resolves.toBe(false);
 
     await expect(
-      evaluate(rules, {
+      evaluateRules(rules, {
         tableName: "users",
         operation: "read",
         ctx: {},

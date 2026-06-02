@@ -3,6 +3,7 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { internalMutation } from "./internal-mutation";
 import { query } from "./query";
+import type { ActionCtx } from "./types";
 
 const UUID_V7_ERROR_PATTERN = /UUIDv7/;
 
@@ -40,5 +41,9 @@ describe("function wrappers", () => {
     type Args = Parameters<typeof createUser.handler>[1];
     expectTypeOf<Args>().toEqualTypeOf<{ userId: Id<"users"> }>();
     expect(createUser.visibility).toBe("internal");
+  });
+
+  it("keeps action database access behind runQuery and runMutation", () => {
+    expectTypeOf<ActionCtx>().not.toHaveProperty("db");
   });
 });

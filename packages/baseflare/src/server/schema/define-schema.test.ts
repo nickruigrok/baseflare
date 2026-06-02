@@ -4,7 +4,12 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import { defineSchema } from "./define-schema";
 import { defineTable } from "./define-table";
-import type { DataModelFromSchema, Doc } from "./types";
+import {
+  createIndexStatement,
+  type DataModelFromSchema,
+  type Doc,
+  type TableBuilder,
+} from "./types";
 
 const RESERVED_TABLE_NAME_ERROR_PATTERN = /cannot start with "_"/;
 
@@ -24,7 +29,7 @@ describe("defineSchema", () => {
     });
 
     expect(schema.toCreateStatements()).toEqual([
-      "CREATE TABLE todos (_id TEXT PRIMARY KEY, _data TEXT NOT NULL)",
+      "CREATE TABLE todos (_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0 CHECK(_rev >= 0))",
       "CREATE INDEX todos_by_completed ON todos (json_extract(_data, '$.completed'))",
     ]);
   });
@@ -51,6 +56,18 @@ describe("defineSchema", () => {
     ).not.toThrow();
   });
 
+  it("supports IF NOT EXISTS index statement generation", () => {
+    expect(
+      createIndexStatement(
+        "todos",
+        { name: "by_completed", fields: ["completed"] },
+        { ifNotExists: true }
+      )
+    ).toBe(
+      "CREATE INDEX IF NOT EXISTS todos_by_completed ON todos (json_extract(_data, '$.completed'))"
+    );
+  });
+
   it("derives document types from the schema without codegen", () => {
     const schema = defineSchema({
       todos: defineTable({
@@ -62,9 +79,13 @@ describe("defineSchema", () => {
 
     type Schema = typeof schema;
     type TodoDoc = Doc<Schema, "todos">;
-    type SchemaTableHasIndexBuilder =
+    type TodosBuilder = ReturnType<
+      typeof defineTable<typeof schema.tables.todos.fields>
+    >;
+    type SchemaTableHasTableBuilder =
       "index" extends keyof (typeof schema)["tables"]["todos"] ? true : false;
 
+    expectTypeOf<TodosBuilder>().toExtend<TableBuilder>();
     expectTypeOf<TodoDoc["_id"]>().toEqualTypeOf<Id<"todos">>();
     expectTypeOf<TodoDoc["_createdAt"]>().toEqualTypeOf<number>();
     expectTypeOf<TodoDoc["text"]>().toEqualTypeOf<string>();
@@ -75,6 +96,6 @@ describe("defineSchema", () => {
 
     type Model = DataModelFromSchema<Schema>;
     expectTypeOf<Model["todos"]>().toEqualTypeOf<TodoDoc>();
-    expectTypeOf<SchemaTableHasIndexBuilder>().toEqualTypeOf<false>();
+    expectTypeOf<SchemaTableHasTableBuilder>().toEqualTypeOf<false>();
   });
 });

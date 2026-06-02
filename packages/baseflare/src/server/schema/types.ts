@@ -7,6 +7,7 @@ import {
 
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 const FILTER_LOGIC_FIELD_NAMES = new Set(["AND", "OR", "NOT"]);
+export const TABLE_VERSION_TABLE_NAME = "_bf_table_versions";
 
 export interface TableIndex {
   readonly fields: readonly string[];
@@ -20,10 +21,9 @@ export interface TableDefinition<
   readonly indexes: readonly TableIndex[];
 }
 
-export interface TableDefBuilder<
-  TFields extends ValidatorShape = ValidatorShape,
-> extends TableDefinition<TFields> {
-  index(name: string, fields: readonly string[]): TableDefBuilder<TFields>;
+export interface TableBuilder<TFields extends ValidatorShape = ValidatorShape>
+  extends TableDefinition<TFields> {
+  index(name: string, fields: readonly string[]): TableBuilder<TFields>;
 }
 
 export type SchemaTables = Record<string, TableDefinition>;
@@ -61,6 +61,11 @@ export type DataModelFromSchema<TSchema extends Schema> = {
 export interface DiffedIndex {
   readonly index: TableIndex;
   readonly tableName: string;
+}
+
+export interface SqlStatement {
+  readonly params: readonly (number | string | null)[];
+  readonly sql: string;
 }
 
 export interface SchemaDiff {
@@ -104,16 +109,38 @@ export function assertFieldName(name: string): void {
 }
 
 export function createTableStatement(tableName: string): string {
-  return `CREATE TABLE ${tableName} (_id TEXT PRIMARY KEY, _data TEXT NOT NULL)`;
+  return `CREATE TABLE ${tableName} (_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0 CHECK(_rev >= 0))`;
 }
 
 export function createIndexStatement(
   tableName: string,
-  index: TableIndex
+  index: TableIndex,
+  options: { ifNotExists?: boolean } = {}
 ): string {
   const expressions = index.fields
     .map((field) => `json_extract(_data, '$.${field}')`)
     .join(", ");
+  const ifNotExists = options.ifNotExists ? " IF NOT EXISTS" : "";
 
-  return `CREATE INDEX ${tableName}_${index.name} ON ${tableName} (${expressions})`;
+  return `CREATE INDEX${ifNotExists} ${tableName}_${index.name} ON ${tableName} (${expressions})`;
+}
+
+export function createTableVersionStatements(
+  tableNames: readonly string[]
+): SqlStatement[] {
+  const statements: SqlStatement[] = [
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${TABLE_VERSION_TABLE_NAME} (table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0))`,
+      params: [],
+    },
+  ];
+
+  for (const tableName of tableNames) {
+    statements.push({
+      sql: `INSERT OR IGNORE INTO ${TABLE_VERSION_TABLE_NAME} (table_name, version) VALUES (?, 0)`,
+      params: [tableName],
+    });
+  }
+
+  return statements;
 }

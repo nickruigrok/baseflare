@@ -57,11 +57,24 @@ export type {
   HttpMethod,
 } from "./http/types";
 export { defineRules } from "./permissions/define-rules";
-export { evaluate } from "./permissions/evaluate";
+export { evaluateRules } from "./permissions/evaluate-rules";
 export type { RuleOperation, Rules, TableRules } from "./permissions/types";
+export { createWorker } from "./runtime/create-worker";
+export type {
+  BaseflareExecutionContext,
+  BaseflareFunctionEntry,
+  BaseflareManifest,
+  BaseflareManifestSource,
+  BaseflareRuntimeEnv,
+  D1BindingValue,
+  D1Database,
+  D1PreparedStatement,
+  D1Result,
+  ExportedHandler,
+} from "./runtime/types";
 export { defineSchema } from "./schema/define-schema";
 export { defineTable } from "./schema/define-table";
-export { diff } from "./schema/diff";
+export { diffSchemas } from "./schema/diff-schemas";
 export type {
   DataModelFromSchema,
   DiffedIndex,
@@ -70,7 +83,7 @@ export type {
   Schema,
   SchemaDiff,
   SchemaTables,
-  TableDefBuilder,
+  TableBuilder,
   TableDefinition,
   TableIndex,
 } from "./schema/types";

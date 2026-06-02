@@ -52,8 +52,8 @@ export function deserialize(row: {
   }
 
   return {
+    ...(fromStorageValue(parsed) as Record<string, unknown>),
     _id: row._id,
     _createdAt: getCreatedMsFromId(row._id),
-    ...(fromStorageValue(parsed) as Record<string, unknown>),
   };
 }

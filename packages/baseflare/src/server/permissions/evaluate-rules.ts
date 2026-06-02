@@ -1,6 +1,6 @@
 import type { EvaluationInput, Rules } from "./types";
 
-export async function evaluate(
+export async function evaluateRules(
   rules: Rules,
   input: EvaluationInput
 ): Promise<boolean> {

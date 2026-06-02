@@ -2,6 +2,11 @@ import { minIdForMs } from "baseflare/values";
 import { describe, expect, it } from "vitest";
 
 import { decodeCursor } from "./cursor";
+import {
+  compareSqliteJsonValues,
+  fieldExpression,
+  matchesFilter,
+} from "./filters";
 import { createQueryBuilder } from "./query-builder";
 
 const UNIQUE_DOCUMENT_ERROR_PATTERN = /Expected exactly one document/;
@@ -100,6 +105,53 @@ describe("createQueryBuilder", () => {
     );
   });
 
+  it("compares in-memory values with SQLite json_extract ordering", () => {
+    expect(compareSqliteJsonValues(null, null)).toBe(0);
+    expect(compareSqliteJsonValues(null, 1)).toBeLessThan(0);
+    expect(compareSqliteJsonValues(undefined, "a")).toBeLessThan(0);
+    expect(compareSqliteJsonValues(false, true)).toBeLessThan(0);
+    expect(compareSqliteJsonValues(2, "1")).toBeLessThan(0);
+    expect(compareSqliteJsonValues("10", "2")).toBeLessThan(0);
+
+    expect(matchesFilter({ value: { gt: 2 } }, { value: "1" })).toBe(true);
+    expect(matchesFilter({ value: { lt: "1" } }, { value: 2 })).toBe(true);
+  });
+
+  it("compares non-scalar values by their stored JSON shape", () => {
+    expect(
+      compareSqliteJsonValues({ z: 1, a: 2 }, { a: 2, z: 1 })
+    ).toBeGreaterThan(0);
+    expect(compareSqliteJsonValues({ $bytes: "user" }, { a: 1 })).toBeLessThan(
+      0
+    );
+    expect(
+      compareSqliteJsonValues(new Uint8Array([255]), new Uint8Array([1, 2, 3]))
+    ).toBeLessThan(0);
+  });
+
+  it("matches non-scalar equality by stored JSON shape", () => {
+    expect(
+      matchesFilter(
+        { tags: { eq: '["alpha","beta"]' } },
+        { tags: ["alpha", "beta"] }
+      )
+    ).toBe(true);
+    expect(
+      matchesFilter({ meta: { eq: '{"rank":1}' } }, { meta: { rank: 1 } })
+    ).toBe(true);
+    expect(
+      matchesFilter({ meta: { neq: '{"rank":2}' } }, { meta: { rank: 1 } })
+    ).toBe(true);
+    expect(
+      matchesFilter(
+        { data: { eq: '{"$bytes":"AQI="}' } },
+        {
+          data: new Uint8Array([1, 2]),
+        }
+      )
+    ).toBe(true);
+  });
+
   it("collapses _createdAt ordering to _id", () => {
     const query = createQueryBuilder("todos").order(
       "_createdAt",
@@ -111,6 +163,10 @@ describe("createQueryBuilder", () => {
     );
   });
 
+  it("resolves _createdAt field expressions to _id", () => {
+    expect(fieldExpression("_createdAt")).toBe("_id");
+  });
+
   it("filters _id directly", () => {
     const query = createQueryBuilder("todos").filter({
       _id: { in: ["id-1", "id-2"] },
@@ -120,6 +176,28 @@ describe("createQueryBuilder", () => {
       sql: "SELECT _id, _data FROM todos WHERE _id IN (?, ?) ORDER BY _id ASC",
       params: ["id-1", "id-2"],
     });
+  });
+
+  it("limits in filters to a bounded number of values", () => {
+    const values = Array.from({ length: 100 }, (_, index) => `id-${index}`);
+    const query = createQueryBuilder("todos").filter({
+      _id: { in: values },
+    }) as ReturnType<typeof createQueryBuilder>;
+
+    expect(query.toSQL().params).toHaveLength(100);
+
+    expect(() =>
+      (
+        createQueryBuilder("todos").filter({
+          _id: { in: [...values, "id-100"] },
+        }) as ReturnType<typeof createQueryBuilder>
+      ).toSQL()
+    ).toThrow(/must not contain more than 100 values/);
+
+    expect(matchesFilter({ _id: { in: values } }, { _id: "id-99" })).toBe(true);
+    expect(() =>
+      matchesFilter({ _id: { in: [...values, "id-100"] } }, { _id: "id-99" })
+    ).toThrow(/must not contain more than 100 values/);
   });
 
   it("translates _createdAt range filters to _id boundaries", () => {
@@ -183,6 +261,26 @@ describe("createQueryBuilder", () => {
         >
       ).toSQL()
     ).toThrow(/must be "_id"/);
+  });
+
+  it("reports indexed paths for invalid nested logical filters", () => {
+    expect(() =>
+      matchesFilter(
+        {
+          AND: [{ status: { contains: "active" } }],
+        } as never,
+        { status: "active" }
+      )
+    ).toThrow(/filter\.AND\[0\]\.status\.contains/);
+
+    expect(() =>
+      matchesFilter(
+        {
+          OR: [{ status: "active" }, { age: { contains: 18 } }],
+        } as never,
+        { status: "inactive" }
+      )
+    ).toThrow(/filter\.OR\[1\]\.age\.contains/);
   });
 
   it("supports unique, count, and pagination against an executor", async () => {
