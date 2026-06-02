@@ -129,6 +129,29 @@ describe("createQueryBuilder", () => {
     ).toBeLessThan(0);
   });
 
+  it("matches non-scalar equality by stored JSON shape", () => {
+    expect(
+      matchesFilter(
+        { tags: { eq: '["alpha","beta"]' } },
+        { tags: ["alpha", "beta"] }
+      )
+    ).toBe(true);
+    expect(
+      matchesFilter({ meta: { eq: '{"rank":1}' } }, { meta: { rank: 1 } })
+    ).toBe(true);
+    expect(
+      matchesFilter({ meta: { neq: '{"rank":2}' } }, { meta: { rank: 1 } })
+    ).toBe(true);
+    expect(
+      matchesFilter(
+        { data: { eq: '{"$bytes":"AQI="}' } },
+        {
+          data: new Uint8Array([1, 2]),
+        }
+      )
+    ).toBe(true);
+  });
+
   it("collapses _createdAt ordering to _id", () => {
     const query = createQueryBuilder("todos").order(
       "_createdAt",

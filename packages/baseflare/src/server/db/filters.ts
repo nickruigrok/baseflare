@@ -489,7 +489,12 @@ function normalizeDocumentValue(value: unknown): string | number | null {
     return value;
   }
 
-  return null;
+  if (value === null || value === undefined) {
+    return null;
+  }
+
+  const serialized = JSON.stringify(toStorageValue(value));
+  return serialized ?? null;
 }
 
 function compareValues(

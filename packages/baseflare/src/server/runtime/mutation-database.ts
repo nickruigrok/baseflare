@@ -120,6 +120,8 @@ function getMutationQueryChunkSize(
     return 0;
   }
 
+  // Pending inserts are merged and sliced after base reads. They can displace
+  // fetched base rows, but only update/delete writes shadow existing D1 rows.
   return Math.min(state.limit + shadowedCount, MUTATION_QUERY_CHUNK_SIZE);
 }
 

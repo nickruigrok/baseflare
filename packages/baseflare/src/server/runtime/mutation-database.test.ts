@@ -76,6 +76,7 @@ const schema = defineSchema({
     text: v.string(),
   }),
   todos: defineTable({
+    tags: v.array(v.string()).optional(),
     text: v.string(),
   }),
 });
@@ -974,6 +975,29 @@ describe("MutationDatabase", () => {
       .collect();
 
     expect(documents.map((document) => document.text)).toEqual(["a", "b"]);
+  });
+
+  it("matches pending overlay inserts with stored JSON equality filters", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [],
+        tableVersion: 0,
+      })
+    );
+
+    await mutationDb.insert("todos", {
+      tags: ["alpha", "beta"],
+      text: "pending-tags",
+    });
+
+    const documents = await mutationDb
+      .query("todos")
+      .filter({ tags: { eq: '["alpha","beta"]' } })
+      .collect();
+
+    expect(documents.map((document) => document.text)).toEqual([
+      "pending-tags",
+    ]);
   });
 
   it("keeps an empty overlay result for zero limits", async () => {
