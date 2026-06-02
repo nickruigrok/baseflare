@@ -17,6 +17,7 @@ import {
   getRuntimeScanQueryOptions,
   type RuntimeScanPosition,
 } from "./d1";
+import { ValidationRuntimeError } from "./errors";
 import type { D1Database, D1PreparedStatement, D1Result } from "./types";
 
 class FakePreparedStatement implements D1PreparedStatement {
@@ -287,7 +288,7 @@ describe("D1 runtime helpers", () => {
     expect(query.params).toEqual(["alpha", "alpha", testId, 256, 1]);
   });
 
-  it("includes the table name in duplicate unique errors", async () => {
+  it("throws validation errors for duplicate unique results", async () => {
     const database = createAdapter({
       queryRows: [
         createStoredRow(testId),
@@ -300,7 +301,9 @@ describe("D1 runtime helpers", () => {
       }),
     });
 
-    await expect(database.query("todos").unique()).rejects.toThrow(
+    const unique = database.query("todos").unique();
+    await expect(unique).rejects.toBeInstanceOf(ValidationRuntimeError);
+    await expect(unique).rejects.toThrow(
       'Expected exactly one document from "todos", received 2'
     );
   });

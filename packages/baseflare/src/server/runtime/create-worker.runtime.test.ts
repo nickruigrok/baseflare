@@ -1409,7 +1409,7 @@ describe("worker runtime", () => {
     });
   });
 
-  it("treats query unique duplicate results as known runtime errors", async () => {
+  it("returns validation errors for query unique duplicate results", async () => {
     const errorSpy = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -1427,10 +1427,10 @@ describe("worker runtime", () => {
       error: { code: string; message: string };
     };
 
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(400);
     expect(body.error).toEqual({
-      code: ErrorCode.InternalError,
-      message: "Internal error",
+      code: ErrorCode.ValidationError,
+      message: 'Expected exactly one document from "todos", received 2',
     });
     expect(errorSpy).not.toHaveBeenCalled();
   });
@@ -1452,7 +1452,7 @@ describe("worker runtime", () => {
     });
   });
 
-  it("treats mutation unique duplicate results as known runtime errors", async () => {
+  it("returns validation errors for mutation unique duplicate results", async () => {
     const errorSpy = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -1470,10 +1470,10 @@ describe("worker runtime", () => {
       error: { code: string; message: string };
     };
 
-    expect(response.status).toBe(500);
+    expect(response.status).toBe(400);
     expect(body.error).toEqual({
-      code: ErrorCode.InternalError,
-      message: "Internal error",
+      code: ErrorCode.ValidationError,
+      message: 'Expected exactly one document from "todos", received 2',
     });
     expect(errorSpy).not.toHaveBeenCalled();
   });

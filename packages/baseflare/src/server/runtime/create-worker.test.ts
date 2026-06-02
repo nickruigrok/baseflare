@@ -9,7 +9,7 @@ import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
 import { createWorker } from "./create-worker";
 import { PayloadTooLargeRuntimeError } from "./errors";
-import { createActionContext } from "./execution";
+import { createActionContext, executeActionDefinition } from "./execution";
 import { createFunctionIndex } from "./function-index";
 import { buildBaseflareManifest } from "./manifest";
 import { readRequestBodyText } from "./request-body";
@@ -101,7 +101,7 @@ describe("worker request body reader", () => {
     );
   });
 
-  it("does not require D1 Sessions until an action calls a nested function", () => {
+  it("does not require D1 Sessions for direct action context construction", () => {
     const database: D1Database = {
       batch() {
         throw new Error("Expected no D1 batch");
@@ -132,6 +132,60 @@ describe("worker request body reader", () => {
     });
 
     expect(pureAction.handler(ctx, {})).toBe("ok");
+  });
+
+  it("requires D1 Sessions before executing action handlers", async () => {
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let handlerCalled = false;
+    const database: D1Database = {
+      batch() {
+        return Promise.resolve([]);
+      },
+      prepare() {
+        throw new Error("Expected action execution to fail before queries");
+      },
+    };
+    const pureAction = action({
+      args: {},
+      handler: () => {
+        handlerCalled = true;
+        return "ok";
+      },
+    });
+
+    try {
+      await expect(
+        executeActionDefinition(
+          pureAction,
+          {
+            database,
+            executionContext: {
+              waitUntil() {
+                // Test execution context stub.
+              },
+            },
+            functionIndex: createFunctionIndex(
+              buildBaseflareManifest({ schema })
+            ),
+            requestHeaders: new Headers(),
+            rules: defineRules({
+              todos: {
+                read: () => true,
+              },
+            }),
+            schema,
+          },
+          {}
+        )
+      ).rejects.toThrow(
+        "Baseflare runtime misconfiguration: APP_DB does not support D1 Sessions required for consistent mutations."
+      );
+      expect(handlerCalled).toBe(false);
+    } finally {
+      consoleError.mockRestore();
+    }
   });
 
   it("sanitizes missing D1 Session errors in API responses", async () => {

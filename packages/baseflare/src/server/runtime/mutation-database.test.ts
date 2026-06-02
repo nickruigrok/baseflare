@@ -10,7 +10,7 @@ import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
 import { TABLE_VERSION_TABLE_NAME } from "../schema/types";
 import type { StoredDocumentRow } from "./d1";
-import { InternalRuntimeError } from "./errors";
+import { InternalRuntimeError, ValidationRuntimeError } from "./errors";
 import {
   createMutationDatabaseSession,
   MutationDatabase,
@@ -367,7 +367,7 @@ describe("MutationDatabase", () => {
     );
   });
 
-  it("includes the table name in duplicate mutation unique errors", async () => {
+  it("throws validation errors for duplicate mutation unique results", async () => {
     const mutationDb = createMutationDatabase(
       createFakeDatabase({
         batchResults: [],
@@ -378,7 +378,9 @@ describe("MutationDatabase", () => {
     await mutationDb.insert("todos", { text: "first" });
     await mutationDb.insert("todos", { text: "second" });
 
-    await expect(mutationDb.query("todos").unique()).rejects.toThrow(
+    const unique = mutationDb.query("todos").unique();
+    await expect(unique).rejects.toBeInstanceOf(ValidationRuntimeError);
+    await expect(unique).rejects.toThrow(
       'Expected exactly one document from "todos", received 2'
     );
   });

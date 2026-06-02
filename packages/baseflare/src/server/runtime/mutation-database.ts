@@ -44,6 +44,7 @@ import {
   ensureSuccessfulD1Result,
   InternalRuntimeError,
   NotFoundRuntimeError,
+  ValidationRuntimeError,
   withDatabaseErrorHandling,
 } from "./errors";
 import { logRuntimeEvent } from "./logging";
@@ -315,7 +316,7 @@ class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
     }
 
     if (documents.length > 1) {
-      throw new InternalRuntimeError(
+      throw new ValidationRuntimeError(
         `Expected exactly one document from "${this.tableName}", received ${documents.length}`
       );
     }

@@ -426,7 +426,7 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
     }
 
     if (documents.length > 1) {
-      throw new InternalRuntimeError(
+      throw new ValidationRuntimeError(
         `Expected exactly one document from "${this.options.tableName}", received ${documents.length}`
       );
     }

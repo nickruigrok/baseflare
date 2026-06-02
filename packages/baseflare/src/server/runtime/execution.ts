@@ -145,7 +145,11 @@ export async function executeActionDefinition<TResult>(
   options: InvocationOptions,
   args: unknown
 ): Promise<TResult> {
-  const ctx = createActionContext(options);
+  const actionOptions = {
+    ...options,
+    database: createMutationDatabaseSession(options.database),
+  };
+  const ctx = createActionContext(actionOptions);
   const validatedArgs = validateArgs(definition, args);
   const result = await definition.handler(ctx, validatedArgs);
   return validateReturn(definition, result) as TResult;
