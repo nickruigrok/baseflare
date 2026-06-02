@@ -441,6 +441,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         throw new RetryableMutationConflictError();
       }
 
+      // RuntimeError subclasses raised during result validation propagate
+      // unchanged; unexpected D1/platform errors are coerced and sanitized.
       coerceDatabaseError(error, "Failed to commit mutation transaction");
     }
   }
@@ -775,8 +777,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       this.createTableVersionAssertionOperation(checkedTableNames),
       createGuardedTableVersionBumps(mutatedTables, guard),
     ];
-    // Mutation commits use the plural multi-table gate. The first document
-    // write must observe changes() equal to every mutated table being bumped.
+    // D1 batches run statements in order inside one SQLite transaction, and
+    // changes() observes the immediately previous statement. The plural
+    // version bump is the OCC gate; if it affects 0 rows, every following
+    // document write is already a SQL-level no-op through this chain.
     let expectedPreviousChanges = mutatedTables.length;
 
     for (const tableName of mutatedTables) {
@@ -1126,6 +1130,9 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       }
 
       if (operation.type === "assert-table-versions") {
+        // This SELECT is diagnostic metadata validation after D1 resolves the
+        // batch. Atomicity comes from the guarded version bump and changes()
+        // chain below, not from post-batch JavaScript validation.
         this.validateTableVersionAssertion(operation, result);
         continue;
       }

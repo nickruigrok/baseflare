@@ -628,6 +628,12 @@ export function createGuardedTableVersionBumps(
   readonly sql: string;
   readonly type: "bump-table-versions";
 } {
+  if (tableNames.length === 0) {
+    throw new InternalRuntimeError(
+      "Guarded table-version bump requires at least one table"
+    );
+  }
+
   const guardConditions = buildCommitGuardConditions(guard);
   const placeholders = tableNames.map(() => "?").join(", ");
   const conditions = [

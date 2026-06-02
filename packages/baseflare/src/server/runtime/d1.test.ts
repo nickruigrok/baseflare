@@ -339,4 +339,16 @@ describe("D1 runtime helpers", () => {
       nextTestId,
     ]);
   });
+
+  it("rejects empty guarded table-version bumps", () => {
+    const guard: CommitGuard = {
+      insertedIds: new Map(),
+      rowRevisions: new Map(),
+      tableVersions: new Map(),
+    };
+
+    expect(() => createGuardedTableVersionBumps([], guard)).toThrow(
+      "Guarded table-version bump requires at least one table"
+    );
+  });
 });

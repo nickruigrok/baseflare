@@ -4,8 +4,12 @@ export function getRequestLogFields(request: Request): {
   readonly method: string;
   readonly pathname: string;
 } {
-  const url = new URL(request.url);
-  return { method: request.method, pathname: url.pathname };
+  try {
+    const url = new URL(request.url);
+    return { method: request.method, pathname: url.pathname };
+  } catch {
+    return { method: request.method, pathname: "<malformed>" };
+  }
 }
 
 export function logRuntimeEvent(
