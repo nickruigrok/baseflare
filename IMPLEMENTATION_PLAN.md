@@ -275,7 +275,7 @@ export default defineConfig({
   // e.g. 'packages/baseflare/src', 'backend/functions'
   functions: 'baseflare',
 
-  // Packages to exclude from esbuild bundling (optional, escape hatch)
+  // Packages to exclude from Worker bundling (optional, escape hatch)
   // Use for packages with native bindings or dynamic requires that break when bundled
   external: [],
 
@@ -337,7 +337,7 @@ The CLI checks two things before any CF operation: `project` in config and valid
 npx baseflare deploy --env production
 ```
 
-1. CLI bundles the `baseflare/` directory via `esbuild` (runtime-agnostic, no Bun dependency)
+1. CLI bundles the `baseflare/` directory with the Baseflare Worker bundler, aligned with the Rolldown/tsdown toolchain used for package builds
 2. CLI wraps the bundle into a Worker entry point template:
    ```typescript
    import { createWorker } from 'baseflare/server'
@@ -566,7 +566,7 @@ baseflare/
 | `baseflare/client` | Subpath export for `BaseflareClient`, WebSocket connection manager, subscription state, optimistic updates, auth methods (`signUp`, `signIn`, `signOut`, `getSession`, `onAuthStateChange`) | Browser/Node |
 | `@baseflare/react` | `BaseflareProvider`, `useQuery()`, `useMutation()`, `useAction()`, `useAuth()` | Browser |
 | `baseflare-dashboard` | Local Vite React app — data browser, environment management, logs. Dogfoods `@baseflare/react` for data plane, CF API for management. Not published to npm. | Dev machine |
-| `baseflare` CLI | Single binary for `new/login/dev/deploy/codegen/generate/env/secrets/backup/dashboard`, codegen engine (analyzes `baseflare/` dir, writes `_generated/`), esbuild bundling, CF API client, OAuth client, Miniflare orchestration, cron emulation | Dev machine |
+| `baseflare` CLI | Single binary for `new/login/dev/deploy/codegen/generate/env/secrets/backup/dashboard`, codegen engine (analyzes `baseflare/` dir, writes `_generated/`), Worker bundling, CF API client, OAuth client, Miniflare orchestration, cron emulation | Dev machine |
 
 ### 3.2 Build Order
 
@@ -580,6 +580,8 @@ Level 3: baseflare-dashboard            (depends on baseflare/client, @baseflare
 ```
 
 The `baseflare` package publishes independent subpath exports for `./values`, `./server`, and `./client`, plus the `baseflare` CLI binary. Importing one subpath must not pull in the other subpaths' runtime code.
+
+Published workspace packages are built with `tsdown`. Codegen writes `_generated/` TypeScript helpers for user projects; it is separate from package bundling. Worker deploy bundling is a later CLI step that consumes app code and generated helpers, and should stay aligned with the Rolldown/tsdown toolchain unless implementation proves lower-level Rolldown control is needed.
 
 ### 3.3 Internal Structure of `baseflare/server`
 
@@ -940,7 +942,7 @@ enterprise work. **Open Phase 3 decision:** default production count, `N=1` vs
    - `logout` — revokes OAuth tokens for current or specified profile
    - `whoami` — shows current profile, account name, email, account ID
    - `dev` — lazy-prompts for profile/account/project name on first run, then starts Miniflare with file watcher and codegen
-   - `deploy --env <n>` — lazy-prompts if not configured → create environment if new → esbuild → CF Workers API deploy → apply table/index changes to D1
+   - `deploy --env <n>` — lazy-prompts if not configured → create environment if new → Worker bundle → CF Workers API deploy → apply table/index changes to D1
    - `deploy --env <n> --dry-run` — preview table/index changes
    - `generate` — regenerate types
    - `env list` — list environments via CF API (`bf-{project}-*`)

@@ -1,4 +1,4 @@
-import { defineConfig } from "tsup";
+import { defineConfig } from "tsdown";
 
 export default defineConfig({
   entry: {
@@ -8,12 +8,13 @@ export default defineConfig({
     "values/index": "src/values/index.ts",
   },
   format: ["esm"],
-  splitting: true,
-  dts: true,
+  dts: { sourcemap: false },
   clean: true,
   define: {
     __BASEFLARE_DEV_WARNINGS__: "false",
   },
-  minifySyntax: true,
+  fixedExtension: false,
+  minify: "dce-only",
+  sourcemap: false,
   target: "es2022",
 });
