@@ -11,5 +11,9 @@ export default defineConfig({
   splitting: true,
   dts: true,
   clean: true,
+  define: {
+    __BASEFLARE_DEV_WARNINGS__: "false",
+  },
+  minifySyntax: true,
   target: "es2022",
 });

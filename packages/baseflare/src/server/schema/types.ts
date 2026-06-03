@@ -8,10 +8,16 @@ import {
 const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 const FILTER_LOGIC_FIELD_NAMES = new Set(["AND", "OR", "NOT"]);
 export const TABLE_VERSION_TABLE_NAME = "_bf_table_versions";
+export const PARTITION_VERSION_TABLE_NAME = "_bf_partition_versions";
+
+export interface TableIndexOptions {
+  readonly partition?: boolean;
+}
 
 export interface TableIndex {
   readonly fields: readonly string[];
   readonly name: string;
+  readonly partition?: boolean;
 }
 
 export interface TableDefinition<
@@ -23,7 +29,11 @@ export interface TableDefinition<
 
 export interface TableBuilder<TFields extends ValidatorShape = ValidatorShape>
   extends TableDefinition<TFields> {
-  index(name: string, fields: readonly string[]): TableBuilder<TFields>;
+  index(
+    name: string,
+    fields: readonly string[],
+    options?: TableIndexOptions
+  ): TableBuilder<TFields>;
 }
 
 export type SchemaTables = Record<string, TableDefinition>;
@@ -143,4 +153,13 @@ export function createTableVersionStatements(
   }
 
   return statements;
+}
+
+export function createPartitionVersionStatements(): SqlStatement[] {
+  return [
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${PARTITION_VERSION_TABLE_NAME} (table_name TEXT NOT NULL, partition_key TEXT NOT NULL, partition_value TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0), PRIMARY KEY (table_name, partition_key, partition_value))`,
+      params: [],
+    },
+  ];
 }

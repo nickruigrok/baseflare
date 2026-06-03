@@ -5,6 +5,7 @@ import {
   assertIdentifier,
   type TableBuilder,
   type TableIndex,
+  type TableIndexOptions,
 } from "./types";
 
 function validateIndexFields(
@@ -33,7 +34,11 @@ function createTableBuilder<TFields extends ValidatorShape>(
   return {
     fields,
     indexes,
-    index(name: string, indexFields: readonly string[]): TableBuilder<TFields> {
+    index(
+      name: string,
+      indexFields: readonly string[],
+      options: TableIndexOptions = {}
+    ): TableBuilder<TFields> {
       assertIdentifier(name, "Index name");
       validateIndexFields(fields, indexFields);
 
@@ -43,9 +48,22 @@ function createTableBuilder<TFields extends ValidatorShape>(
         );
       }
 
+      if (
+        options.partition === true &&
+        indexes.some((index) => index.partition === true)
+      ) {
+        throw new SchemaError("Only one index per table can be partitioned");
+      }
+
       return createTableBuilder(fields, [
         ...indexes,
-        { name, fields: [...indexFields] },
+        {
+          name,
+          fields: [...indexFields],
+          ...(options.partition === undefined
+            ? {}
+            : { partition: options.partition }),
+        },
       ]);
     },
   };

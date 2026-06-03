@@ -89,12 +89,14 @@ describe("runtime schema apply", () => {
       "CREATE INDEX IF NOT EXISTS todos_by_owner ON todos (json_extract(_data, '$.ownerToken'))",
       "CREATE TABLE IF NOT EXISTS _bf_table_versions (table_name TEXT PRIMARY KEY, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0))",
       "INSERT OR IGNORE INTO _bf_table_versions (table_name, version) VALUES (?, 0)",
+      "CREATE TABLE IF NOT EXISTS _bf_partition_versions (table_name TEXT NOT NULL, partition_key TEXT NOT NULL, partition_value TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0), PRIMARY KEY (table_name, partition_key, partition_value))",
     ]);
     expect(preparedStatements.map((statement) => statement.params)).toEqual([
       [],
       [],
       [],
       ["todos"],
+      [],
     ]);
   });
 });
