@@ -1,5 +1,5 @@
 import { v } from "baseflare/values";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CursorPayload } from "../db/cursor";
 import type { QueryState } from "../db/query-builder";
@@ -18,6 +18,7 @@ import {
   createMutationDatabaseSession,
   MutationDatabase,
   RetryableMutationConflictError,
+  resetOccContentionWarningStateForTest,
   withMutationRetry,
 } from "./mutation-database";
 import type {
@@ -68,6 +69,10 @@ class FakePreparedStatement implements D1PreparedStatement {
     throw new Error(`Unexpected run for query: ${this.query}`);
   }
 }
+
+beforeEach(() => {
+  resetOccContentionWarningStateForTest();
+});
 
 interface FakeReadResult {
   readonly rows?: readonly Record<string, unknown>[];
@@ -716,6 +721,31 @@ describe("MutationDatabase", () => {
 
     await expect(mutationDb.commit()).rejects.toThrow(
       RetryableMutationConflictError
+    );
+  });
+
+  it("reports missing positive partition version rows as corruption", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          partitionVersionResult([]),
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+        readResults: [{ rows: [], version: 7 }],
+      })
+    );
+
+    await mutationDb.query("messages").filter({ channelId: "a" }).collect();
+    await mutationDb.insert("messages", { channelId: "a", text: "hello" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      'Partition version row for "messages/by_channel/["a"]" was present during the read phase (version 7) but is now missing; this indicates data corruption or unexpected manual deletion'
     );
   });
 

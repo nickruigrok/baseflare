@@ -157,8 +157,16 @@ const missingPartitionVersionRowMessage = (
   partition: PartitionVersionKey
 ): string =>
   `Missing internal partition version row for "${partition.tableName}/${partition.partitionKey}/${partition.partitionValue}"; run applyRuntimeSchema before handling runtime traffic`;
+const missingPositivePartitionVersionRowMessage = (
+  partition: PartitionVersionRead
+): string =>
+  `Partition version row for "${partition.tableName}/${partition.partitionKey}/${partition.partitionValue}" was present during the read phase (version ${partition.version}) but is now missing; this indicates data corruption or unexpected manual deletion`;
 
 declare const __BASEFLARE_DEV_WARNINGS__: boolean | undefined;
+
+export function resetOccContentionWarningStateForTest(): void {
+  occContentionWarningState.clear();
+}
 
 function createBaseQueryState(): QueryState {
   return { order: { field: "_id", direction: "asc" } };
@@ -1652,7 +1660,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         }
 
         throw new InternalRuntimeError(
-          missingPartitionVersionRowMessage(partition)
+          missingPositivePartitionVersionRowMessage(partition)
         );
       }
 
