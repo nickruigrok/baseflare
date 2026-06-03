@@ -244,15 +244,15 @@ export function createRealtimeMutationNotifier(
   return {
     enabled: true,
     notify(events) {
-      for (const event of events) {
-        const shardName = getRealtimeSubscriptionShardName();
-        const stub = env.REALTIME_SUBSCRIPTIONS?.get(
-          env.REALTIME_SUBSCRIPTIONS.idFromName(shardName)
-        );
-        if (!stub) {
-          continue;
-        }
+      const shardName = getRealtimeSubscriptionShardName();
+      const stub = env.REALTIME_SUBSCRIPTIONS?.get(
+        env.REALTIME_SUBSCRIPTIONS.idFromName(shardName)
+      );
+      if (!stub) {
+        return;
+      }
 
+      for (const event of events) {
         ctx.waitUntil(
           stub
             .fetch("https://baseflare.internal/notify", {
@@ -750,6 +750,10 @@ export class RealtimeSubscriptionDO {
         afterSequence,
         typeof body.limit === "number" ? body.limit : 100
       );
+      if (events.length === 0) {
+        return jsonResponse({ evaluated: 0, events, failed: 0, ok: true });
+      }
+
       this.advanceLastSeenSequence(events.at(-1)?.sequence);
       const result = await this.reEvaluateActiveRegistrations();
       return jsonResponse({ ...result, events, ok: true });
@@ -811,6 +815,7 @@ export class RealtimeSubscriptionDO {
         evaluated += 1;
       } catch (error) {
         failed += 1;
+        this.deleteExpiredRegistration(registration);
         logRuntimeEvent(
           "error",
           "runtime.realtime_registration_re_evaluation_failed",
@@ -898,18 +903,26 @@ export class RealtimeSubscriptionDO {
         ? deliveryResult.delivered
         : 0;
     if (delivered <= 0) {
-      if (registration.leaseExpiresAt <= Date.now()) {
-        this.registrations.delete(
-          createRegistrationKey(
-            registration.connectionKey,
-            registration.subscriptionId
-          )
-        );
-      }
+      this.deleteExpiredRegistration(registration);
       return;
     }
 
     registration.lastResultJson = resultJson;
     registration.leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
+  }
+
+  private deleteExpiredRegistration(
+    registration: StoredRealtimeRegistration
+  ): void {
+    if (registration.leaseExpiresAt > Date.now()) {
+      return;
+    }
+
+    this.registrations.delete(
+      createRegistrationKey(
+        registration.connectionKey,
+        registration.subscriptionId
+      )
+    );
   }
 }
