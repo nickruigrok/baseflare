@@ -1032,6 +1032,69 @@ describe("worker runtime", () => {
     expect(missingBody.delivered).toBe(0);
   });
 
+  it("continues realtime delivery after one socket send fails", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const deliveredPayloads: string[] = [];
+    const failedSocket = {
+      send() {
+        throw new Error("Socket closed");
+      },
+    } as unknown as WebSocket;
+    const activeSocket = {
+      send(payload: string) {
+        deliveredPayloads.push(payload);
+      },
+    } as unknown as WebSocket;
+    const internals = connectionDo as unknown as {
+      socketConnectionKeys: Map<WebSocket, string>;
+      socketConnectionNames: Map<WebSocket, string>;
+      sockets: Set<WebSocket>;
+      socketsByConnectionKey: Map<string, Set<WebSocket>>;
+    };
+    internals.sockets.add(failedSocket);
+    internals.sockets.add(activeSocket);
+    internals.socketConnectionKeys.set(failedSocket, "client-a");
+    internals.socketConnectionKeys.set(activeSocket, "client-a");
+    internals.socketConnectionNames.set(failedSocket, "connection:0");
+    internals.socketConnectionNames.set(activeSocket, "connection:0");
+    internals.socketsByConnectionKey.set(
+      "client-a",
+      new Set([failedSocket, activeSocket])
+    );
+
+    const response = await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          result: [{ text: "still-delivered" }],
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as { delivered: number };
+
+    expect(body.delivered).toBe(1);
+    expect(deliveredPayloads.map((payload) => JSON.parse(payload))).toEqual([
+      {
+        message: {
+          result: [{ text: "still-delivered" }],
+          subscriptionId: "sub-a",
+        },
+        type: "delivery",
+      },
+    ]);
+    expect(internals.sockets.has(failedSocket)).toBe(false);
+    expect(internals.socketsByConnectionKey.get("client-a")).toEqual(
+      new Set([activeSocket])
+    );
+  });
+
   it("restores realtime subscriptions without serial register round trips", async () => {
     let activeRegistrations = 0;
     let maxActiveRegistrations = 0;
@@ -1431,7 +1494,7 @@ describe("worker runtime", () => {
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
         deliveries.push(await request.json());
-        return Response.json({ ok: true });
+        return Response.json({ delivered: 1, ok: true });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -1598,7 +1661,7 @@ describe("worker runtime", () => {
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
         deliveries.push(await request.json());
-        return Response.json({ ok: true });
+        return Response.json({ delivered: 1, ok: true });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -1910,7 +1973,7 @@ describe("worker runtime", () => {
     expect(body.lastSeenSequence).toBe(newerRow?.sequence);
   });
 
-  it("ignores stale realtime registration epochs and expires old leases", async () => {
+  it("ignores stale realtime registration epochs and keeps leases for delivery cleanup", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
@@ -1966,7 +2029,9 @@ describe("worker runtime", () => {
       registrations: Array<{ queryName: string }>;
     };
 
-    expect(body.registrations).toEqual([]);
+    expect(
+      body.registrations.map((registration) => registration.queryName)
+    ).toEqual(["todos:expired"]);
   });
 
   it("scopes identical subscription ids by connection key", async () => {
@@ -2053,7 +2118,7 @@ describe("worker runtime", () => {
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
         deliveries.push(await request.json());
-        return Response.json({ ok: true });
+        return Response.json({ delivered: 1, ok: true });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -2123,6 +2188,181 @@ describe("worker runtime", () => {
     ).toEqual(["delivered"]);
   });
 
+  it("renews expired realtime leases after successful delivery", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ delivered: 1, ok: true }))
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() - 1,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "renewed-lease");
+    await createRealtimeOutboxEvent("renew-lease-event");
+    const renewalStartedAt = Date.now();
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "renew-lease-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: Array<{ leaseExpiresAt: number }>;
+    };
+
+    expect(registrationsBody.registrations).toHaveLength(1);
+    expect(registrationsBody.registrations[0]?.leaseExpiresAt).toBeGreaterThan(
+      renewalStartedAt
+    );
+  });
+
+  it("retries realtime delivery when no socket receives the result", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ delivered: 0, ok: true }))
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "retry-without-socket");
+    await createRealtimeOutboxEvent("no-socket-retry-event");
+
+    const notify = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId: "no-socket-retry-event" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    const firstResponse = await notify();
+    const firstBody = (await firstResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    const secondResponse = await notify();
+    const secondBody = (await secondResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(firstBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(secondBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(connections.requests).toHaveLength(2);
+  });
+
+  it("removes expired realtime registrations when no socket receives delivery", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ delivered: 0, ok: true }))
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() - 1,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "cleanup-expired-lease");
+    await createRealtimeOutboxEvent("cleanup-expired-lease-event");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "cleanup-expired-lease-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: unknown[];
+    };
+
+    expect(registrationsBody.registrations).toEqual([]);
+  });
+
   it("retries unchanged realtime results after a failed delivery", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
@@ -2135,7 +2375,7 @@ describe("worker runtime", () => {
         }
 
         deliveries.push(await request.json());
-        return Response.json({ ok: true });
+        return Response.json({ delivered: 1, ok: true });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -2222,7 +2462,7 @@ describe("worker runtime", () => {
         }
 
         deliveries.push(await request.json());
-        return Response.json({ ok: true });
+        return Response.json({ delivered: 1, ok: true });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -2303,7 +2543,7 @@ describe("worker runtime", () => {
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
         deliveries.push(await request.json());
-        return Response.json({ ok: true });
+        return Response.json({ delivered: 1, ok: true });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {

@@ -73,7 +73,11 @@ interface RealtimeRuntime {
   readonly schema: Schema;
 }
 
-type StoredRealtimeRegistration = RealtimeRegistration & {
+type StoredRealtimeRegistration = Omit<
+  RealtimeRegistration,
+  "leaseExpiresAt"
+> & {
+  leaseExpiresAt: number;
   lastResultJson?: string;
 };
 
@@ -657,8 +661,12 @@ export class RealtimeConnectionDO {
 
     let delivered = 0;
     for (const socket of sockets) {
-      socket.send(payload);
-      delivered += 1;
+      try {
+        socket.send(payload);
+        delivered += 1;
+      } catch {
+        this.removeSocket(socket);
+      }
     }
 
     return delivered;
@@ -750,7 +758,7 @@ export class RealtimeSubscriptionDO {
     if (url.pathname === "/registrations") {
       return jsonResponse({
         lastSeenSequence: this.lastSeenSequence,
-        registrations: this.getActiveRegistrations(),
+        registrations: this.getStoredRegistrations(),
       });
     }
 
@@ -787,19 +795,8 @@ export class RealtimeSubscriptionDO {
     };
   }
 
-  private getActiveRegistrations(): StoredRealtimeRegistration[] {
-    const now = Date.now();
-    const active: StoredRealtimeRegistration[] = [];
-    for (const [subscriptionId, registration] of this.registrations) {
-      if (registration.leaseExpiresAt <= now) {
-        this.registrations.delete(subscriptionId);
-        continue;
-      }
-
-      active.push(registration);
-    }
-
-    return active;
+  private getStoredRegistrations(): StoredRealtimeRegistration[] {
+    return Array.from(this.registrations.values());
   }
 
   private async reEvaluateActiveRegistrations(): Promise<{
@@ -808,7 +805,7 @@ export class RealtimeSubscriptionDO {
   }> {
     let evaluated = 0;
     let failed = 0;
-    for (const registration of this.getActiveRegistrations()) {
+    for (const registration of this.getStoredRegistrations()) {
       try {
         await this.reEvaluateRegistration(registration);
         evaluated += 1;
@@ -893,6 +890,26 @@ export class RealtimeSubscriptionDO {
       );
     }
 
+    const deliveryResult = (await deliveryResponse.json()) as {
+      delivered?: unknown;
+    };
+    const delivered =
+      typeof deliveryResult.delivered === "number"
+        ? deliveryResult.delivered
+        : 0;
+    if (delivered <= 0) {
+      if (registration.leaseExpiresAt <= Date.now()) {
+        this.registrations.delete(
+          createRegistrationKey(
+            registration.connectionKey,
+            registration.subscriptionId
+          )
+        );
+      }
+      return;
+    }
+
     registration.lastResultJson = resultJson;
+    registration.leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
   }
 }
