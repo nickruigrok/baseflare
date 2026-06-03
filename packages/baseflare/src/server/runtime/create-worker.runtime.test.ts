@@ -767,6 +767,14 @@ async function createTodoViaRpc(
   return body.result.id;
 }
 
+async function createRealtimeOutboxEvent(eventId: string): Promise<void> {
+  await env.APP_DB.prepare(
+    "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+  )
+    .bind(eventId, Date.now(), JSON.stringify(["todos"]), JSON.stringify([]))
+    .run();
+}
+
 async function createDetailedTodoViaRpc(args: {
   completed?: boolean;
   deletedAt?: number;
@@ -1181,6 +1189,148 @@ describe("worker runtime", () => {
     });
   });
 
+  it("reports realtime restore failures when registration returns an error response", async () => {
+    const subscriptionDo = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const registration = (await request.json()) as {
+          subscriptionId: string;
+        };
+        return Response.json(
+          { ok: false },
+          { status: registration.subscriptionId === "sub-bad" ? 500 : 200 }
+        );
+      }
+    );
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{
+      failed?: Array<{ error: string; index: number; subscriptionId?: string }>;
+      subscriptionId?: string;
+      type: string;
+    }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          failed?: Array<{
+            error: string;
+            index: number;
+            subscriptionId?: string;
+          }>;
+          subscriptionId?: string;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-good",
+          },
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-bad",
+          },
+        ],
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages).toEqual([
+      { subscriptionId: "sub-good", type: "subscribed" },
+      {
+        failed: [
+          {
+            error: "Realtime subscription registration failed with status 500",
+            index: 1,
+            subscriptionId: "sub-bad",
+          },
+        ],
+        type: "restored",
+      },
+    ]);
+  });
+
+  it("does not report direct realtime subscriptions as live after registration errors", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ ok: false }, { status: 500 }))
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{
+      error?: string;
+      subscriptionId?: string;
+      type: string;
+    }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          error?: string;
+          subscriptionId?: string;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-failed",
+        type: "subscribe",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages).toEqual([
+      {
+        error: "Realtime subscription registration failed with status 500",
+        type: "error",
+      },
+    ]);
+  });
+
   it("keeps malformed realtime restore envelopes on the socket error path", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -1258,6 +1408,7 @@ describe("worker runtime", () => {
     await register("sub-bad", "todos:renamed");
     await register("sub-good", "todos:list");
     await createTodoViaRpc("owner-a", "still-delivered");
+    await createRealtimeOutboxEvent("event-1");
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {
@@ -1556,6 +1707,64 @@ describe("worker runtime", () => {
     expect(body.lastSeenSequence).toBe(row?.sequence);
   });
 
+  it("skips realtime re-evaluation when notify references an unknown event", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          deliveries.push(await request.json());
+          return Response.json({ ok: true });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "missing-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      lastSeenSequence: number | null;
+    };
+
+    expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(deliveries).toHaveLength(0);
+    expect(registrationsBody.lastSeenSequence).toBeNull();
+  });
+
   it("keeps realtime notify cursors monotonic for out-of-order events", async () => {
     await env.APP_DB.batch([
       env.APP_DB.prepare(
@@ -1817,6 +2026,7 @@ describe("worker runtime", () => {
       })
     );
     await createTodoViaRpc("owner-a", "delivered");
+    await createRealtimeOutboxEvent("event-1");
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {
@@ -1898,6 +2108,7 @@ describe("worker runtime", () => {
       })
     );
     await createTodoViaRpc("owner-a", "retry-delivery");
+    await createRealtimeOutboxEvent("event-1");
 
     const notify = () =>
       subscriptionDo.fetch(
@@ -1980,6 +2191,7 @@ describe("worker runtime", () => {
 
     createWorker(createManifest({ queries: [] }));
     await createTodoViaRpc("owner-a", "original-runtime");
+    await createRealtimeOutboxEvent("event-1");
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {

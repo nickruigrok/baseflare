@@ -497,11 +497,20 @@ export class RealtimeConnectionDO {
     socket: RuntimeWebSocket
   ): Promise<void> {
     const registration = this.createRegistration(message, socket);
-    await this.subscriptionStub().fetch("https://baseflare.internal/register", {
-      body: JSON.stringify(registration),
-      headers: JSON_HEADERS,
-      method: "POST",
-    });
+    const response = await this.subscriptionStub().fetch(
+      "https://baseflare.internal/register",
+      {
+        body: JSON.stringify(registration),
+        headers: JSON_HEADERS,
+        method: "POST",
+      }
+    );
+    if (!response.ok) {
+      throw new InternalRuntimeError(
+        `Realtime subscription registration failed with status ${response.status}`
+      );
+    }
+
     socket.send(
       JSON.stringify({
         subscriptionId: registration.subscriptionId,
@@ -709,7 +718,11 @@ export class RealtimeSubscriptionDO {
         this.database,
         getStringField(body, "eventId")
       );
-      this.advanceLastSeenSequence(event?.sequence);
+      if (!event) {
+        return jsonResponse({ evaluated: 0, failed: 0, ok: true });
+      }
+
+      this.advanceLastSeenSequence(event.sequence);
       const result = await this.reEvaluateActiveRegistrations();
       return jsonResponse({ ...result, ok: true });
     }
