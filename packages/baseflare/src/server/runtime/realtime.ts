@@ -58,6 +58,7 @@ interface RealtimeRegistration {
   readonly epoch: number;
   readonly leaseExpiresAt: number;
   readonly queryName: string;
+  readonly runtimeId: string;
   readonly subscriptionId: string;
 }
 
@@ -79,10 +80,16 @@ type StoredRealtimeRegistration = RealtimeRegistration & {
 const DEFAULT_REALTIME_SHARD_COUNT = 1;
 const REALTIME_LEASE_MS = 60_000;
 const JSON_HEADERS = { "content-type": "application/json" } as const;
-let configuredRealtimeRuntime: RealtimeRuntime | undefined;
+const REALTIME_RUNTIME_ID_HEADER = "x-baseflare-realtime-runtime-id";
+const UINT32_MODULUS = 4_294_967_296;
+let nextRealtimeRuntimeId = 0;
+const configuredRealtimeRuntimes = new Map<string, RealtimeRuntime>();
 
-export function configureRealtimeRuntime(runtime: RealtimeRuntime): void {
-  configuredRealtimeRuntime = runtime;
+export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
+  nextRealtimeRuntimeId += 1;
+  const runtimeId = `runtime:${nextRealtimeRuntimeId}`;
+  configuredRealtimeRuntimes.set(runtimeId, runtime);
+  return runtimeId;
 }
 
 function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
@@ -142,17 +149,38 @@ function getEpoch(value: unknown): number {
   return value;
 }
 
-function getRealtimeShardName(prefix: string, key: string): string {
-  let hash = 0;
-  for (const char of key) {
-    hash = (hash * 31 + char.charCodeAt(0)) % Number.MAX_SAFE_INTEGER;
-  }
-
-  return `${prefix}:${hash % DEFAULT_REALTIME_SHARD_COUNT}`;
+function createRegistrationKey(
+  connectionKey: string,
+  subscriptionId: string
+): string {
+  return JSON.stringify([connectionKey, subscriptionId]);
 }
 
-export function getRealtimeConnectionShardName(key: string): string {
-  return getRealtimeShardName("connection", key);
+function getRealtimeShardName(
+  prefix: string,
+  key: string,
+  shardCount = DEFAULT_REALTIME_SHARD_COUNT
+): string {
+  if (!Number.isInteger(shardCount) || shardCount <= 0) {
+    throw new InternalRuntimeError(
+      "Realtime shard count must be a positive integer"
+    );
+  }
+
+  let hash = 0;
+  for (const char of key) {
+    const nextHash = Math.imul(hash, 31) + char.charCodeAt(0);
+    hash = ((nextHash % UINT32_MODULUS) + UINT32_MODULUS) % UINT32_MODULUS;
+  }
+
+  return `${prefix}:${hash % shardCount}`;
+}
+
+export function getRealtimeConnectionShardName(
+  key: string,
+  shardCount = DEFAULT_REALTIME_SHARD_COUNT
+): string {
+  return getRealtimeShardName("connection", key, shardCount);
 }
 
 export function getRealtimeSubscriptionShardName(): string {
@@ -237,38 +265,73 @@ export function createRealtimeMutationNotifier(
 
 export async function fetchRealtimeOutboxEvents(
   database: Pick<RuntimeDatabase, "prepare">,
-  afterEventId: string | null,
+  afterSequence: number | null,
   limit: number
 ): Promise<
   Array<{
     readonly eventId: string;
     readonly partitions: readonly RealtimePartitionTarget[];
+    readonly sequence: number;
     readonly tables: readonly string[];
   }>
 > {
   const boundedLimit = Math.min(Math.max(limit, 1), 1000);
   const sql =
-    afterEventId === null
-      ? `SELECT event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} ORDER BY event_id ASC LIMIT ?`
-      : `SELECT event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id > ? ORDER BY event_id ASC LIMIT ?`;
+    afterSequence === null
+      ? `SELECT sequence, event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} ORDER BY sequence ASC LIMIT ?`
+      : `SELECT sequence, event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE sequence > ? ORDER BY sequence ASC LIMIT ?`;
   const params =
-    afterEventId === null ? [boundedLimit] : [afterEventId, boundedLimit];
+    afterSequence === null ? [boundedLimit] : [afterSequence, boundedLimit];
   const result = await bindStatement(database, sql, params).all<{
     event_id: string;
     partitions: string;
+    sequence: number;
     tables: string;
   }>();
 
   return (result.results ?? []).map((row) => ({
     eventId: row.event_id,
     partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
+    sequence: row.sequence,
     tables: JSON.parse(row.tables) as string[],
   }));
 }
 
+async function fetchRealtimeOutboxEventById(
+  database: Pick<RuntimeDatabase, "prepare">,
+  eventId: string
+): Promise<{
+  readonly eventId: string;
+  readonly partitions: readonly RealtimePartitionTarget[];
+  readonly sequence: number;
+  readonly tables: readonly string[];
+} | null> {
+  const row = await bindStatement(
+    database,
+    `SELECT sequence, event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
+    [eventId]
+  ).first<{
+    event_id: string;
+    partitions: string;
+    sequence: number;
+    tables: string;
+  }>();
+  if (!row) {
+    return null;
+  }
+
+  return {
+    eventId: row.event_id,
+    partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
+    sequence: row.sequence,
+    tables: JSON.parse(row.tables) as string[],
+  };
+}
+
 export async function routeRealtimeSubscribe(
   request: Request,
-  env: BaseflareRuntimeEnv
+  env: BaseflareRuntimeEnv,
+  runtimeId: string
 ): Promise<Response | null> {
   const url = new URL(request.url);
   if (url.pathname !== "/api/subscribe") {
@@ -295,8 +358,10 @@ export async function routeRealtimeSubscribe(
   const stub = env.REALTIME_CONNECTIONS.get(
     env.REALTIME_CONNECTIONS.idFromName(shardName)
   );
+  const headers = new Headers(request.headers);
+  headers.set(REALTIME_RUNTIME_ID_HEADER, runtimeId);
 
-  return await stub.fetch(request);
+  return await stub.fetch(new Request(request, { headers }));
 }
 
 export class RealtimeConnectionDO {
@@ -307,6 +372,7 @@ export class RealtimeConnectionDO {
   >();
   private readonly socketConnectionKeys = new Map<RuntimeWebSocket, string>();
   private readonly socketConnectionNames = new Map<RuntimeWebSocket, string>();
+  private readonly socketRuntimeIds = new Map<RuntimeWebSocket, string>();
   private readonly socketsByConnectionKey = new Map<
     string,
     Set<RuntimeWebSocket>
@@ -353,6 +419,10 @@ export class RealtimeConnectionDO {
       "default";
     server.accept();
     this.addSocket(server, clientKey);
+    this.socketRuntimeIds.set(
+      server,
+      request.headers.get(REALTIME_RUNTIME_ID_HEADER) ?? ""
+    );
     this.socketConnectionNames.set(
       server,
       getRealtimeConnectionShardName(clientKey)
@@ -377,6 +447,7 @@ export class RealtimeConnectionDO {
     server.addEventListener("close", () => {
       this.removeSocket(server);
       this.socketAuthorizationHeaders.delete(server);
+      this.socketRuntimeIds.delete(server);
     });
 
     return new Response(null, {
@@ -439,10 +510,11 @@ export class RealtimeConnectionDO {
     socket: RuntimeWebSocket
   ): Promise<void> {
     const subscriptionId = getStringField(message, "subscriptionId");
+    const connectionKey = this.socketConnectionKeys.get(socket) ?? "default";
     await this.subscriptionStub().fetch(
       "https://baseflare.internal/unregister",
       {
-        body: JSON.stringify({ subscriptionId }),
+        body: JSON.stringify({ connectionKey, subscriptionId }),
         headers: JSON_HEADERS,
         method: "POST",
       }
@@ -489,6 +561,7 @@ export class RealtimeConnectionDO {
       epoch: getEpoch(message.epoch),
       leaseExpiresAt: Date.now() + REALTIME_LEASE_MS,
       queryName: getStringField(message, "queryName"),
+      runtimeId: socket ? (this.socketRuntimeIds.get(socket) ?? "") : "",
       subscriptionId,
     };
   }
@@ -555,7 +628,7 @@ export class RealtimeSubscriptionDO {
     string,
     StoredRealtimeRegistration
   >();
-  private lastSeenEventId: string | null = null;
+  private lastSeenSequence: number | null = null;
 
   constructor(_state: unknown, env: RealtimeObjectEnv) {
     this.database = env.APP_DB;
@@ -572,42 +645,55 @@ export class RealtimeSubscriptionDO {
       const registration = this.parseRegistration(
         await readJsonObject(request)
       );
-      const existing = this.registrations.get(registration.subscriptionId);
+      const registrationKey = createRegistrationKey(
+        registration.connectionKey,
+        registration.subscriptionId
+      );
+      const existing = this.registrations.get(registrationKey);
       if (!existing || registration.epoch >= existing.epoch) {
-        this.registrations.set(registration.subscriptionId, registration);
+        this.registrations.set(registrationKey, registration);
       }
       return jsonResponse({ ok: true });
     }
 
     if (url.pathname === "/unregister") {
       const body = await readJsonObject(request);
-      this.registrations.delete(getStringField(body, "subscriptionId"));
+      this.registrations.delete(
+        createRegistrationKey(
+          getStringField(body, "connectionKey"),
+          getStringField(body, "subscriptionId")
+        )
+      );
       return jsonResponse({ ok: true });
     }
 
     if (url.pathname === "/notify") {
       const body = await readJsonObject(request);
-      this.lastSeenEventId = getStringField(body, "eventId");
-      await this.reEvaluateActiveRegistrations();
-      return jsonResponse({ ok: true });
+      const event = await fetchRealtimeOutboxEventById(
+        this.database,
+        getStringField(body, "eventId")
+      );
+      this.lastSeenSequence = event?.sequence ?? this.lastSeenSequence;
+      const result = await this.reEvaluateActiveRegistrations();
+      return jsonResponse({ ...result, ok: true });
     }
 
     if (url.pathname === "/catch-up") {
       const body = await readJsonObject(request);
-      const afterEventId =
-        typeof body.afterEventId === "string" ? body.afterEventId : null;
+      const afterSequence =
+        typeof body.afterSequence === "number" ? body.afterSequence : null;
       const events = await fetchRealtimeOutboxEvents(
         this.database,
-        afterEventId,
+        afterSequence,
         typeof body.limit === "number" ? body.limit : 100
       );
-      this.lastSeenEventId = events.at(-1)?.eventId ?? this.lastSeenEventId;
+      this.lastSeenSequence = events.at(-1)?.sequence ?? this.lastSeenSequence;
       return jsonResponse({ events, ok: true });
     }
 
     if (url.pathname === "/registrations") {
       return jsonResponse({
-        lastSeenEventId: this.lastSeenEventId,
+        lastSeenSequence: this.lastSeenSequence,
         registrations: this.getActiveRegistrations(),
       });
     }
@@ -632,13 +718,14 @@ export class RealtimeSubscriptionDO {
           ? body.leaseExpiresAt
           : Date.now() + REALTIME_LEASE_MS,
       queryName: getStringField(body, "queryName"),
+      runtimeId: getStringField(body, "runtimeId"),
       subscriptionId: getStringField(body, "subscriptionId"),
     };
   }
 
   private getActiveRegistrations(): StoredRealtimeRegistration[] {
     const now = Date.now();
-    const active: RealtimeRegistration[] = [];
+    const active: StoredRealtimeRegistration[] = [];
     for (const [subscriptionId, registration] of this.registrations) {
       if (registration.leaseExpiresAt <= now) {
         this.registrations.delete(subscriptionId);
@@ -651,16 +738,37 @@ export class RealtimeSubscriptionDO {
     return active;
   }
 
-  private async reEvaluateActiveRegistrations(): Promise<void> {
+  private async reEvaluateActiveRegistrations(): Promise<{
+    readonly evaluated: number;
+    readonly failed: number;
+  }> {
+    let evaluated = 0;
+    let failed = 0;
     for (const registration of this.getActiveRegistrations()) {
-      await this.reEvaluateRegistration(registration);
+      try {
+        await this.reEvaluateRegistration(registration);
+        evaluated += 1;
+      } catch (error) {
+        failed += 1;
+        logRuntimeEvent(
+          "error",
+          "runtime.realtime_registration_re_evaluation_failed",
+          {
+            errorName: error instanceof Error ? error.name : typeof error,
+            queryName: registration.queryName,
+            subscriptionId: registration.subscriptionId,
+          }
+        );
+      }
     }
+
+    return { evaluated, failed };
   }
 
   private async reEvaluateRegistration(
     registration: StoredRealtimeRegistration
   ): Promise<void> {
-    const runtime = configuredRealtimeRuntime;
+    const runtime = configuredRealtimeRuntimes.get(registration.runtimeId);
     if (!runtime) {
       throw new InternalRuntimeError(
         "Baseflare runtime misconfiguration: realtime query runtime is not configured"

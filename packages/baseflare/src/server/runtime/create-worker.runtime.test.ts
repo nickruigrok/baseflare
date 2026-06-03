@@ -30,8 +30,10 @@ import { defineRules } from "../permissions/define-rules";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
 import { createWorker } from "./create-worker";
+import { createFunctionIndex } from "./function-index";
 import { buildBaseflareManifest } from "./manifest";
 import {
+  configureRealtimeRuntime,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
   RealtimeConnectionDO,
@@ -724,6 +726,16 @@ function createManifest(
 
 const worker = createWorker(createManifest());
 
+function createRealtimeRuntimeId(
+  manifest: BaseflareManifest = createManifest()
+): string {
+  return configureRealtimeRuntime({
+    functionIndex: createFunctionIndex(manifest),
+    rules: manifest.rules,
+    schema: manifest.schema,
+  });
+}
+
 async function invoke(
   path: string,
   init: RequestInit = {},
@@ -886,7 +898,8 @@ describe("worker runtime", () => {
       "SELECT name FROM sqlite_master WHERE type = 'index' AND name = '_bf_realtime_outbox_created_at'"
     ).first<{ name: string }>();
 
-    expect(outbox?.sql).toContain("event_id TEXT PRIMARY KEY");
+    expect(outbox?.sql).toContain("sequence INTEGER PRIMARY KEY AUTOINCREMENT");
+    expect(outbox?.sql).toContain("event_id TEXT NOT NULL UNIQUE");
     expect(outbox?.sql).toContain("partitions TEXT NOT NULL");
     expect(createdAtIndex?.name).toBe("_bf_realtime_outbox_created_at");
   });
@@ -911,6 +924,18 @@ describe("worker runtime", () => {
     expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
       "/api/subscribe"
     );
+  });
+
+  it("keeps future realtime connection shard routing deterministic and bounded", () => {
+    const shardCount = 32;
+    const first = getRealtimeConnectionShardName("client-a", shardCount);
+    const second = getRealtimeConnectionShardName("client-a", shardCount);
+    const shardNumber = Number(first.split(":").at(1));
+
+    expect(first).toBe(second);
+    expect(first).toMatch(/^connection:\d+$/);
+    expect(shardNumber).toBeGreaterThanOrEqual(0);
+    expect(shardNumber).toBeLessThan(shardCount);
   });
 
   it("delivers realtime messages only to sockets for the target connection key", async () => {
@@ -996,6 +1021,88 @@ describe("worker runtime", () => {
     expect(missingBody.delivered).toBe(0);
   });
 
+  it("keeps realtime registration failures from blocking other subscribers", async () => {
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveries.push(await request.json());
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string, queryName: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName,
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await register("sub-bad", "todos:renamed");
+    await register("sub-good", "todos:list");
+    await createTodoViaRpc("owner-a", "still-delivered");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "event-1" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({ evaluated: 1, failed: 1, ok: true });
+    expect(deliveries).toHaveLength(1);
+    expect(
+      (
+        deliveries[0] as {
+          result: Array<{ text: string }>;
+          subscriptionId: string;
+        }
+      ).subscriptionId
+    ).toBe("sub-good");
+    expect(
+      (
+        deliveries[0] as {
+          result: Array<{ text: string }>;
+          subscriptionId: string;
+        }
+      ).result.map((todo) => todo.text)
+    ).toEqual(["still-delivered"]);
+    expect(errorSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_re_evaluation_failed",
+        queryName: "todos:renamed",
+        subscriptionId: "sub-bad",
+      })
+    );
+  });
+
   it("writes realtime outbox events and notifies subscription DOs after mutations", async () => {
     const subscriptions = new FakeDurableObjectNamespace();
     const response = await invoke(
@@ -1010,14 +1117,16 @@ describe("worker runtime", () => {
     );
     await new Promise((resolve) => setTimeout(resolve, 0));
     const row = await env.APP_DB.prepare(
-      "SELECT event_id, tables, partitions FROM _bf_realtime_outbox ORDER BY event_id DESC LIMIT 1"
+      "SELECT sequence, event_id, tables, partitions FROM _bf_realtime_outbox ORDER BY sequence DESC LIMIT 1"
     ).first<{
       event_id: string;
       partitions: string;
+      sequence: number;
       tables: string;
     }>();
 
     expect(response.status).toBe(200);
+    expect(row?.sequence).toBeTypeOf("number");
     expect(row?.event_id).toBeTypeOf("string");
     expect(JSON.parse(row?.tables ?? "[]")).toEqual(["todos"]);
     expect(JSON.parse(row?.partitions ?? "[]")).toEqual([
@@ -1054,21 +1163,108 @@ describe("worker runtime", () => {
     });
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/catch-up", {
-        body: JSON.stringify({ afterEventId: null, limit: 10 }),
+        body: JSON.stringify({ afterSequence: null, limit: 10 }),
         headers: { "content-type": "application/json" },
         method: "POST",
       })
     );
     const body = (await response.json()) as {
-      events: Array<{ tables: string[] }>;
+      events: Array<{ sequence: number; tables: string[] }>;
     };
 
     expect(response.status).toBe(200);
     expect(body.events).toHaveLength(1);
+    expect(body.events[0]?.sequence).toBeTypeOf("number");
     expect(body.events[0]?.tables).toEqual(["todos"]);
   });
 
+  it("uses realtime outbox sequence instead of event id for catch-up", async () => {
+    await env.APP_DB.batch([
+      env.APP_DB.prepare(
+        "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+      ).bind("z-event", 1, JSON.stringify(["todos"]), JSON.stringify([])),
+      env.APP_DB.prepare(
+        "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+      ).bind("a-event", 2, JSON.stringify(["labels"]), JSON.stringify([])),
+    ]);
+    const firstRow = await env.APP_DB.prepare(
+      "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("z-event")
+      .first<{ sequence: number }>();
+    const secondRow = await env.APP_DB.prepare(
+      "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("a-event")
+      .first<{ sequence: number }>();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: firstRow?.sequence, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      events: Array<{ eventId: string; sequence: number; tables: string[] }>;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.events).toEqual([
+      {
+        eventId: "a-event",
+        partitions: [],
+        sequence: secondRow?.sequence,
+        tables: ["labels"],
+      },
+    ]);
+  });
+
+  it("advances realtime notify cursors by outbox sequence", async () => {
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+    )
+      .bind("notify-event", 1, JSON.stringify(["todos"]), JSON.stringify([]))
+      .run();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "notify-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const body = (await registrationsResponse.json()) as {
+      lastSeenSequence: number | null;
+    };
+    const row = await env.APP_DB.prepare(
+      "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("notify-event")
+      .first<{ sequence: number }>();
+
+    expect(response.status).toBe(200);
+    expect(body.lastSeenSequence).toBe(row?.sequence);
+  });
+
   it("ignores stale realtime registration epochs and expires old leases", async () => {
+    const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
@@ -1088,6 +1284,7 @@ describe("worker runtime", () => {
             epoch,
             leaseExpiresAt,
             queryName,
+            runtimeId,
             subscriptionId: "sub-1",
           }),
           headers: { "content-type": "application/json" },
@@ -1125,7 +1322,86 @@ describe("worker runtime", () => {
     expect(body.registrations).toEqual([]);
   });
 
+  it("scopes identical subscription ids by connection key", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (connectionKey: string, queryName: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: {},
+            connectionKey,
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName,
+            runtimeId,
+            subscriptionId: "sub-1",
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await register("client-a", "todos:a");
+    await register("client-b", "todos:b");
+
+    let response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    let body = (await response.json()) as {
+      registrations: Array<{ connectionKey: string; queryName: string }>;
+    };
+
+    expect(
+      body.registrations.map((registration) => [
+        registration.connectionKey,
+        registration.queryName,
+      ])
+    ).toEqual([
+      ["client-a", "todos:a"],
+      ["client-b", "todos:b"],
+    ]);
+
+    response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/unregister", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    expect(response.status).toBe(200);
+
+    response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    body = (await response.json()) as {
+      registrations: Array<{ connectionKey: string; queryName: string }>;
+    };
+
+    expect(
+      body.registrations.map((registration) => [
+        registration.connectionKey,
+        registration.queryName,
+      ])
+    ).toEqual([["client-b", "todos:b"]]);
+  });
+
   it("re-evaluates registered realtime queries and delivers changed results", async () => {
+    const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
@@ -1148,6 +1424,7 @@ describe("worker runtime", () => {
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
           queryName: "todos:list",
+          runtimeId,
           subscriptionId: "sub-1",
         }),
         headers: { "content-type": "application/json" },
@@ -1196,6 +1473,66 @@ describe("worker runtime", () => {
         }
       ).result.map((todo) => todo.text)
     ).toEqual(["delivered"]);
+  });
+
+  it("keeps realtime registrations bound to their original worker runtime", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveries.push(await request.json());
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    createWorker(createManifest({ queries: [] }));
+    await createTodoViaRpc("owner-a", "original-runtime");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "event-1" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(deliveries).toHaveLength(1);
+    expect(
+      (
+        deliveries[0] as {
+          result: Array<{ text: string }>;
+        }
+      ).result.map((todo) => todo.text)
+    ).toEqual(["original-runtime"]);
   });
 
   it("keeps schema application deploy-owned", async () => {

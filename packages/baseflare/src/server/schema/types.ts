@@ -168,7 +168,7 @@ export function createPartitionVersionStatements(): SqlStatement[] {
 export function createRealtimeOutboxStatements(): SqlStatement[] {
   return [
     {
-      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME} (event_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, tables TEXT NOT NULL, partitions TEXT NOT NULL)`,
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME} (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, tables TEXT NOT NULL, partitions TEXT NOT NULL)`,
       params: [],
     },
     {

@@ -248,7 +248,8 @@ async function routeRequest(
   env: BaseflareRuntimeEnv,
   ctx: BaseflareExecutionContext,
   manifest: BaseflareManifest,
-  functionIndex: ReturnType<typeof createFunctionIndex>
+  functionIndex: ReturnType<typeof createFunctionIndex>,
+  realtimeRuntimeId: string
 ): Promise<Response> {
   let url: URL;
   try {
@@ -258,7 +259,7 @@ async function routeRequest(
   }
 
   return (
-    (await routeRealtimeSubscribe(request, env)) ??
+    (await routeRealtimeSubscribe(request, env, realtimeRuntimeId)) ??
     (await handleQueryRequest(
       request,
       url,
@@ -308,7 +309,7 @@ export function createWorker<
   TEnv extends BaseflareRuntimeEnv = BaseflareRuntimeEnv,
 >(manifest: BaseflareManifest): ExportedHandler<TEnv> {
   const functionIndex = createFunctionIndex(manifest);
-  configureRealtimeRuntime({
+  const realtimeRuntimeId = configureRealtimeRuntime({
     functionIndex,
     rules: manifest.rules,
     schema: manifest.schema,
@@ -317,7 +318,14 @@ export function createWorker<
   return {
     async fetch(request, env, ctx) {
       try {
-        return await routeRequest(request, env, ctx, manifest, functionIndex);
+        return await routeRequest(
+          request,
+          env,
+          ctx,
+          manifest,
+          functionIndex,
+          realtimeRuntimeId
+        );
       } catch (error) {
         if (
           !(

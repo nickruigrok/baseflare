@@ -841,6 +841,14 @@ not configure shards in v1. Live shard-count autoscaling/resharding is future
 enterprise work. **Open Phase 3 decision:** default production count, `N=1` vs
 `N=32`, decided by hibernation/performance tests.
 
+Future managed autoscaling should keep raw shard counts internal. Once shard
+generations, reconnect/drain behavior, outbox catch-up, and load metrics exist,
+Baseflare can observe realtime DO pressure and increase shard counts
+geometrically (`1 -> 2 -> 4 -> 8 -> ...`). Old generations should drain through
+client reconnects and registration leases, while new subscription DOs catch up
+from `_bf_realtime_outbox`. Downscaling should be conservative and only happen
+after sustained low load.
+
 **Subscription tracking:**
 - Each subscription is: `{ subscriptionId, clientId, queryName, queryArgs, lastDeliveredVersion, tableDependencies, partitionDependencies }`
 - `RealtimeSubscriptionDO` maintains table/partition dependency indexes for affected subscription lookup.
