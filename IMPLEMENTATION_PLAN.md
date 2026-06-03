@@ -865,9 +865,9 @@ after sustained low load.
 6. Subscription DOs re-run affected queries against D1 with tracking enabled and compare monotonic table/partition versions before re-querying when possible.
 7. Changed results are batched per `RealtimeConnectionDO`; connection DOs deliver to clients via WebSocket.
 
-The foundation slice re-evaluates active registrations on notify/catch-up, then the dependency-aware invalidation slice narrows that work to registrations whose tracked table/partition dependencies match the outbox event. Sharded subscription routing, reconnect reconciliation, batching, and backpressure remain later Phase 3 work.
+The foundation slice re-evaluates active registrations on notify/catch-up, the dependency-aware invalidation slice narrows that work to registrations whose tracked table/partition dependencies match the outbox event, and reconnect restore now uses the client's last delivered outbox sequence to trigger catch-up before reporting restore completion. Sharded subscription routing, batching, backpressure, periodic reconciliation, and client-side sequence persistence remain later Phase 3 work.
 
-**Recovery model:** Worker-to-subscription notification is recovered by D1 outbox catch-up. Subscription-to-connection delivery is recovered by connection reconciliation. Connection DOs track last delivered table/partition versions per subscription and reconcile before re-querying. **Open Phase 3 decision:** live periodic reconciliation interval, balancing worst-case staleness against idle DO hibernation.
+**Recovery model:** Worker-to-subscription notification is recovered by D1 outbox catch-up. Reconnect-triggered recovery is implemented by carrying the last delivered outbox sequence in delivery messages and running subscription DO catch-up during restore. Live periodic reconciliation, connection hibernation behavior, and client SDK sequence persistence remain later Phase 3 work. **Open Phase 3 decision:** live periodic reconciliation interval, balancing worst-case staleness against idle DO hibernation.
 
 **Registration lifecycle:** Connection-to-subscription registrations use leases and epochs. Subscription DOs expire stale registrations and ignore old epochs so restarted/evicted connection DOs do not leave phantom delivery targets.
 
@@ -880,7 +880,8 @@ The foundation slice re-evaluates active registrations on notify/catch-up, then 
    - Holds WebSocket connections via Hibernation API
    - Tracks client/session delivery state
    - Registers subscriptions with `RealtimeSubscriptionDO`
-   - Reconciles subscriptions on reconnect and periodic checks
+   - Reconciles subscriptions on reconnect through outbox-sequence catch-up
+   - Periodic checks remain later Phase 3 work
 2. `RealtimeSubscriptionDO` Durable Object class:
    - Tracks subscriptions with table/partition dependency indexes
    - Handles outbox catch-up and `notify(eventId)`
@@ -920,9 +921,9 @@ The foundation slice re-evaluates active registrations on notify/catch-up, then 
   - broad queries receive writes from all partitions
 - Recovery:
   - missed Worker-to-subscription notify recovers from outbox
-  - missed subscription-to-connection delivery recovers through connection reconciliation
-  - reconnect with no version gap avoids D1 re-query
-  - reconnect with version gap re-evaluates and delivers current data
+  - reconnect restore with a current outbox sequence avoids unnecessary re-evaluation
+  - reconnect restore with a stale outbox sequence catches up and delivers current data
+  - missed subscription-to-connection delivery recovers through reconnect-triggered catch-up; live periodic reconciliation remains later work
   - expired connection leases and stale epochs stop phantom deliveries
 - Performance:
   - compare idle cost/hibernation for `N=1` vs `N=32`

@@ -38,6 +38,10 @@ export interface RealtimeOutboxEvent {
   readonly tables: readonly string[];
 }
 
+interface RealtimeSequencedOutboxEvent extends RealtimeOutboxEvent {
+  readonly sequence: number;
+}
+
 export interface RealtimeMutationNotifier {
   readonly enabled: true;
   notify(events: readonly RealtimeOutboxEvent[]): void;
@@ -91,6 +95,7 @@ interface RealtimeDependencySet {
 interface RealtimeAffectedTargets {
   readonly broadTables: ReadonlySet<string>;
   readonly partitions: ReadonlySet<string>;
+  readonly sequence: number | null;
   readonly tables: ReadonlySet<string>;
 }
 
@@ -175,6 +180,20 @@ function getEpoch(value: unknown): number {
   return value;
 }
 
+function getOptionalSequence(value: unknown, fieldName: string): number | null {
+  if (value === undefined || value === null) {
+    return null;
+  }
+
+  if (!Number.isSafeInteger(value) || (value as number) < 0) {
+    throw new ValidationRuntimeError(
+      `Realtime field "${fieldName}" must be a non-negative integer or null`
+    );
+  }
+
+  return value as number;
+}
+
 function resolveRealtimeConnectionKey(url: URL): string {
   return (
     url.searchParams.get("clientId") ??
@@ -210,13 +229,15 @@ function createRealtimeDependencySet(): {
 }
 
 function createRealtimeAffectedTargets(
-  events: readonly RealtimeOutboxEvent[]
+  events: readonly RealtimeSequencedOutboxEvent[]
 ): RealtimeAffectedTargets {
   const broadTables = new Set<string>();
   const partitions = new Set<string>();
   const tables = new Set<string>();
+  let sequence: number | null = null;
 
   for (const event of events) {
+    sequence = Math.max(sequence ?? 0, event.sequence);
     const partitionTables = new Set<string>();
     for (const partition of event.partitions) {
       partitions.add(partitionTargetId(partition));
@@ -231,7 +252,7 @@ function createRealtimeAffectedTargets(
     }
   }
 
-  return { broadTables, partitions, tables };
+  return { broadTables, partitions, sequence, tables };
 }
 
 function getPartitionDependencyTable(partitionId: string): string | undefined {
@@ -695,7 +716,11 @@ export class RealtimeConnectionDO {
         };
       })
     );
-    const failed = results.flatMap((result, index) => {
+    const failed: Array<{
+      error: string;
+      index: number;
+      subscriptionId?: string;
+    }> = results.flatMap((result, index) => {
       if (result.status === "fulfilled") {
         return [];
       }
@@ -719,7 +744,38 @@ export class RealtimeConnectionDO {
         },
       ];
     });
-    socket.send(JSON.stringify({ failed, type: "restored" }));
+    let reconciled = false;
+    try {
+      const catchUpResponse = await this.subscriptionStub().fetch(
+        "https://baseflare.internal/catch-up",
+        {
+          body: JSON.stringify({
+            afterSequence: getOptionalSequence(
+              message.afterSequence,
+              "afterSequence"
+            ),
+          }),
+          headers: JSON_HEADERS,
+          method: "POST",
+        }
+      );
+      if (!catchUpResponse.ok) {
+        throw new InternalRuntimeError(
+          `Realtime restore catch-up failed with status ${catchUpResponse.status}`
+        );
+      }
+      reconciled = true;
+    } catch (error) {
+      failed.push({
+        error:
+          error instanceof Error
+            ? error.message
+            : "Realtime restore catch-up failed",
+        index: -1,
+      });
+    }
+
+    socket.send(JSON.stringify({ failed, reconciled, type: "restored" }));
   }
 
   private createRegistration(
@@ -875,8 +931,10 @@ export class RealtimeSubscriptionDO {
 
     if (url.pathname === "/catch-up") {
       const body = await readJsonObject(request);
-      const afterSequence =
-        typeof body.afterSequence === "number" ? body.afterSequence : null;
+      const afterSequence = getOptionalSequence(
+        body.afterSequence,
+        "afterSequence"
+      );
       const events = await fetchRealtimeOutboxEvents(
         this.database,
         afterSequence,
@@ -962,7 +1020,7 @@ export class RealtimeSubscriptionDO {
 
       this.reEvaluatingRegistrations.add(registrationKey);
       try {
-        await this.reEvaluateRegistration(registration);
+        await this.reEvaluateRegistration(registration, targets.sequence);
         evaluated += 1;
       } catch (error) {
         failed += 1;
@@ -1005,7 +1063,8 @@ export class RealtimeSubscriptionDO {
   }
 
   private async reEvaluateRegistration(
-    registration: StoredRealtimeRegistration
+    registration: StoredRealtimeRegistration,
+    sequence: number | null
   ): Promise<void> {
     const runtime = configuredRealtimeRuntimes.get(registration.runtimeId);
     if (!runtime) {
@@ -1060,6 +1119,7 @@ export class RealtimeSubscriptionDO {
       body: JSON.stringify({
         connectionKey: registration.connectionKey,
         result,
+        sequence,
         subscriptionId: registration.subscriptionId,
       }),
       headers: JSON_HEADERS,

@@ -1115,6 +1115,7 @@ describe("worker runtime", () => {
         body: JSON.stringify({
           connectionKey: "client-a",
           result: [{ text: "only-a" }],
+          sequence: 123,
           subscriptionId: "sub-a",
         }),
         headers: { "content-type": "application/json" },
@@ -1129,6 +1130,7 @@ describe("worker runtime", () => {
       {
         message: {
           result: [{ text: "only-a" }],
+          sequence: 123,
           subscriptionId: "sub-a",
         },
         type: "delivery",
@@ -1394,6 +1396,15 @@ describe("worker runtime", () => {
     const registerRequests: unknown[] = [];
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
+        if (new URL(request.url).pathname === "/catch-up") {
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+
         activeRegistrations += 1;
         maxActiveRegistrations = Math.max(
           maxActiveRegistrations,
@@ -1459,13 +1470,26 @@ describe("worker runtime", () => {
       "subscribed",
       "subscribed",
     ]);
-    expect(messages.at(-1)).toEqual({ failed: [], type: "restored" });
+    expect(messages.at(-1)).toEqual({
+      failed: [],
+      reconciled: true,
+      type: "restored",
+    });
   });
 
   it("reports partial realtime restore failures after successful registrations", async () => {
     const registerRequests: unknown[] = [];
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
+        if (new URL(request.url).pathname === "/catch-up") {
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+
         registerRequests.push(await request.json());
         return Response.json({ ok: true });
       }
@@ -1488,6 +1512,7 @@ describe("worker runtime", () => {
       .webSocket as WebSocket & { accept?: () => void };
     const messages: Array<{
       failed?: Array<{ error: string; index: number; subscriptionId?: string }>;
+      reconciled?: boolean;
       subscriptionId?: string;
       type: string;
     }> = [];
@@ -1500,6 +1525,7 @@ describe("worker runtime", () => {
             index: number;
             subscriptionId?: string;
           }>;
+          reconciled?: boolean;
           subscriptionId?: string;
           type: string;
         }
@@ -1541,6 +1567,7 @@ describe("worker runtime", () => {
           subscriptionId: "sub-bad",
         },
       ],
+      reconciled: true,
       type: "restored",
     });
   });
@@ -1548,6 +1575,15 @@ describe("worker runtime", () => {
   it("reports realtime restore failures when registration returns an error response", async () => {
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
+        if (new URL(request.url).pathname === "/catch-up") {
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+
         const registration = (await request.json()) as {
           subscriptionId: string;
         };
@@ -1575,6 +1611,7 @@ describe("worker runtime", () => {
       .webSocket as WebSocket & { accept?: () => void };
     const messages: Array<{
       failed?: Array<{ error: string; index: number; subscriptionId?: string }>;
+      reconciled?: boolean;
       subscriptionId?: string;
       type: string;
     }> = [];
@@ -1587,6 +1624,7 @@ describe("worker runtime", () => {
             index: number;
             subscriptionId?: string;
           }>;
+          reconciled?: boolean;
           subscriptionId?: string;
           type: string;
         }
@@ -1626,6 +1664,322 @@ describe("worker runtime", () => {
             subscriptionId: "sub-bad",
           },
         ],
+        reconciled: true,
+        type: "restored",
+      },
+    ]);
+  });
+
+  it("runs realtime restore catch-up from the supplied outbox sequence", async () => {
+    let catchUpBody: { afterSequence: number | null } | undefined;
+    const catchUpResponse = createDeferred<Response>();
+    const subscriptionDo = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/catch-up") {
+          catchUpBody = (await request.json()) as {
+            afterSequence: number | null;
+          };
+          return await catchUpResponse.promise;
+        }
+
+        return Response.json({ ok: true });
+      }
+    );
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ reconciled?: boolean; type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as { reconciled?: boolean; type: string }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        afterSequence: 42,
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+          },
+        ],
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(catchUpBody).toEqual({ afterSequence: 42 });
+    expect(messages).toEqual([{ subscriptionId: "sub-a", type: "subscribed" }]);
+
+    catchUpResponse.resolve(
+      Response.json({ evaluated: 0, events: [], failed: 0, ok: true })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages.at(-1)).toEqual({
+      failed: [],
+      reconciled: true,
+      type: "restored",
+    });
+  });
+
+  it("uses conservative realtime catch-up when restore has no sequence", async () => {
+    let catchUpBody: { afterSequence: number | null } | undefined;
+    const subscriptionDo = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/catch-up") {
+          catchUpBody = (await request.json()) as {
+            afterSequence: number | null;
+          };
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+
+        return Response.json({ ok: true });
+      }
+    );
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(JSON.parse(String(event.data)) as { type: string });
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+          },
+        ],
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(catchUpBody).toEqual({ afterSequence: null });
+    expect(messages.at(-1)).toEqual({
+      failed: [],
+      reconciled: true,
+      type: "restored",
+    });
+  });
+
+  it("delivers current realtime results during restore catch-up from a stale sequence", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    let connectionDo!: RealtimeConnectionDO;
+    let subscriptionDo!: RealtimeSubscriptionDO;
+    const connections = new FakeDurableObjectNamespace((_name, request) =>
+      connectionDo.fetch(request)
+    );
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) =>
+      subscriptionDo.fetch(request)
+    );
+    connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await createTodoViaRpc("owner-a", "restore-catch-up");
+    await createRealtimeOutboxEvent("restore-stale-event", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    const sequence = await getRealtimeOutboxSequence("restore-stale-event");
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": runtimeId,
+          },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{
+      message?: {
+        result: Array<{ text: string }>;
+        sequence: number | null;
+        subscriptionId: string;
+      };
+      reconciled?: boolean;
+      subscriptionId?: string;
+      type: string;
+    }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          message?: {
+            result: Array<{ text: string }>;
+            sequence: number | null;
+            subscriptionId: string;
+          };
+          reconciled?: boolean;
+          subscriptionId?: string;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        afterSequence: 0,
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+          },
+        ],
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 30 && messages.length < 3; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages).toEqual([
+      { subscriptionId: "sub-a", type: "subscribed" },
+      {
+        message: {
+          result: expect.arrayContaining([
+            expect.objectContaining({ text: "restore-catch-up" }),
+          ]),
+          sequence,
+          subscriptionId: "sub-a",
+        },
+        type: "delivery",
+      },
+      { failed: [], reconciled: true, type: "restored" },
+    ]);
+  });
+
+  it("reports realtime restore catch-up failures in the restored payload", async () => {
+    const subscriptionDo = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname === "/catch-up") {
+        return Promise.resolve(Response.json({ ok: false }, { status: 500 }));
+      }
+
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{
+      failed?: Array<{ error: string; index: number }>;
+      subscriptionId?: string;
+      reconciled?: boolean;
+      type: string;
+    }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          failed?: Array<{ error: string; index: number }>;
+          subscriptionId?: string;
+          reconciled?: boolean;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+          },
+        ],
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages).toEqual([
+      { subscriptionId: "sub-a", type: "subscribed" },
+      {
+        failed: [
+          {
+            error: "Realtime restore catch-up failed with status 500",
+            index: -1,
+          },
+        ],
+        reconciled: false,
         type: "restored",
       },
     ]);
@@ -1818,6 +2172,7 @@ describe("worker runtime", () => {
     await register("sub-good", "todos:list");
     await createTodoViaRpc("owner-a", "still-delivered");
     await createRealtimeOutboxEvent("event-1");
+    const sequence = await getRealtimeOutboxSequence("event-1");
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {
@@ -1839,10 +2194,18 @@ describe("worker runtime", () => {
       (
         deliveries[0] as {
           result: Array<{ text: string }>;
+          sequence: number | null;
           subscriptionId: string;
         }
       ).subscriptionId
     ).toBe("sub-good");
+    expect(
+      (
+        deliveries[0] as {
+          sequence: number | null;
+        }
+      ).sequence
+    ).toBe(sequence);
     expect(
       (
         deliveries[0] as {
@@ -2174,6 +2537,13 @@ describe("worker runtime", () => {
       expect.objectContaining({ evaluated: 1, failed: 1, ok: true })
     );
     expect(deliveries).toHaveLength(1);
+    expect(
+      (
+        deliveries[0] as {
+          sequence: number | null;
+        }
+      ).sequence
+    ).toBe(body.events[0]?.sequence);
     expect(
       (
         deliveries[0] as {
