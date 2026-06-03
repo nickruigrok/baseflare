@@ -92,6 +92,11 @@ export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
   return runtimeId;
 }
 
+export function resetRealtimeRuntimeStateForTest(): void {
+  configuredRealtimeRuntimes.clear();
+  nextRealtimeRuntimeId = 0;
+}
+
 function jsonResponse(value: unknown, init: ResponseInit = {}): Response {
   return Response.json(value, {
     ...init,
@@ -812,7 +817,6 @@ export class RealtimeSubscriptionDO {
       return;
     }
 
-    registration.lastResultJson = resultJson;
     await this.env.REALTIME_CONNECTIONS.get(
       this.env.REALTIME_CONNECTIONS.idFromName(registration.connectionName)
     ).fetch("https://baseflare.internal/deliver", {
@@ -824,5 +828,6 @@ export class RealtimeSubscriptionDO {
       headers: JSON_HEADERS,
       method: "POST",
     });
+    registration.lastResultJson = resultJson;
   }
 }

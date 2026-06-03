@@ -38,6 +38,7 @@ import {
   getRealtimeSubscriptionShardName,
   RealtimeConnectionDO,
   RealtimeSubscriptionDO,
+  resetRealtimeRuntimeStateForTest,
 } from "./realtime";
 import { applyRuntimeSchema } from "./schema-apply";
 import type {
@@ -846,6 +847,7 @@ describe("worker runtime", () => {
   });
 
   beforeEach(async () => {
+    resetRealtimeRuntimeStateForTest();
     exhaustedConflictAttempts = 0;
     multiTableConflictAttempts = 0;
     rowConflictAttempts = 0;
@@ -870,6 +872,7 @@ describe("worker runtime", () => {
   });
 
   afterEach(() => {
+    resetRealtimeRuntimeStateForTest();
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -1473,6 +1476,92 @@ describe("worker runtime", () => {
         }
       ).result.map((todo) => todo.text)
     ).toEqual(["delivered"]);
+  });
+
+  it("retries unchanged realtime results after a failed delivery", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    let deliveryAttempts = 0;
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveryAttempts += 1;
+        if (deliveryAttempts === 1) {
+          throw new Error("Transient delivery failure");
+        }
+
+        deliveries.push(await request.json());
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "retry-delivery");
+
+    const notify = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId: "event-1" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    const failedResponse = await notify();
+    const failedBody = (await failedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(deliveries).toHaveLength(0);
+
+    const retriedResponse = await notify();
+    const retriedBody = (await retriedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(retriedBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(deliveries).toHaveLength(1);
+    expect(
+      (
+        deliveries[0] as {
+          result: Array<{ text: string }>;
+        }
+      ).result.map((todo) => todo.text)
+    ).toEqual(["retry-delivery"]);
+
+    const duplicateResponse = await notify();
+    const duplicateBody = (await duplicateResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(duplicateBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(deliveries).toHaveLength(1);
   });
 
   it("keeps realtime registrations bound to their original worker runtime", async () => {
