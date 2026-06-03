@@ -43,6 +43,7 @@
     "format": [
       "esm"
     ],
+    "minify": "dce-only",
     "sourcemap": false,
     "target": "es2022"
   }

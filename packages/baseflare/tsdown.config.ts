@@ -15,6 +15,9 @@ export default defineConfig({
   },
   fixedExtension: false,
   minify: "dce-only",
+  outputOptions: {
+    codeSplitting: true,
+  },
   sourcemap: false,
   target: "es2022",
 });
