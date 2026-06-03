@@ -1331,6 +1331,59 @@ describe("worker runtime", () => {
     ]);
   });
 
+  it("does not confirm realtime unsubscribe after unregister errors", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ ok: false }, { status: 500 }))
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{
+      error?: string;
+      subscriptionId?: string;
+      type: string;
+    }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          error?: string;
+          subscriptionId?: string;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptionId: "sub-failed",
+        type: "unsubscribe",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages).toEqual([
+      {
+        error: "Realtime subscription unregister failed with status 500",
+        type: "error",
+      },
+    ]);
+  });
+
   it("keeps malformed realtime restore envelopes on the socket error path", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -2145,6 +2198,93 @@ describe("worker runtime", () => {
         }
       ).result.map((todo) => todo.text)
     ).toEqual(["retry-delivery"]);
+
+    const duplicateResponse = await notify();
+    const duplicateBody = (await duplicateResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(duplicateBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(deliveries).toHaveLength(1);
+  });
+
+  it("retries unchanged realtime results after a non-ok delivery response", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    let deliveryAttempts = 0;
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveryAttempts += 1;
+        if (deliveryAttempts === 1) {
+          return Response.json({ ok: false }, { status: 500 });
+        }
+
+        deliveries.push(await request.json());
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "retry-non-ok-delivery");
+    await createRealtimeOutboxEvent("event-1");
+
+    const notify = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId: "event-1" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    const failedResponse = await notify();
+    const failedBody = (await failedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(deliveries).toHaveLength(0);
+
+    const retriedResponse = await notify();
+    const retriedBody = (await retriedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(retriedBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(deliveries).toHaveLength(1);
+    expect(
+      (
+        deliveries[0] as {
+          result: Array<{ text: string }>;
+        }
+      ).result.map((todo) => todo.text)
+    ).toEqual(["retry-non-ok-delivery"]);
 
     const duplicateResponse = await notify();
     const duplicateBody = (await duplicateResponse.json()) as {

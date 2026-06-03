@@ -525,7 +525,7 @@ export class RealtimeConnectionDO {
   ): Promise<void> {
     const subscriptionId = getStringField(message, "subscriptionId");
     const connectionKey = this.socketConnectionKeys.get(socket) ?? "default";
-    await this.subscriptionStub().fetch(
+    const unregisterResponse = await this.subscriptionStub().fetch(
       "https://baseflare.internal/unregister",
       {
         body: JSON.stringify({ connectionKey, subscriptionId }),
@@ -533,6 +533,12 @@ export class RealtimeConnectionDO {
         method: "POST",
       }
     );
+    if (!unregisterResponse.ok) {
+      throw new InternalRuntimeError(
+        `Realtime subscription unregister failed with status ${unregisterResponse.status}`
+      );
+    }
+
     socket.send(JSON.stringify({ subscriptionId, type: "unsubscribed" }));
   }
 
@@ -870,7 +876,7 @@ export class RealtimeSubscriptionDO {
       return;
     }
 
-    await this.env.REALTIME_CONNECTIONS.get(
+    const deliveryResponse = await this.env.REALTIME_CONNECTIONS.get(
       this.env.REALTIME_CONNECTIONS.idFromName(registration.connectionName)
     ).fetch("https://baseflare.internal/deliver", {
       body: JSON.stringify({
@@ -881,6 +887,12 @@ export class RealtimeSubscriptionDO {
       headers: JSON_HEADERS,
       method: "POST",
     });
+    if (!deliveryResponse.ok) {
+      throw new InternalRuntimeError(
+        `Realtime delivery failed with status ${deliveryResponse.status}`
+      );
+    }
+
     registration.lastResultJson = resultJson;
   }
 }
