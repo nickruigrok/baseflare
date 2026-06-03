@@ -60,6 +60,10 @@ export { defineRules } from "./permissions/define-rules";
 export { evaluateRules } from "./permissions/evaluate-rules";
 export type { RuleOperation, Rules, TableRules } from "./permissions/types";
 export { createWorker } from "./runtime/create-worker";
+export {
+  RealtimeConnectionDO,
+  RealtimeSubscriptionDO,
+} from "./runtime/realtime";
 export type {
   BaseflareExecutionContext,
   BaseflareFunctionEntry,

@@ -21,6 +21,11 @@ import {
 } from "./execution";
 import { createFunctionIndex } from "./function-index";
 import { getRequestLogFields, logRuntimeEvent } from "./logging";
+import {
+  configureRealtimeRuntime,
+  createRealtimeMutationNotifier,
+  routeRealtimeSubscribe,
+} from "./realtime";
 import { readRequestBodyText } from "./request-body";
 import type {
   BaseflareExecutionContext,
@@ -110,6 +115,7 @@ function createInvocationOptions(
     executionContext: ctx,
     functionIndex,
     requestHeaders: request.headers,
+    realtime: createRealtimeMutationNotifier(env, ctx),
     rules: manifest.rules,
     schema: manifest.schema,
   };
@@ -252,6 +258,7 @@ async function routeRequest(
   }
 
   return (
+    (await routeRealtimeSubscribe(request, env)) ??
     (await handleQueryRequest(
       request,
       url,
@@ -301,6 +308,11 @@ export function createWorker<
   TEnv extends BaseflareRuntimeEnv = BaseflareRuntimeEnv,
 >(manifest: BaseflareManifest): ExportedHandler<TEnv> {
   const functionIndex = createFunctionIndex(manifest);
+  configureRealtimeRuntime({
+    functionIndex,
+    rules: manifest.rules,
+    schema: manifest.schema,
+  });
 
   return {
     async fetch(request, env, ctx) {

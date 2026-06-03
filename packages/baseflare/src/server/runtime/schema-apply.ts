@@ -2,6 +2,7 @@ import { assertTableIdentifier } from "../db/query-builder";
 import {
   createIndexStatement,
   createPartitionVersionStatements,
+  createRealtimeOutboxStatements,
   createTableVersionStatements,
   type Schema,
   type SqlStatement,
@@ -44,6 +45,7 @@ export async function applyRuntimeSchema(
 
   statements.push(...createTableVersionStatements(tableNames));
   statements.push(...createPartitionVersionStatements());
+  statements.push(...createRealtimeOutboxStatements());
 
   await withDatabaseErrorHandling(
     "Failed to apply runtime schema",

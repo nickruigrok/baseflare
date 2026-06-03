@@ -27,6 +27,7 @@ import {
   createStorageReaderPlaceholder,
   createStorageWriterPlaceholder,
 } from "./placeholders";
+import type { RealtimeMutationNotifier } from "./realtime";
 import type { BaseflareExecutionContext, RuntimeDatabase } from "./types";
 
 interface InvocationOptions {
@@ -34,6 +35,7 @@ interface InvocationOptions {
   readonly executionContext: BaseflareExecutionContext;
   readonly functionIndex: FunctionIndex;
   readonly invocationName?: string;
+  readonly realtime?: RealtimeMutationNotifier;
   readonly requestHeaders: Headers;
   readonly rules?: Rules;
   readonly schema: Schema;
@@ -101,6 +103,7 @@ export function executeMutationDefinition<TResult>(
         database: createMutationDatabaseSession(options.database),
         functionName: options.invocationName,
         getContext: () => ctx,
+        realtime: options.realtime,
         rules: options.rules,
         schema: options.schema,
       });

@@ -66,6 +66,12 @@ import {
   assertReadRulesConfigured,
   canReadDocument,
 } from "./permissions";
+import {
+  createRealtimeOutboxEvent,
+  createRealtimeOutboxOperation,
+  type RealtimeMutationNotifier,
+  type RealtimeOutboxEvent,
+} from "./realtime";
 import type { D1DatabaseSession, D1Result, RuntimeDatabase } from "./types";
 
 type SessionDatabase = Pick<RuntimeDatabase, "batch" | "prepare">;
@@ -131,6 +137,13 @@ type CommitOperation =
       readonly params: readonly (string | number | null)[];
       readonly sql: string;
       readonly type: "assert-partition-versions";
+    }
+  | {
+      readonly event: RealtimeOutboxEvent;
+      readonly expectedChanges: number;
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+      readonly type: "insert-realtime-outbox";
     }
   | {
       readonly expectedChanges: number;
@@ -485,6 +498,7 @@ function requiresChangeCount(
     operation.type === "bump-partition-versions" ||
     operation.type === "bump-table-versions" ||
     operation.type === "delete" ||
+    operation.type === "insert-realtime-outbox" ||
     operation.type === "insert" ||
     operation.type === "update"
   );
@@ -657,6 +671,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   >();
   private readonly rowReadRevisions = new Map<string, Map<string, number>>();
   private readonly rules?: Rules;
+  private readonly realtime?: RealtimeMutationNotifier;
   private readonly schema: Schema;
   private readonly tableReadVersions = new Map<string, number>();
 
@@ -664,12 +679,14 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     database: SessionDatabase;
     functionName?: string;
     getContext: () => MutationCtx;
+    realtime?: RealtimeMutationNotifier;
     rules?: Rules;
     schema: Schema;
   }) {
     this.database = options.database;
     this.functionName = options.functionName;
     this.getContext = options.getContext;
+    this.realtime = options.realtime;
     this.rules = options.rules;
     this.schema = options.schema;
   }
@@ -690,6 +707,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     try {
       const results = await this.database.batch(statements);
       this.validateCommitResults(operations, results);
+      this.notifyRealtimeOutboxEvents(operations);
     } catch (error) {
       if (isRetryableConflict(error)) {
         recordOccConflictRetryMetrics(conflictMetricEvents);
@@ -1083,6 +1101,15 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         operations,
         tableName,
         expectedPreviousChanges
+      );
+    }
+
+    if (this.realtime) {
+      operations.push(
+        createRealtimeOutboxOperation(
+          createRealtimeOutboxEvent(mutatedTables, partitionBumpTargets),
+          expectedPreviousChanges
+        )
       );
     }
 
@@ -1564,6 +1591,19 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         this.validateCommitChangeCount(operation, result.meta?.changes);
       }
     }
+  }
+
+  private notifyRealtimeOutboxEvents(
+    operations: readonly CommitOperation[]
+  ): void {
+    const events = operations.flatMap((operation) =>
+      operation.type === "insert-realtime-outbox" ? [operation.event] : []
+    );
+    if (events.length === 0) {
+      return;
+    }
+
+    this.realtime?.notify(events);
   }
 
   private validateCommitChangeCount(

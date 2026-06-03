@@ -9,6 +9,7 @@ const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 const FILTER_LOGIC_FIELD_NAMES = new Set(["AND", "OR", "NOT"]);
 export const TABLE_VERSION_TABLE_NAME = "_bf_table_versions";
 export const PARTITION_VERSION_TABLE_NAME = "_bf_partition_versions";
+export const REALTIME_OUTBOX_TABLE_NAME = "_bf_realtime_outbox";
 
 export interface TableIndexOptions {
   readonly partition?: boolean;
@@ -159,6 +160,19 @@ export function createPartitionVersionStatements(): SqlStatement[] {
   return [
     {
       sql: `CREATE TABLE IF NOT EXISTS ${PARTITION_VERSION_TABLE_NAME} (table_name TEXT NOT NULL, partition_key TEXT NOT NULL, partition_value TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0), PRIMARY KEY (table_name, partition_key, partition_value))`,
+      params: [],
+    },
+  ];
+}
+
+export function createRealtimeOutboxStatements(): SqlStatement[] {
+  return [
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME} (event_id TEXT PRIMARY KEY, created_at INTEGER NOT NULL, tables TEXT NOT NULL, partitions TEXT NOT NULL)`,
+      params: [],
+    },
+    {
+      sql: `CREATE INDEX IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME}_created_at ON ${REALTIME_OUTBOX_TABLE_NAME} (created_at)`,
       params: [],
     },
   ];
