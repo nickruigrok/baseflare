@@ -865,6 +865,8 @@ after sustained low load.
 6. Subscription DOs re-run affected queries against D1 with tracking enabled and compare monotonic table/partition versions before re-querying when possible.
 7. Changed results are batched per `RealtimeConnectionDO`; connection DOs deliver to clients via WebSocket.
 
+Phase 3A keeps notification handling correct by re-evaluating active registrations on notify/catch-up. Table/partition dependency filtering is the next realtime slice and should share the same partition metadata used by OCC and realtime outbox routing.
+
 **Recovery model:** Worker-to-subscription notification is recovered by D1 outbox catch-up. Subscription-to-connection delivery is recovered by connection reconciliation. Connection DOs track last delivered table/partition versions per subscription and reconcile before re-querying. **Open Phase 3 decision:** live periodic reconciliation interval, balancing worst-case staleness against idle DO hibernation.
 
 **Registration lifecycle:** Connection-to-subscription registrations use leases and epochs. Subscription DOs expire stale registrations and ignore old epochs so restarted/evicted connection DOs do not leave phantom delivery targets.

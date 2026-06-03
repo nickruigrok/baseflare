@@ -778,11 +778,14 @@ async function createTodoViaRpc(
   return body.result.id;
 }
 
-async function createRealtimeOutboxEvent(eventId: string): Promise<void> {
+async function createRealtimeOutboxEvent(
+  eventId: string,
+  createdAt = Date.now()
+): Promise<void> {
   await env.APP_DB.prepare(
     "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
   )
-    .bind(eventId, Date.now(), JSON.stringify(["todos"]), JSON.stringify([]))
+    .bind(eventId, createdAt, JSON.stringify(["todos"]), JSON.stringify([]))
     .run();
 }
 
@@ -948,6 +951,42 @@ describe("worker runtime", () => {
     );
   });
 
+  it("routes anonymous realtime connections with generated connection keys", async () => {
+    const connections = new FakeDurableObjectNamespace();
+    await invoke(
+      "/api/subscribe",
+      {
+        headers: { upgrade: "websocket" },
+        method: "GET",
+      },
+      worker,
+      { ...env, REALTIME_CONNECTIONS: connections }
+    );
+    await invoke(
+      "/api/subscribe",
+      {
+        headers: { upgrade: "websocket" },
+        method: "GET",
+      },
+      worker,
+      { ...env, REALTIME_CONNECTIONS: connections }
+    );
+    const firstKey = connections.requests[0]?.request.headers.get(
+      "x-baseflare-realtime-connection-key"
+    );
+    const secondKey = connections.requests[1]?.request.headers.get(
+      "x-baseflare-realtime-connection-key"
+    );
+
+    expect(firstKey).toMatch(/^anonymous:/);
+    expect(secondKey).toMatch(/^anonymous:/);
+    expect(firstKey).not.toBe(secondKey);
+    expect(connections.requests.map((request) => request.name)).toEqual([
+      getRealtimeConnectionShardName(firstKey ?? ""),
+      getRealtimeConnectionShardName(secondKey ?? ""),
+    ]);
+  });
+
   it("keeps future realtime connection shard routing deterministic and bounded", () => {
     const shardCount = 32;
     const first = getRealtimeConnectionShardName("client-a", shardCount);
@@ -1041,6 +1080,120 @@ describe("worker runtime", () => {
     };
 
     expect(missingBody.delivered).toBe(0);
+  });
+
+  it("isolates anonymous realtime sockets from each other", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const clientAMessages: unknown[] = [];
+    const clientBMessages: unknown[] = [];
+    const responseA = await connectionDo.fetch(
+      new Request("https://baseflare.internal/api/subscribe", {
+        headers: { upgrade: "websocket" },
+        method: "GET",
+      })
+    );
+    const responseB = await connectionDo.fetch(
+      new Request("https://baseflare.internal/api/subscribe", {
+        headers: { upgrade: "websocket" },
+        method: "GET",
+      })
+    );
+    const clientA = (responseA as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const clientB = (responseB as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    clientA.accept?.();
+    clientB.accept?.();
+    clientA.addEventListener("message", (event) => {
+      clientAMessages.push(JSON.parse(String(event.data)) as unknown);
+    });
+    clientB.addEventListener("message", (event) => {
+      clientBMessages.push(JSON.parse(String(event.data)) as unknown);
+    });
+    const internals = connectionDo as unknown as {
+      socketConnectionKeys: Map<WebSocket, string>;
+    };
+    const [clientAKey, clientBKey] = [
+      ...internals.socketConnectionKeys.values(),
+    ];
+
+    expect(clientAKey).toMatch(/^anonymous:/);
+    expect(clientBKey).toMatch(/^anonymous:/);
+    expect(clientAKey).not.toBe(clientBKey);
+
+    const response = await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver", {
+        body: JSON.stringify({
+          connectionKey: clientAKey,
+          result: [{ text: "anonymous-a" }],
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as { delivered: number };
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(body.delivered).toBe(1);
+    expect(clientAMessages).toHaveLength(1);
+    expect(clientBMessages).toEqual([]);
+  });
+
+  it("keeps explicit realtime client ids grouped for delivery", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const clientAMessages: unknown[] = [];
+    const clientBMessages: unknown[] = [];
+    const connect = () =>
+      connectionDo.fetch(
+        new Request(
+          "https://baseflare.internal/api/subscribe?clientId=shared-client",
+          {
+            headers: { upgrade: "websocket" },
+            method: "GET",
+          }
+        )
+      );
+    const responseA = await connect();
+    const responseB = await connect();
+    const clientA = (responseA as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const clientB = (responseB as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    clientA.accept?.();
+    clientB.accept?.();
+    clientA.addEventListener("message", (event) => {
+      clientAMessages.push(JSON.parse(String(event.data)) as unknown);
+    });
+    clientB.addEventListener("message", (event) => {
+      clientBMessages.push(JSON.parse(String(event.data)) as unknown);
+    });
+
+    const response = await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver", {
+        body: JSON.stringify({
+          connectionKey: "shared-client",
+          result: [{ text: "shared" }],
+          subscriptionId: "sub-shared",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as { delivered: number };
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(body.delivered).toBe(2);
+    expect(clientAMessages).toHaveLength(1);
+    expect(clientBMessages).toHaveLength(1);
   });
 
   it("continues realtime delivery after one socket send fails", async () => {
@@ -1804,6 +1957,85 @@ describe("worker runtime", () => {
     expect(connections.requests).toHaveLength(0);
   });
 
+  it("removes expired realtime outbox rows during catch-up cleanup", async () => {
+    const expiredAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const recentAt = Date.now();
+    await createRealtimeOutboxEvent("expired-outbox-event", expiredAt);
+    await createRealtimeOutboxEvent("recent-outbox-event", recentAt);
+    const latest = await env.APP_DB.prepare(
+      "SELECT MAX(sequence) AS sequence FROM _bf_realtime_outbox"
+    ).first<{ sequence: number }>();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: latest?.sequence, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const expired = await env.APP_DB.prepare(
+      "SELECT event_id FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("expired-outbox-event")
+      .first<{ event_id: string }>();
+    const recent = await env.APP_DB.prepare(
+      "SELECT event_id FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("recent-outbox-event")
+      .first<{ event_id: string }>();
+
+    expect(response.status).toBe(200);
+    expect(expired).toBeNull();
+    expect(recent?.event_id).toBe("recent-outbox-event");
+  });
+
+  it("bounds and throttles realtime outbox cleanup work", async () => {
+    const expiredAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    await env.APP_DB.prepare(
+      `WITH RECURSIVE events(index_value) AS (
+         SELECT 1
+         UNION ALL
+         SELECT index_value + 1 FROM events WHERE index_value < 1001
+       )
+       INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions)
+       SELECT 'expired-batch-' || index_value, ?, ?, ? FROM events`
+    )
+      .bind(expiredAt, JSON.stringify(["todos"]), JSON.stringify([]))
+      .run();
+    const latest = await env.APP_DB.prepare(
+      "SELECT MAX(sequence) AS sequence FROM _bf_realtime_outbox"
+    ).first<{ sequence: number }>();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const catchUp = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/catch-up", {
+          body: JSON.stringify({ afterSequence: latest?.sequence, limit: 10 }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await catchUp();
+    await catchUp();
+
+    const remaining = await env.APP_DB.prepare(
+      "SELECT COUNT(*) AS count FROM _bf_realtime_outbox WHERE created_at = ?"
+    )
+      .bind(expiredAt)
+      .first<{ count: number }>();
+
+    expect(remaining?.count).toBe(1);
+  });
+
   it("re-evaluates active realtime registrations during catch-up", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
@@ -1888,13 +2120,19 @@ describe("worker runtime", () => {
   });
 
   it("uses realtime outbox sequence instead of event id for catch-up", async () => {
+    const now = Date.now();
     await env.APP_DB.batch([
       env.APP_DB.prepare(
         "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
-      ).bind("z-event", 1, JSON.stringify(["todos"]), JSON.stringify([])),
+      ).bind("z-event", now, JSON.stringify(["todos"]), JSON.stringify([])),
       env.APP_DB.prepare(
         "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
-      ).bind("a-event", 2, JSON.stringify(["labels"]), JSON.stringify([])),
+      ).bind(
+        "a-event",
+        now + 1,
+        JSON.stringify(["labels"]),
+        JSON.stringify([])
+      ),
     ]);
     const firstRow = await env.APP_DB.prepare(
       "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
@@ -1938,7 +2176,12 @@ describe("worker runtime", () => {
     await env.APP_DB.prepare(
       "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
     )
-      .bind("notify-event", 1, JSON.stringify(["todos"]), JSON.stringify([]))
+      .bind(
+        "notify-event",
+        Date.now(),
+        JSON.stringify(["todos"]),
+        JSON.stringify([])
+      )
       .run();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
@@ -2031,13 +2274,19 @@ describe("worker runtime", () => {
   });
 
   it("keeps realtime notify cursors monotonic for out-of-order events", async () => {
+    const now = Date.now();
     await env.APP_DB.batch([
       env.APP_DB.prepare(
         "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
-      ).bind("older-event", 1, JSON.stringify(["todos"]), JSON.stringify([])),
+      ).bind("older-event", now, JSON.stringify(["todos"]), JSON.stringify([])),
       env.APP_DB.prepare(
         "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
-      ).bind("newer-event", 2, JSON.stringify(["todos"]), JSON.stringify([])),
+      ).bind(
+        "newer-event",
+        now + 1,
+        JSON.stringify(["todos"]),
+        JSON.stringify([])
+      ),
     ]);
     const newerRow = await env.APP_DB.prepare(
       "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
@@ -2075,13 +2324,24 @@ describe("worker runtime", () => {
   });
 
   it("does not regress realtime cursors when catch-up returns older events", async () => {
+    const now = Date.now();
     await env.APP_DB.batch([
       env.APP_DB.prepare(
         "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
-      ).bind("catchup-older", 1, JSON.stringify(["todos"]), JSON.stringify([])),
+      ).bind(
+        "catchup-older",
+        now,
+        JSON.stringify(["todos"]),
+        JSON.stringify([])
+      ),
       env.APP_DB.prepare(
         "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
-      ).bind("catchup-newer", 2, JSON.stringify(["todos"]), JSON.stringify([])),
+      ).bind(
+        "catchup-newer",
+        now + 1,
+        JSON.stringify(["todos"]),
+        JSON.stringify([])
+      ),
     ]);
     const newerRow = await env.APP_DB.prepare(
       "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"

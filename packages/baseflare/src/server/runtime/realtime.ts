@@ -83,7 +83,11 @@ type StoredRealtimeRegistration = Omit<
 
 const DEFAULT_REALTIME_SHARD_COUNT = 1;
 const REALTIME_LEASE_MS = 60_000;
+const REALTIME_OUTBOX_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
+const REALTIME_OUTBOX_CLEANUP_LIMIT = 1000;
+const REALTIME_OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const JSON_HEADERS = { "content-type": "application/json" } as const;
+const REALTIME_CONNECTION_KEY_HEADER = "x-baseflare-realtime-connection-key";
 const REALTIME_RUNTIME_ID_HEADER = "x-baseflare-realtime-runtime-id";
 const UINT32_MODULUS = 4_294_967_296;
 let nextRealtimeRuntimeId = 0;
@@ -156,6 +160,14 @@ function getEpoch(value: unknown): number {
   }
 
   return value;
+}
+
+function resolveRealtimeConnectionKey(url: URL): string {
+  return (
+    url.searchParams.get("clientId") ??
+    url.searchParams.get("sessionId") ??
+    `anonymous:${crypto.randomUUID()}`
+  );
 }
 
 function createRegistrationKey(
@@ -337,6 +349,28 @@ async function fetchRealtimeOutboxEventById(
   };
 }
 
+async function deleteRealtimeOutboxEventsBefore(
+  database: Pick<RuntimeDatabase, "prepare">,
+  createdBefore: number,
+  limit: number
+): Promise<void> {
+  const boundedLimit = Math.min(
+    Math.max(limit, 1),
+    REALTIME_OUTBOX_CLEANUP_LIMIT
+  );
+  await bindStatement(
+    database,
+    `DELETE FROM ${REALTIME_OUTBOX_TABLE_NAME}
+     WHERE sequence IN (
+       SELECT sequence FROM ${REALTIME_OUTBOX_TABLE_NAME}
+       WHERE created_at < ?
+       ORDER BY created_at ASC
+       LIMIT ?
+     )`,
+    [createdBefore, boundedLimit]
+  ).run();
+}
+
 export async function routeRealtimeSubscribe(
   request: Request,
   env: BaseflareRuntimeEnv,
@@ -359,15 +393,13 @@ export async function routeRealtimeSubscribe(
     );
   }
 
-  const clientKey =
-    url.searchParams.get("clientId") ??
-    url.searchParams.get("sessionId") ??
-    "default";
+  const clientKey = resolveRealtimeConnectionKey(url);
   const shardName = getRealtimeConnectionShardName(clientKey);
   const stub = env.REALTIME_CONNECTIONS.get(
     env.REALTIME_CONNECTIONS.idFromName(shardName)
   );
   const headers = new Headers(request.headers);
+  headers.set(REALTIME_CONNECTION_KEY_HEADER, clientKey);
   headers.set(REALTIME_RUNTIME_ID_HEADER, runtimeId);
 
   return await stub.fetch(new Request(request, { headers }));
@@ -423,9 +455,8 @@ export class RealtimeConnectionDO {
     const server = pair[1];
     const url = new URL(request.url);
     const clientKey =
-      url.searchParams.get("clientId") ??
-      url.searchParams.get("sessionId") ??
-      "default";
+      request.headers.get(REALTIME_CONNECTION_KEY_HEADER) ??
+      resolveRealtimeConnectionKey(url);
     server.accept();
     this.addSocket(server, clientKey);
     this.socketRuntimeIds.set(
@@ -688,6 +719,7 @@ export class RealtimeSubscriptionDO {
     StoredRealtimeRegistration
   >();
   private readonly reEvaluatingRegistrations = new Set<string>();
+  private lastOutboxCleanupAt = 0;
   private lastSeenSequence: number | null = null;
 
   constructor(_state: unknown, env: RealtimeObjectEnv) {
@@ -738,7 +770,10 @@ export class RealtimeSubscriptionDO {
       }
 
       this.advanceLastSeenSequence(event.sequence);
+      // Phase 3A intentionally re-evaluates all active registrations. The next
+      // realtime slice adds shared table/partition dependency filtering.
       const result = await this.reEvaluateActiveRegistrations();
+      await this.cleanupRealtimeOutbox();
       return jsonResponse({ ...result, ok: true });
     }
 
@@ -752,11 +787,15 @@ export class RealtimeSubscriptionDO {
         typeof body.limit === "number" ? body.limit : 100
       );
       if (events.length === 0) {
+        await this.cleanupRealtimeOutbox();
         return jsonResponse({ evaluated: 0, events, failed: 0, ok: true });
       }
 
       this.advanceLastSeenSequence(events.at(-1)?.sequence);
+      // Phase 3A intentionally re-evaluates all active registrations. The next
+      // realtime slice adds shared table/partition dependency filtering.
       const result = await this.reEvaluateActiveRegistrations();
+      await this.cleanupRealtimeOutbox();
       return jsonResponse({ ...result, events, ok: true });
     }
 
@@ -841,6 +880,26 @@ export class RealtimeSubscriptionDO {
     }
 
     return { evaluated, failed };
+  }
+
+  private async cleanupRealtimeOutbox(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastOutboxCleanupAt < REALTIME_OUTBOX_CLEANUP_INTERVAL_MS) {
+      return;
+    }
+
+    this.lastOutboxCleanupAt = now;
+    try {
+      await deleteRealtimeOutboxEventsBefore(
+        this.database,
+        now - REALTIME_OUTBOX_RETENTION_MS,
+        REALTIME_OUTBOX_CLEANUP_LIMIT
+      );
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_outbox_cleanup_failed", {
+        errorName: error instanceof Error ? error.name : typeof error,
+      });
+    }
   }
 
   private async reEvaluateRegistration(
