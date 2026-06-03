@@ -455,8 +455,6 @@ export class RealtimeConnectionDO {
     });
     server.addEventListener("close", () => {
       this.removeSocket(server);
-      this.socketAuthorizationHeaders.delete(server);
-      this.socketRuntimeIds.delete(server);
     });
 
     return new Response(null, {
@@ -634,8 +632,10 @@ export class RealtimeConnectionDO {
   private removeSocket(socket: RuntimeWebSocket): void {
     this.sockets.delete(socket);
     const connectionKey = this.socketConnectionKeys.get(socket);
+    this.socketAuthorizationHeaders.delete(socket);
     this.socketConnectionKeys.delete(socket);
     this.socketConnectionNames.delete(socket);
+    this.socketRuntimeIds.delete(socket);
     if (!connectionKey) {
       return;
     }
@@ -687,6 +687,7 @@ export class RealtimeSubscriptionDO {
     string,
     StoredRealtimeRegistration
   >();
+  private readonly reEvaluatingRegistrations = new Set<string>();
   private lastSeenSequence: number | null = null;
 
   constructor(_state: unknown, env: RealtimeObjectEnv) {
@@ -810,6 +811,15 @@ export class RealtimeSubscriptionDO {
     let evaluated = 0;
     let failed = 0;
     for (const registration of this.getStoredRegistrations()) {
+      const registrationKey = createRegistrationKey(
+        registration.connectionKey,
+        registration.subscriptionId
+      );
+      if (this.reEvaluatingRegistrations.has(registrationKey)) {
+        continue;
+      }
+
+      this.reEvaluatingRegistrations.add(registrationKey);
       try {
         await this.reEvaluateRegistration(registration);
         evaluated += 1;
@@ -825,6 +835,8 @@ export class RealtimeSubscriptionDO {
             subscriptionId: registration.subscriptionId,
           }
         );
+      } finally {
+        this.reEvaluatingRegistrations.delete(registrationKey);
       }
     }
 
