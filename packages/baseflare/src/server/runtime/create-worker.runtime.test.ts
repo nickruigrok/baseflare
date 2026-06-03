@@ -1057,10 +1057,12 @@ describe("worker runtime", () => {
     );
     const client = (response as Response & { readonly webSocket?: WebSocket })
       .webSocket as WebSocket & { accept?: () => void };
-    const messages: Array<{ type: string }> = [];
+    const messages: Array<{ failed?: unknown[]; type: string }> = [];
     client.accept?.();
     client.addEventListener("message", (event) => {
-      messages.push(JSON.parse(String(event.data)) as { type: string });
+      messages.push(
+        JSON.parse(String(event.data)) as { failed?: unknown[]; type: string }
+      );
     });
 
     client.send(
@@ -1093,7 +1095,128 @@ describe("worker runtime", () => {
       "subscribed",
       "subscribed",
     ]);
-    expect(messages.at(-1)?.type).toBe("restored");
+    expect(messages.at(-1)).toEqual({ failed: [], type: "restored" });
+  });
+
+  it("reports partial realtime restore failures after successful registrations", async () => {
+    const registerRequests: unknown[] = [];
+    const subscriptionDo = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        registerRequests.push(await request.json());
+        return Response.json({ ok: true });
+      }
+    );
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{
+      failed?: Array<{ error: string; index: number; subscriptionId?: string }>;
+      subscriptionId?: string;
+      type: string;
+    }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          failed?: Array<{
+            error: string;
+            index: number;
+            subscriptionId?: string;
+          }>;
+          subscriptionId?: string;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-good",
+          },
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            subscriptionId: "sub-bad",
+          },
+        ],
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(registerRequests).toHaveLength(1);
+    expect(messages[0]).toEqual({
+      subscriptionId: "sub-good",
+      type: "subscribed",
+    });
+    expect(messages[1]).toEqual({
+      failed: [
+        {
+          error: 'Realtime field "queryName" must be a non-empty string',
+          index: 1,
+          subscriptionId: "sub-bad",
+        },
+      ],
+      type: "restored",
+    });
+  });
+
+  it("keeps malformed realtime restore envelopes on the socket error path", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ error?: string; type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as { error?: string; type: string }
+      );
+    });
+
+    client.send(JSON.stringify({ subscriptions: {}, type: "restore" }));
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages).toEqual([
+      {
+        error: 'Realtime field "subscriptions" must be an array',
+        type: "error",
+      },
+    ]);
   });
 
   it("keeps realtime registration failures from blocking other subscribers", async () => {

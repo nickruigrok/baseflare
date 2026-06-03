@@ -538,15 +538,44 @@ export class RealtimeConnectionDO {
       );
     }
 
-    await Promise.all(
-      subscriptions.map((subscription) =>
-        this.registerSubscription(
-          parseObject(subscription, "Realtime subscription"),
-          socket
-        )
-      )
+    const results = await Promise.allSettled(
+      subscriptions.map(async (subscription, index) => {
+        const message = parseObject(subscription, "Realtime subscription");
+        await this.registerSubscription(message, socket);
+        return {
+          index,
+          subscriptionId:
+            typeof message.subscriptionId === "string"
+              ? message.subscriptionId
+              : undefined,
+        };
+      })
     );
-    socket.send(JSON.stringify({ type: "restored" }));
+    const failed = results.flatMap((result, index) => {
+      if (result.status === "fulfilled") {
+        return [];
+      }
+
+      const subscription = subscriptions[index];
+      const subscriptionId =
+        subscription &&
+        typeof subscription === "object" &&
+        "subscriptionId" in subscription &&
+        typeof subscription.subscriptionId === "string"
+          ? subscription.subscriptionId
+          : undefined;
+      return [
+        {
+          error:
+            result.reason instanceof Error
+              ? result.reason.message
+              : "Realtime subscription restore failed",
+          index,
+          subscriptionId,
+        },
+      ];
+    });
+    socket.send(JSON.stringify({ failed, type: "restored" }));
   }
 
   private createRegistration(
