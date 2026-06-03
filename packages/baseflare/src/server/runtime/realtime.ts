@@ -678,7 +678,7 @@ export class RealtimeSubscriptionDO {
         this.database,
         getStringField(body, "eventId")
       );
-      this.lastSeenSequence = event?.sequence ?? this.lastSeenSequence;
+      this.advanceLastSeenSequence(event?.sequence);
       const result = await this.reEvaluateActiveRegistrations();
       return jsonResponse({ ...result, ok: true });
     }
@@ -692,7 +692,7 @@ export class RealtimeSubscriptionDO {
         afterSequence,
         typeof body.limit === "number" ? body.limit : 100
       );
-      this.lastSeenSequence = events.at(-1)?.sequence ?? this.lastSeenSequence;
+      this.advanceLastSeenSequence(events.at(-1)?.sequence);
       return jsonResponse({ events, ok: true });
     }
 
@@ -704,6 +704,14 @@ export class RealtimeSubscriptionDO {
     }
 
     return new Response("Not found", { status: 404 });
+  }
+
+  private advanceLastSeenSequence(sequence: number | null | undefined): void {
+    if (sequence == null) {
+      return;
+    }
+
+    this.lastSeenSequence = Math.max(this.lastSeenSequence ?? 0, sequence);
   }
 
   private parseRegistration(

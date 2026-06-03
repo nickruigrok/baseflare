@@ -1179,6 +1179,18 @@ describe("worker runtime", () => {
     expect(body.events).toHaveLength(1);
     expect(body.events[0]?.sequence).toBeTypeOf("number");
     expect(body.events[0]?.tables).toEqual(["todos"]);
+
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      lastSeenSequence: number | null;
+    };
+
+    expect(registrationsBody.lastSeenSequence).toBe(body.events[0]?.sequence);
   });
 
   it("uses realtime outbox sequence instead of event id for catch-up", async () => {
@@ -1264,6 +1276,98 @@ describe("worker runtime", () => {
 
     expect(response.status).toBe(200);
     expect(body.lastSeenSequence).toBe(row?.sequence);
+  });
+
+  it("keeps realtime notify cursors monotonic for out-of-order events", async () => {
+    await env.APP_DB.batch([
+      env.APP_DB.prepare(
+        "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+      ).bind("older-event", 1, JSON.stringify(["todos"]), JSON.stringify([])),
+      env.APP_DB.prepare(
+        "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+      ).bind("newer-event", 2, JSON.stringify(["todos"]), JSON.stringify([])),
+    ]);
+    const newerRow = await env.APP_DB.prepare(
+      "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("newer-event")
+      .first<{ sequence: number }>();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await notify("newer-event");
+    await notify("older-event");
+
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const body = (await registrationsResponse.json()) as {
+      lastSeenSequence: number | null;
+    };
+
+    expect(body.lastSeenSequence).toBe(newerRow?.sequence);
+  });
+
+  it("does not regress realtime cursors when catch-up returns older events", async () => {
+    await env.APP_DB.batch([
+      env.APP_DB.prepare(
+        "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+      ).bind("catchup-older", 1, JSON.stringify(["todos"]), JSON.stringify([])),
+      env.APP_DB.prepare(
+        "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+      ).bind("catchup-newer", 2, JSON.stringify(["todos"]), JSON.stringify([])),
+    ]);
+    const newerRow = await env.APP_DB.prepare(
+      "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("catchup-newer")
+      .first<{ sequence: number }>();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "catchup-newer" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 1 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const body = (await registrationsResponse.json()) as {
+      lastSeenSequence: number | null;
+    };
+
+    expect(body.lastSeenSequence).toBe(newerRow?.sequence);
   });
 
   it("ignores stale realtime registration epochs and expires old leases", async () => {
