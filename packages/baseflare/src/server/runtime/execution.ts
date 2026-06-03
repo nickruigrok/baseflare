@@ -13,7 +13,7 @@ import type { Rules } from "../permissions/types";
 import type { Schema } from "../schema/types";
 
 import { createAuth } from "./auth";
-import { D1DatabaseAdapter } from "./d1";
+import { D1DatabaseAdapter, type RuntimeReadObserver } from "./d1";
 import { coerceValidationError, NotFoundRuntimeError } from "./errors";
 import type { FunctionIndex } from "./function-index";
 import {
@@ -35,6 +35,7 @@ interface InvocationOptions {
   readonly executionContext: BaseflareExecutionContext;
   readonly functionIndex: FunctionIndex;
   readonly invocationName?: string;
+  readonly readObserver?: RuntimeReadObserver;
   readonly realtime?: RealtimeMutationNotifier;
   readonly requestHeaders: Headers;
   readonly rules?: Rules;
@@ -78,6 +79,7 @@ export async function executeQueryDefinition<TResult>(
       new D1DatabaseAdapter({
         database: options.database,
         getContext: () => ctx,
+        readObserver: options.readObserver,
         rules: options.rules,
         schema: options.schema,
       }),

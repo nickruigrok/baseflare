@@ -4,11 +4,12 @@ import type { Rules } from "../permissions/types";
 import type { Schema } from "../schema/types";
 import { REALTIME_OUTBOX_TABLE_NAME } from "../schema/types";
 
-import { bindStatement } from "./d1";
+import { bindStatement, type RuntimeReadObserver } from "./d1";
 import { InternalRuntimeError, ValidationRuntimeError } from "./errors";
 import { executeQueryDefinition } from "./execution";
 import type { FunctionIndex } from "./function-index";
 import { logRuntimeEvent } from "./logging";
+import { partitionTargetId } from "./partitioning";
 import type {
   BaseflareExecutionContext,
   BaseflareRuntimeEnv,
@@ -77,9 +78,21 @@ type StoredRealtimeRegistration = Omit<
   RealtimeRegistration,
   "leaseExpiresAt"
 > & {
+  dependencies?: RealtimeDependencySet;
   leaseExpiresAt: number;
   lastResultJson?: string;
 };
+
+interface RealtimeDependencySet {
+  readonly partitions: ReadonlySet<string>;
+  readonly tables: ReadonlySet<string>;
+}
+
+interface RealtimeAffectedTargets {
+  readonly broadTables: ReadonlySet<string>;
+  readonly partitions: ReadonlySet<string>;
+  readonly tables: ReadonlySet<string>;
+}
 
 const DEFAULT_REALTIME_SHARD_COUNT = 1;
 const REALTIME_LEASE_MS = 60_000;
@@ -175,6 +188,89 @@ function createRegistrationKey(
   subscriptionId: string
 ): string {
   return JSON.stringify([connectionKey, subscriptionId]);
+}
+
+function createRealtimeDependencySet(): {
+  readonly dependencies: RealtimeDependencySet;
+  readonly readObserver: RuntimeReadObserver;
+} {
+  const tables = new Set<string>();
+  const partitions = new Set<string>();
+  return {
+    dependencies: { partitions, tables },
+    readObserver: {
+      onPartitionRead(partition) {
+        partitions.add(partitionTargetId(partition));
+      },
+      onTableRead(tableName) {
+        tables.add(tableName);
+      },
+    },
+  };
+}
+
+function createRealtimeAffectedTargets(
+  events: readonly RealtimeOutboxEvent[]
+): RealtimeAffectedTargets {
+  const broadTables = new Set<string>();
+  const partitions = new Set<string>();
+  const tables = new Set<string>();
+
+  for (const event of events) {
+    const partitionTables = new Set<string>();
+    for (const partition of event.partitions) {
+      partitions.add(partitionTargetId(partition));
+      partitionTables.add(partition.tableName);
+    }
+
+    for (const tableName of event.tables) {
+      tables.add(tableName);
+      if (!partitionTables.has(tableName)) {
+        broadTables.add(tableName);
+      }
+    }
+  }
+
+  return { broadTables, partitions, tables };
+}
+
+function getPartitionDependencyTable(partitionId: string): string | undefined {
+  try {
+    const parsed = JSON.parse(partitionId) as unknown;
+    return Array.isArray(parsed) && typeof parsed[0] === "string"
+      ? parsed[0]
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function isRealtimeEventRelevant(
+  registration: StoredRealtimeRegistration,
+  targets: RealtimeAffectedTargets
+): boolean {
+  if (!registration.dependencies) {
+    return true;
+  }
+
+  for (const tableName of registration.dependencies.tables) {
+    if (targets.tables.has(tableName)) {
+      return true;
+    }
+  }
+
+  for (const partitionId of registration.dependencies.partitions) {
+    if (targets.partitions.has(partitionId)) {
+      return true;
+    }
+
+    const tableName = getPartitionDependencyTable(partitionId);
+    if (tableName && targets.broadTables.has(tableName)) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 function getRealtimeShardName(
@@ -770,9 +866,9 @@ export class RealtimeSubscriptionDO {
       }
 
       this.advanceLastSeenSequence(event.sequence);
-      // Phase 3A intentionally re-evaluates all active registrations. The next
-      // realtime slice adds shared table/partition dependency filtering.
-      const result = await this.reEvaluateActiveRegistrations();
+      const result = await this.reEvaluateActiveRegistrations(
+        createRealtimeAffectedTargets([event])
+      );
       await this.cleanupRealtimeOutbox();
       return jsonResponse({ ...result, ok: true });
     }
@@ -792,9 +888,9 @@ export class RealtimeSubscriptionDO {
       }
 
       this.advanceLastSeenSequence(events.at(-1)?.sequence);
-      // Phase 3A intentionally re-evaluates all active registrations. The next
-      // realtime slice adds shared table/partition dependency filtering.
-      const result = await this.reEvaluateActiveRegistrations();
+      const result = await this.reEvaluateActiveRegistrations(
+        createRealtimeAffectedTargets(events)
+      );
       await this.cleanupRealtimeOutbox();
       return jsonResponse({ ...result, events, ok: true });
     }
@@ -843,13 +939,19 @@ export class RealtimeSubscriptionDO {
     return Array.from(this.registrations.values());
   }
 
-  private async reEvaluateActiveRegistrations(): Promise<{
+  private async reEvaluateActiveRegistrations(
+    targets: RealtimeAffectedTargets
+  ): Promise<{
     readonly evaluated: number;
     readonly failed: number;
   }> {
     let evaluated = 0;
     let failed = 0;
     for (const registration of this.getStoredRegistrations()) {
+      if (!isRealtimeEventRelevant(registration, targets)) {
+        continue;
+      }
+
       const registrationKey = createRegistrationKey(
         registration.connectionKey,
         registration.subscriptionId
@@ -928,6 +1030,7 @@ export class RealtimeSubscriptionDO {
       headers.set("authorization", registration.authorizationHeader);
     }
 
+    const { dependencies, readObserver } = createRealtimeDependencySet();
     const result = await executeQueryDefinition(
       entry.definition as QueryDefinition,
       {
@@ -938,6 +1041,7 @@ export class RealtimeSubscriptionDO {
           },
         },
         functionIndex: runtime.functionIndex,
+        readObserver,
         requestHeaders: headers,
         rules: runtime.rules,
         schema: runtime.schema,
@@ -946,6 +1050,7 @@ export class RealtimeSubscriptionDO {
     );
     const resultJson = JSON.stringify(result);
     if (resultJson === registration.lastResultJson) {
+      registration.dependencies = dependencies;
       return;
     }
 
@@ -978,6 +1083,7 @@ export class RealtimeSubscriptionDO {
       return;
     }
 
+    registration.dependencies = dependencies;
     registration.lastResultJson = resultJson;
     registration.leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
   }

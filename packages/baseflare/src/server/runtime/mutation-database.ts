@@ -7,7 +7,6 @@ import {
   type FilterObject,
   type FilterValue,
   matchesFilter,
-  normalizeFilterValue,
 } from "../db/filters";
 import type { QueryState } from "../db/query-builder";
 import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
@@ -60,6 +59,14 @@ import {
 } from "./errors";
 import { emitRuntimeMetric, logRuntimeEvent } from "./logging";
 import {
+  getPartitionIndex,
+  getPartitionReadTarget,
+  isFilterValue,
+  type PartitionReadTarget,
+  partitionTargetId,
+  serializePartitionValue,
+} from "./partitioning";
+import {
   assertCanDelete,
   assertCanInsert,
   assertCanUpdate,
@@ -88,10 +95,6 @@ interface TableVersionReadResult<TRow extends Record<string, unknown>> {
   readonly partition?: PartitionReadTarget;
   readonly rows: readonly TRow[];
   readonly version: unknown;
-}
-
-interface PartitionReadTarget extends PartitionVersionKey {
-  readonly fields: readonly string[];
 }
 
 interface OccConflictMetricEvent {
@@ -210,87 +213,7 @@ function mergeFilters(
 }
 
 function partitionVersionId(key: PartitionVersionKey): string {
-  return JSON.stringify([key.tableName, key.partitionKey, key.partitionValue]);
-}
-
-function serializePartitionValue(values: readonly FilterValue[]): string {
-  return JSON.stringify(values.map((value) => normalizeFilterValue(value)));
-}
-
-function isFilterValue(value: unknown): value is FilterValue {
-  const type = typeof value;
-  return (
-    value === null ||
-    type === "boolean" ||
-    type === "number" ||
-    type === "string"
-  );
-}
-
-function getEqualityValue(
-  filter: FilterObject | undefined,
-  fieldName: string
-): FilterValue | undefined {
-  if (!filter) {
-    return undefined;
-  }
-
-  const fieldFilter = filter[fieldName];
-  if (isFilterValue(fieldFilter)) {
-    return fieldFilter;
-  }
-
-  if (
-    fieldFilter &&
-    typeof fieldFilter === "object" &&
-    !Array.isArray(fieldFilter) &&
-    "eq" in fieldFilter &&
-    isFilterValue(fieldFilter.eq)
-  ) {
-    return fieldFilter.eq;
-  }
-
-  for (const nested of filter.AND ?? []) {
-    const value = getEqualityValue(nested, fieldName);
-    if (value !== undefined) {
-      return value;
-    }
-  }
-
-  return undefined;
-}
-
-function getPartitionIndex(table: {
-  readonly indexes: readonly TableIndex[];
-}): TableIndex | undefined {
-  return table.indexes.find((index) => index.partition === true);
-}
-
-function getPartitionReadTarget(
-  tableName: string,
-  table: { readonly indexes: readonly TableIndex[] },
-  state: QueryState
-): PartitionReadTarget | undefined {
-  const partitionIndex = getPartitionIndex(table);
-  if (!partitionIndex) {
-    return undefined;
-  }
-
-  const values: FilterValue[] = [];
-  for (const field of partitionIndex.fields) {
-    const value = getEqualityValue(state.filter, field);
-    if (value === undefined) {
-      return undefined;
-    }
-    values.push(value);
-  }
-
-  return {
-    fields: partitionIndex.fields,
-    partitionKey: partitionIndex.name,
-    partitionValue: serializePartitionValue(values),
-    tableName,
-  };
+  return partitionTargetId(key);
 }
 
 function getDocumentPartition(

@@ -118,6 +118,7 @@ let rowConflictAttempts = 0;
 let tableConflictAttempts = 0;
 let exhaustedConflictAttempts = 0;
 let multiTableConflictAttempts = 0;
+let realtimeDependencyProbeCalls = 0;
 
 const rules = defineRules({
   labels: {
@@ -263,6 +264,34 @@ const uniqueTodo = query({
       .query("todos")
       .filter({ ownerToken: args.ownerToken })
       .unique();
+  },
+});
+
+const realtimeDependencyProbe = query({
+  args: {
+    id: v.optional(v.id("todos")),
+    mode: v.union(
+      v.literal("broad-labels"),
+      v.literal("get-todo"),
+      v.literal("partition-todos")
+    ),
+    ownerToken: v.string(),
+  },
+  handler(ctx, args) {
+    realtimeDependencyProbeCalls += 1;
+    if (args.mode === "broad-labels") {
+      return ctx.db.query("labels").collect();
+    }
+
+    if (args.mode === "get-todo") {
+      return args.id ? ctx.db.get("todos", args.id) : null;
+    }
+
+    return ctx.db
+      .query("todos")
+      .filter({ ownerToken: args.ownerToken })
+      .order("text", "asc")
+      .collect();
   },
 });
 
@@ -600,6 +629,11 @@ function createManifest(
       { definition: getTodo, exportName: "get", modulePath: "todos" },
       { definition: uniqueTodo, exportName: "unique", modulePath: "todos" },
       {
+        definition: realtimeDependencyProbe,
+        exportName: "dependencyProbe",
+        modulePath: "realtime",
+      },
+      {
         definition: permissionShapeProbe,
         exportName: "permissionShapes",
         modulePath: "todos",
@@ -780,13 +814,50 @@ async function createTodoViaRpc(
 
 async function createRealtimeOutboxEvent(
   eventId: string,
-  createdAt = Date.now()
+  createdAt = Date.now(),
+  options: {
+    readonly partitions?: readonly {
+      readonly partitionKey: string;
+      readonly partitionValue: string;
+      readonly tableName: string;
+    }[];
+    readonly tables?: readonly string[];
+  } = {}
 ): Promise<void> {
   await env.APP_DB.prepare(
     "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
   )
-    .bind(eventId, createdAt, JSON.stringify(["todos"]), JSON.stringify([]))
+    .bind(
+      eventId,
+      createdAt,
+      JSON.stringify(options.tables ?? ["todos"]),
+      JSON.stringify(options.partitions ?? [])
+    )
     .run();
+}
+
+function todoOwnerPartition(ownerToken: string): {
+  readonly partitionKey: string;
+  readonly partitionValue: string;
+  readonly tableName: "todos";
+} {
+  return {
+    partitionKey: "by_owner",
+    partitionValue: JSON.stringify([ownerToken]),
+    tableName: "todos",
+  };
+}
+
+async function getRealtimeOutboxSequence(eventId: string): Promise<number> {
+  const row = await env.APP_DB.prepare(
+    "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+  )
+    .bind(eventId)
+    .first<{ sequence: number }>();
+  if (!row) {
+    throw new Error(`Missing realtime outbox event "${eventId}"`);
+  }
+  return row.sequence;
 }
 
 async function createDetailedTodoViaRpc(args: {
@@ -872,6 +943,7 @@ describe("worker runtime", () => {
     resetRealtimeRuntimeStateForTest();
     exhaustedConflictAttempts = 0;
     multiTableConflictAttempts = 0;
+    realtimeDependencyProbeCalls = 0;
     rowConflictAttempts = 0;
     tableConflictAttempts = 0;
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -2117,6 +2189,279 @@ describe("worker runtime", () => {
         }
       ).result.map((todo) => todo.text)
     ).toEqual(["catch-up-delivered"]);
+  });
+
+  it("skips realtime notify re-evaluation for unrelated partitions", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveries.push(await request.json());
+        return Response.json({ delivered: 1, ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await createTodoViaRpc("owner-a", "owner-a-first");
+    await createRealtimeOutboxEvent("owner-a-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("owner-a-prime");
+    await createTodoViaRpc("owner-b", "owner-b-only");
+    await createRealtimeOutboxEvent("owner-b-unrelated", Date.now(), {
+      partitions: [todoOwnerPartition("owner-b")],
+      tables: ["todos"],
+    });
+    const unrelatedResponse = await notify("owner-b-unrelated");
+
+    await createTodoViaRpc("owner-a", "owner-a-second");
+    await createRealtimeOutboxEvent("owner-a-relevant", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    const relevantResponse = await notify("owner-a-relevant");
+
+    expect(await unrelatedResponse.json()).toEqual({
+      evaluated: 0,
+      failed: 0,
+      ok: true,
+    });
+    expect(await relevantResponse.json()).toEqual({
+      evaluated: 1,
+      failed: 0,
+      ok: true,
+    });
+    expect(realtimeDependencyProbeCalls).toBe(2);
+    expect(deliveries).toHaveLength(2);
+  });
+
+  it("keeps broad table dependencies subscribed to table events", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "broad-labels", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-labels",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await createRealtimeOutboxEvent("labels-prime", Date.now(), {
+      tables: ["labels"],
+    });
+    await notify("labels-prime");
+    await createRealtimeOutboxEvent("todos-unrelated-to-labels", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    const unrelatedResponse = await notify("todos-unrelated-to-labels");
+    await createRealtimeOutboxEvent("labels-relevant", Date.now(), {
+      tables: ["labels"],
+    });
+    const relevantResponse = await notify("labels-relevant");
+
+    expect(await unrelatedResponse.json()).toEqual({
+      evaluated: 0,
+      failed: 0,
+      ok: true,
+    });
+    expect(await relevantResponse.json()).toEqual({
+      evaluated: 1,
+      failed: 0,
+      ok: true,
+    });
+    expect(realtimeDependencyProbeCalls).toBe(2);
+  });
+
+  it("treats point reads as table dependencies", async () => {
+    const id = await createTodoViaRpc("owner-a", "point-read");
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { id, mode: "get-todo", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-get",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await createRealtimeOutboxEvent("point-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("point-prime");
+    await createRealtimeOutboxEvent("point-table-match", Date.now(), {
+      partitions: [todoOwnerPartition("owner-b")],
+      tables: ["todos"],
+    });
+    const response = await notify("point-table-match");
+
+    expect(await response.json()).toEqual({
+      evaluated: 1,
+      failed: 0,
+      ok: true,
+    });
+    expect(realtimeDependencyProbeCalls).toBe(2);
+  });
+
+  it("filters realtime catch-up by combined event dependencies", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-catch-up",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createRealtimeOutboxEvent("catch-up-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "catch-up-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const afterSequence = await getRealtimeOutboxSequence("catch-up-prime");
+    await createRealtimeOutboxEvent("catch-up-owner-b", Date.now(), {
+      partitions: [todoOwnerPartition("owner-b")],
+      tables: ["todos"],
+    });
+    await createRealtimeOutboxEvent("catch-up-labels", Date.now(), {
+      tables: ["labels"],
+    });
+
+    const unrelatedResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createRealtimeOutboxEvent("catch-up-owner-a", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    const relevantResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(await unrelatedResponse.json()).toEqual(
+      expect.objectContaining({
+        evaluated: 0,
+        failed: 0,
+        ok: true,
+      })
+    );
+    expect(await relevantResponse.json()).toEqual(
+      expect.objectContaining({
+        evaluated: 1,
+        failed: 0,
+        ok: true,
+      })
+    );
+    expect(realtimeDependencyProbeCalls).toBe(2);
   });
 
   it("uses realtime outbox sequence instead of event id for catch-up", async () => {
