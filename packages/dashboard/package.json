@@ -24,9 +24,22 @@
     "@baseflare/react": "workspace:*"
   },
   "scripts": {
-    "build": "tsup src/index.ts --format esm --dts --clean",
+    "build": "tsdown",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run",
     "clean": "rimraf dist"
+  },
+  "tsdown": {
+    "clean": true,
+    "dts": {
+      "sourcemap": false
+    },
+    "entry": "src/index.ts",
+    "fixedExtension": false,
+    "format": [
+      "esm"
+    ],
+    "sourcemap": false,
+    "target": "es2022"
   }
 }
