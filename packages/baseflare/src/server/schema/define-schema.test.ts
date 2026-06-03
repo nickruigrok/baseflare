@@ -68,6 +68,75 @@ describe("defineSchema", () => {
     );
   });
 
+  it("records partition index metadata", () => {
+    const schema = defineSchema({
+      messages: defineTable({
+        channelId: v.string(),
+        authorId: v.string(),
+        text: v.string(),
+      })
+        .index("by_channel", ["channelId"], { partition: true })
+        .index("by_author", ["authorId"], { partition: false }),
+    });
+
+    expect(schema.tables.messages.indexes).toEqual([
+      { name: "by_channel", fields: ["channelId"], partition: true },
+      { name: "by_author", fields: ["authorId"], partition: false },
+    ]);
+  });
+
+  it("auto-defaults a single index to the partition axis", () => {
+    const schema = defineSchema({
+      tasks: defineTable({
+        projectId: v.string(),
+        title: v.string(),
+      }).index("by_project", ["projectId"]),
+    });
+
+    expect(schema.tables.tasks.indexes).toEqual([
+      { name: "by_project", fields: ["projectId"], partition: true },
+    ]);
+  });
+
+  it("supports opting a single index out of partitioning", () => {
+    const schema = defineSchema({
+      tasks: defineTable({
+        status: v.string(),
+        title: v.string(),
+      }).index("by_status", ["status"], { partition: false }),
+    });
+
+    expect(schema.tables.tasks.indexes).toEqual([
+      { name: "by_status", fields: ["status"], partition: false },
+    ]);
+  });
+
+  it("requires an explicit partition choice for multiple indexes", () => {
+    expect(() =>
+      defineSchema({
+        tasks: defineTable({
+          projectId: v.string(),
+          status: v.string(),
+        })
+          .index("by_project", ["projectId"])
+          .index("by_status", ["status"]),
+      })
+    ).toThrow(/mark one index with { partition: true }/);
+  });
+
+  it("rejects multiple partition indexes", () => {
+    expect(() =>
+      defineSchema({
+        tasks: defineTable({
+          projectId: v.string(),
+          ownerId: v.string(),
+        })
+          .index("by_project", ["projectId"], { partition: true })
+          .index("by_owner", ["ownerId"], { partition: true }),
+      })
+    ).toThrow(/Only one index per table can be partitioned/);
+  });
+
   it("derives document types from the schema without codegen", () => {
     const schema = defineSchema({
       todos: defineTable({

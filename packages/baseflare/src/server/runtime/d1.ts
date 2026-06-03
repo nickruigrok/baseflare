@@ -19,6 +19,7 @@ import {
 import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
 import type { Rules } from "../permissions/types";
 import {
+  PARTITION_VERSION_TABLE_NAME,
   type Schema,
   TABLE_VERSION_TABLE_NAME,
   type TableDefinition,
@@ -58,8 +59,19 @@ export interface VersionedRuntimeDocument {
 
 export interface CommitGuard {
   readonly insertedIds?: ReadonlyMap<string, ReadonlySet<string>>;
+  readonly partitionVersions?: readonly PartitionVersionRead[];
   readonly rowRevisions?: ReadonlyMap<string, ReadonlyMap<string, number>>;
   readonly tableVersions?: ReadonlyMap<string, number>;
+}
+
+export interface PartitionVersionKey {
+  readonly partitionKey: string;
+  readonly partitionValue: string;
+  readonly tableName: string;
+}
+
+export interface PartitionVersionRead extends PartitionVersionKey {
+  readonly version: number;
 }
 
 export interface RuntimeScanPosition {
@@ -113,6 +125,32 @@ function buildCommitGuardConditions(guard: CommitGuard): {
       params,
       `EXISTS (SELECT 1 FROM ${TABLE_VERSION_TABLE_NAME} WHERE table_name = ? AND version = ?)`,
       [tableName, version]
+    );
+  }
+
+  for (const read of guard.partitionVersions ?? []) {
+    if (read.version === 0) {
+      appendGuardCondition(
+        conditions,
+        params,
+        `(NOT EXISTS (SELECT 1 FROM ${PARTITION_VERSION_TABLE_NAME} WHERE table_name = ? AND partition_key = ? AND partition_value = ?) OR EXISTS (SELECT 1 FROM ${PARTITION_VERSION_TABLE_NAME} WHERE table_name = ? AND partition_key = ? AND partition_value = ? AND version = 0))`,
+        [
+          read.tableName,
+          read.partitionKey,
+          read.partitionValue,
+          read.tableName,
+          read.partitionKey,
+          read.partitionValue,
+        ]
+      );
+      continue;
+    }
+
+    appendGuardCondition(
+      conditions,
+      params,
+      `EXISTS (SELECT 1 FROM ${PARTITION_VERSION_TABLE_NAME} WHERE table_name = ? AND partition_key = ? AND partition_value = ? AND version = ?)`,
+      [read.tableName, read.partitionKey, read.partitionValue, read.version]
     );
   }
 
@@ -649,5 +687,74 @@ export function createGuardedTableVersionBumps(
     conflictOnZero: true,
     expectedChanges: tableNames.length,
     type: "bump-table-versions",
+  };
+}
+
+export function createEnsurePartitionVersionRows(
+  partitions: readonly PartitionVersionKey[]
+): {
+  readonly params: readonly (string | number | null)[];
+  readonly sql: string;
+  readonly type: "ensure-partition-versions";
+} {
+  if (partitions.length === 0) {
+    throw new InternalRuntimeError(
+      "Partition version row creation requires at least one partition"
+    );
+  }
+
+  const values = partitions.map(() => "(?, ?, ?, 0)").join(", ");
+  return {
+    sql: `INSERT OR IGNORE INTO ${PARTITION_VERSION_TABLE_NAME} (table_name, partition_key, partition_value, version) VALUES ${values}`,
+    params: partitions.flatMap((partition) => [
+      partition.tableName,
+      partition.partitionKey,
+      partition.partitionValue,
+    ]),
+    type: "ensure-partition-versions",
+  };
+}
+
+export function createGuardedPartitionVersionBumps(
+  partitions: readonly PartitionVersionKey[],
+  guard: CommitGuard,
+  expectedPreviousChanges: number
+): {
+  readonly expectedChanges: number;
+  readonly params: readonly (string | number | null)[];
+  readonly sql: string;
+  readonly type: "bump-partition-versions";
+} {
+  if (partitions.length === 0) {
+    throw new InternalRuntimeError(
+      "Guarded partition-version bump requires at least one partition"
+    );
+  }
+
+  const guardConditions = buildCommitGuardConditions(guard);
+  const partitionConditions = partitions.map(
+    () => "(table_name = ? AND partition_key = ? AND partition_value = ?)"
+  );
+  const conditions = [
+    `(${partitionConditions.join(" OR ")})`,
+    "changes() = ?",
+    ...guardConditions.conditions,
+  ];
+
+  return {
+    sql: `UPDATE ${PARTITION_VERSION_TABLE_NAME}
+          SET version = version + 1
+          WHERE ${conditions.join(" AND ")}`,
+    params: [
+      ...partitions.flatMap((partition) => [
+        partition.tableName,
+        partition.partitionKey,
+        partition.partitionValue,
+      ]),
+      expectedPreviousChanges,
+      ...guardConditions.params,
+    ],
+    expectedChanges: partitions.length,
+    type: "bump-partition-versions",
   };
 }

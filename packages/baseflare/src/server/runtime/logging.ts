@@ -35,3 +35,11 @@ export function logRuntimeEvent(
 
   console.info("baseflare-runtime", payload);
 }
+
+export function emitRuntimeMetric(
+  name: string,
+  value: number,
+  tags: Record<string, string | boolean | number>
+): void {
+  logRuntimeEvent("info", "runtime.metric", { metric: name, tags, value });
+}

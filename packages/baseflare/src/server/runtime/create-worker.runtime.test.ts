@@ -747,6 +747,12 @@ async function insertStoredTodo(doc: {
     env.APP_DB.prepare(
       "UPDATE _bf_table_versions SET version = version + 1 WHERE table_name = ?"
     ).bind("todos"),
+    env.APP_DB.prepare(
+      "INSERT OR IGNORE INTO _bf_partition_versions (table_name, partition_key, partition_value, version) VALUES (?, ?, ?, 0)"
+    ).bind("todos", "by_owner", JSON.stringify([doc.ownerToken])),
+    env.APP_DB.prepare(
+      "UPDATE _bf_partition_versions SET version = version + 1 WHERE table_name = ? AND partition_key = ? AND partition_value = ?"
+    ).bind("todos", "by_owner", JSON.stringify([doc.ownerToken])),
   ]);
 
   return id;

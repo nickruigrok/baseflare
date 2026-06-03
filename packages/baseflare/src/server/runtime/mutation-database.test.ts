@@ -1,5 +1,5 @@
 import { v } from "baseflare/values";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { CursorPayload } from "../db/cursor";
 import type { QueryState } from "../db/query-builder";
@@ -8,13 +8,17 @@ import { defineRules } from "../permissions/define-rules";
 import type { Rules } from "../permissions/types";
 import { defineSchema } from "../schema/define-schema";
 import { defineTable } from "../schema/define-table";
-import { TABLE_VERSION_TABLE_NAME } from "../schema/types";
+import {
+  PARTITION_VERSION_TABLE_NAME,
+  TABLE_VERSION_TABLE_NAME,
+} from "../schema/types";
 import type { StoredDocumentRow } from "./d1";
 import { InternalRuntimeError, ValidationRuntimeError } from "./errors";
 import {
   createMutationDatabaseSession,
   MutationDatabase,
   RetryableMutationConflictError,
+  resetOccContentionWarningStateForTest,
   withMutationRetry,
 } from "./mutation-database";
 import type {
@@ -66,6 +70,10 @@ class FakePreparedStatement implements D1PreparedStatement {
   }
 }
 
+beforeEach(() => {
+  resetOccContentionWarningStateForTest();
+});
+
 interface FakeReadResult {
   readonly rows?: readonly Record<string, unknown>[];
   readonly version?: number;
@@ -75,6 +83,10 @@ const schema = defineSchema({
   labels: defineTable({
     text: v.string(),
   }),
+  messages: defineTable({
+    channelId: v.string(),
+    text: v.string(),
+  }).index("by_channel", ["channelId"]),
   todos: defineTable({
     tags: v.array(v.string()).optional(),
     text: v.string(),
@@ -83,6 +95,12 @@ const schema = defineSchema({
 
 const rules = defineRules({
   labels: {
+    delete: () => true,
+    insert: () => true,
+    read: () => true,
+    update: () => true,
+  },
+  messages: {
     delete: () => true,
     insert: () => true,
     read: () => true,
@@ -138,7 +156,31 @@ function createFakeDatabase(options: {
         versionStatement instanceof FakePreparedStatement &&
         queryStatement instanceof FakePreparedStatement &&
         versionStatement.query.includes(`FROM ${TABLE_VERSION_TABLE_NAME}`) &&
-        queryStatement.query.includes("FROM todos")
+        queryStatement.query.includes("FROM ")
+      ) {
+        const read = readResults.shift() ?? {
+          version: options.tableVersion,
+          rows: [],
+        };
+        return Promise.resolve([
+          {
+            results:
+              read.version === undefined ? [] : [{ version: read.version }],
+            success: true,
+          },
+          { results: read.rows ?? [], success: true },
+        ]);
+      }
+
+      const partitionVersionStatement = statements[0];
+      const partitionQueryStatement = statements[1];
+      if (
+        statements.length === 2 &&
+        partitionVersionStatement instanceof FakePreparedStatement &&
+        partitionQueryStatement instanceof FakePreparedStatement &&
+        partitionVersionStatement.query.includes(
+          `FROM ${PARTITION_VERSION_TABLE_NAME}`
+        )
       ) {
         const read = readResults.shift() ?? {
           version: options.tableVersion,
@@ -229,6 +271,17 @@ function tableVersionResult(
     })),
     success: true,
   };
+}
+
+function partitionVersionResult(
+  partitions: ReadonlyArray<{
+    readonly partition_key: string;
+    readonly partition_value: string;
+    readonly table_name: string;
+    readonly version: number;
+  }>
+): D1Result {
+  return { results: partitions, success: true };
 }
 
 describe("MutationDatabase", () => {
@@ -518,6 +571,441 @@ describe("MutationDatabase", () => {
     expect(batchParams[0]?.[2]?.at(-1)).toBe(2);
     expect(batchQueries[0]?.[3]).toContain("WHERE changes() = ?");
     expect(batchParams[0]?.[3]?.at(-1)).toBe(1);
+  });
+
+  it("uses partition versions for partition-aligned query reads", async () => {
+    const batchQueries: string[][] = [];
+    const batchParams: D1BindingValue[][][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchQueries,
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          partitionVersionResult([
+            {
+              table_name: "messages",
+              partition_key: "by_channel",
+              partition_value: '["a"]',
+              version: 7,
+            },
+          ]),
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ],
+        readResults: [{ rows: [], version: 7 }],
+      })
+    );
+
+    await mutationDb.query("messages").filter({ channelId: "a" }).collect();
+    await mutationDb.insert("messages", { channelId: "b", text: "hello" });
+    await mutationDb.commit();
+
+    expect(batchQueries[0]?.[0]).toContain("FROM _bf_partition_versions");
+    expect(batchQueries[0]?.[0]).not.toContain("INSERT OR IGNORE");
+    expect(batchQueries[0]?.[1]).toContain("FROM messages");
+    expect(batchQueries[1]?.[2]).toContain(
+      "SELECT table_name, partition_key, partition_value, version FROM _bf_partition_versions"
+    );
+    expect(batchQueries[1]?.[4]).toContain("UPDATE _bf_partition_versions");
+    expect(batchParams[1]?.[0]?.slice(0, 3)).toEqual([
+      "messages",
+      "by_channel",
+      '["b"]',
+    ]);
+  });
+
+  it("records missing partition-version rows as logical version zero", async () => {
+    const batchQueries: string[][] = [];
+    const batchParams: D1BindingValue[][][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchQueries,
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          partitionVersionResult([]),
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ],
+        readResults: [{ rows: [], version: undefined }],
+      })
+    );
+
+    await mutationDb
+      .query("messages")
+      .filter({ channelId: "missing" })
+      .collect();
+    await mutationDb.insert("messages", { channelId: "other", text: "hello" });
+    await mutationDb.commit();
+
+    expect(batchQueries[0]).toHaveLength(2);
+    expect(batchQueries[1]?.[3]).toContain("NOT EXISTS");
+    expect(batchQueries[1]?.[3]).toContain("version = 0");
+    expect(batchParams[1]?.[2]).toEqual([
+      "messages",
+      "by_channel",
+      '["missing"]',
+    ]);
+  });
+
+  it("retries when a missing partition row is created and bumped before commit", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          partitionVersionResult([
+            {
+              table_name: "messages",
+              partition_key: "by_channel",
+              partition_value: '["missing"]',
+              version: 1,
+            },
+          ]),
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+        readResults: [{ rows: [], version: undefined }],
+      })
+    );
+
+    await mutationDb
+      .query("messages")
+      .filter({ channelId: "missing" })
+      .collect();
+    await mutationDb.insert("messages", { channelId: "other", text: "hello" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
+  });
+
+  it("retries when a partition read becomes stale", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          partitionVersionResult([
+            {
+              table_name: "messages",
+              partition_key: "by_channel",
+              partition_value: '["a"]',
+              version: 8,
+            },
+          ]),
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+        readResults: [{ rows: [], version: 7 }],
+      })
+    );
+
+    await mutationDb.query("messages").filter({ channelId: "a" }).collect();
+    await mutationDb.insert("messages", { channelId: "a", text: "hello" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      RetryableMutationConflictError
+    );
+  });
+
+  it("reports missing positive partition version rows as corruption", async () => {
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          partitionVersionResult([]),
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+        readResults: [{ rows: [], version: 7 }],
+      })
+    );
+
+    await mutationDb.query("messages").filter({ channelId: "a" }).collect();
+    await mutationDb.insert("messages", { channelId: "a", text: "hello" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(
+      'Partition version row for "messages/by_channel/["a"]" was present during the read phase (version 7) but is now missing; this indicates data corruption or unexpected manual deletion'
+    );
+  });
+
+  it("emits OCC retry metrics with partition tags", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          partitionVersionResult([
+            {
+              table_name: "messages",
+              partition_key: "by_channel",
+              partition_value: '["a"]',
+              version: 8,
+            },
+          ]),
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+        readResults: [{ rows: [], version: 7 }],
+      })
+    );
+
+    try {
+      await mutationDb.query("messages").filter({ channelId: "a" }).collect();
+      await mutationDb.insert("messages", { channelId: "a", text: "hello" });
+
+      await expect(mutationDb.commit()).rejects.toThrow(
+        RetryableMutationConflictError
+      );
+
+      expect(info).toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          event: "runtime.metric",
+          metric: "baseflare.runtime.occ.conflict_retries",
+          tags: {
+            partitionAligned: true,
+            partitioned: true,
+            scope: "partition",
+            table: "messages",
+          },
+          value: 1,
+        })
+      );
+    } finally {
+      info.mockRestore();
+    }
+  });
+
+  it("warns in development when partitioned tables contend through broad reads", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      vi.stubGlobal("__BASEFLARE_DEV_WARNINGS__", true);
+      for (let index = 0; index < 10; index += 1) {
+        const mutationDb = createMutationDatabase(
+          createFakeDatabase({
+            batchResults: [
+              {
+                success: true,
+              },
+              tableVersionResult({ messages: 0 }),
+              { meta: { changes: 0 }, success: true },
+              { meta: { changes: 0 }, success: true },
+              { meta: { changes: 0 }, success: true },
+            ],
+            readResults: [{ rows: [], version: 0 }],
+          })
+        );
+
+        await mutationDb.query("messages").collect();
+        await mutationDb.insert("messages", {
+          channelId: `channel-${index}`,
+          text: "hello",
+        });
+        await expect(mutationDb.commit()).rejects.toThrow(
+          RetryableMutationConflictError
+        );
+      }
+
+      expect(warn).toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          event: "runtime.occ_contention",
+          message: expect.stringContaining("non-partition-aligned reads"),
+          table: "messages",
+        })
+      );
+    } finally {
+      info.mockRestore();
+      warn.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("keeps OCC contention warnings disabled by default", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      for (let index = 0; index < 10; index += 1) {
+        const mutationDb = createMutationDatabase(
+          createFakeDatabase({
+            batchResults: [
+              {
+                success: true,
+              },
+              tableVersionResult({ messages: 0 }),
+              { meta: { changes: 0 }, success: true },
+              { meta: { changes: 0 }, success: true },
+              { meta: { changes: 0 }, success: true },
+            ],
+            readResults: [{ rows: [], version: 0 }],
+          })
+        );
+
+        await mutationDb.query("messages").collect();
+        await mutationDb.insert("messages", {
+          channelId: `default-${index}`,
+          text: "hello",
+        });
+        await expect(mutationDb.commit()).rejects.toThrow(
+          RetryableMutationConflictError
+        );
+      }
+
+      expect(warn).not.toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          event: "runtime.occ_contention",
+        })
+      );
+    } finally {
+      info.mockRestore();
+      warn.mockRestore();
+    }
+  });
+
+  it("does not warn about partition indexes for repeated row-level conflicts", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    try {
+      vi.stubGlobal("__BASEFLARE_DEV_WARNINGS__", true);
+      for (let index = 0; index < 10; index += 1) {
+        const mutationDb = createMutationDatabase(
+          createFakeDatabase({
+            batchResults: [
+              {
+                success: true,
+              },
+              tableVersionResult({ messages: 0 }),
+              { meta: { changes: 0 }, success: true },
+              { meta: { changes: 0 }, success: true },
+              { meta: { changes: 0 }, success: true },
+            ],
+            readResults: [
+              {
+                rows: [
+                  {
+                    _id: "019078e5-d29f-7000-8000-000000000222",
+                    _data: JSON.stringify({
+                      channelId: "hot",
+                      text: "before",
+                    }),
+                    _rev: 1,
+                  },
+                ],
+                version: 0,
+              },
+            ],
+          })
+        );
+
+        await mutationDb.patch(
+          "messages",
+          "019078e5-d29f-7000-8000-000000000222",
+          { text: `after-${index}` }
+        );
+        await expect(mutationDb.commit()).rejects.toThrow(
+          RetryableMutationConflictError
+        );
+      }
+
+      expect(info).toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          event: "runtime.metric",
+          metric: "baseflare.runtime.occ.conflict_retries",
+          tags: {
+            partitionAligned: false,
+            partitioned: true,
+            scope: "row",
+            table: "messages",
+          },
+          value: 1,
+        })
+      );
+      expect(warn).not.toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          event: "runtime.occ_contention",
+        })
+      );
+    } finally {
+      info.mockRestore();
+      warn.mockRestore();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("bumps old and new partition values when a document moves", async () => {
+    const batchParams: D1BindingValue[][][] = [];
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchParams,
+        batchResults: [
+          {
+            success: true,
+          },
+          tableVersionResult({ messages: 0 }),
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 2 }, success: true },
+          { meta: { changes: 1 }, success: true },
+        ],
+        readResults: [
+          {
+            rows: [
+              {
+                _id: "019078e5-d29f-7000-8000-000000000111",
+                _data: JSON.stringify({ channelId: "a", text: "old" }),
+                _rev: 3,
+              },
+            ],
+            version: 0,
+          },
+        ],
+      })
+    );
+
+    await mutationDb.patch("messages", "019078e5-d29f-7000-8000-000000000111", {
+      channelId: "b",
+    });
+    await mutationDb.commit();
+
+    expect(batchParams[1]?.[0]).toEqual([
+      "messages",
+      "by_channel",
+      '["a"]',
+      "messages",
+      "by_channel",
+      '["b"]',
+    ]);
   });
 
   it("builds document writes behind the multi-table version gate", async () => {
@@ -953,6 +1441,47 @@ describe("MutationDatabase", () => {
       );
     } finally {
       warn.mockRestore();
+    }
+  });
+
+  it("emits OCC retry exhaustion metrics", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+
+    try {
+      await expect(
+        withMutationRetry(
+          () =>
+            Promise.reject(
+              new RetryableMutationConflictError(undefined, [
+                {
+                  partitionAligned: false,
+                  partitioned: false,
+                  scope: "row",
+                  table: "todos",
+                },
+              ])
+            ),
+          1,
+          "todos:create"
+        )
+      ).rejects.toThrow("Mutation conflict retry limit exceeded");
+
+      expect(info).toHaveBeenCalledWith(
+        "baseflare-runtime",
+        expect.objectContaining({
+          event: "runtime.metric",
+          metric: "baseflare.runtime.occ.retry_exhaustions",
+          tags: {
+            partitionAligned: false,
+            partitioned: false,
+            scope: "row",
+            table: "todos",
+          },
+          value: 1,
+        })
+      );
+    } finally {
+      info.mockRestore();
     }
   });
 

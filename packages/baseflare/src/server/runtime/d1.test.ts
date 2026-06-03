@@ -11,6 +11,8 @@ import {
   assertWithinScanBudget,
   buildRuntimeSelectQuery,
   type CommitGuard,
+  createEnsurePartitionVersionRows,
+  createGuardedPartitionVersionBumps,
   createGuardedTableVersionBumps,
   D1DatabaseAdapter,
   getNextRuntimeScanPosition,
@@ -352,6 +354,46 @@ describe("D1 runtime helpers", () => {
 
     expect(() => createGuardedTableVersionBumps([], guard)).toThrow(
       "Guarded table-version bump requires at least one table"
+    );
+  });
+
+  it("accepts missing partition-version rows only for recorded version zero", () => {
+    const bump = createGuardedTableVersionBumps(["messages"], {
+      partitionVersions: [
+        {
+          partitionKey: "by_channel",
+          partitionValue: '["missing"]',
+          tableName: "messages",
+          version: 0,
+        },
+      ],
+    });
+
+    expect(bump.sql).toContain("NOT EXISTS");
+    expect(bump.sql).toContain("version = 0");
+    expect(bump.params).toEqual([
+      "messages",
+      "messages",
+      "by_channel",
+      '["missing"]',
+      "messages",
+      "by_channel",
+      '["missing"]',
+    ]);
+  });
+
+  it("rejects empty partition-version operations", () => {
+    const guard: CommitGuard = {
+      insertedIds: new Map(),
+      rowRevisions: new Map(),
+      tableVersions: new Map(),
+    };
+
+    expect(() => createEnsurePartitionVersionRows([])).toThrow(
+      "Partition version row creation requires at least one partition"
+    );
+    expect(() => createGuardedPartitionVersionBumps([], guard, 1)).toThrow(
+      "Guarded partition-version bump requires at least one partition"
     );
   });
 });

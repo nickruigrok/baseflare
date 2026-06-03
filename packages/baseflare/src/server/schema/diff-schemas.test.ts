@@ -30,11 +30,14 @@ describe("diffSchemas", () => {
     expect(schemaDiff.addedIndexes).toEqual([
       {
         tableName: "todos",
-        index: { name: "by_completed", fields: ["completed"] },
+        index: { name: "by_completed", fields: ["completed"], partition: true },
       },
     ]);
     expect(schemaDiff.removedIndexes).toEqual([
-      { tableName: "todos", index: { name: "by_text", fields: ["text"] } },
+      {
+        tableName: "todos",
+        index: { name: "by_text", fields: ["text"], partition: true },
+      },
     ]);
   });
 
@@ -74,12 +77,15 @@ describe("diffSchemas", () => {
     const schemaDiff = diffSchemas(current, target);
 
     expect(schemaDiff.removedIndexes).toEqual([
-      { tableName: "todos", index: { name: "by_org", fields: ["orgId"] } },
+      {
+        tableName: "todos",
+        index: { name: "by_org", fields: ["orgId"], partition: true },
+      },
     ]);
     expect(schemaDiff.addedIndexes).toEqual([
       {
         tableName: "todos",
-        index: { name: "by_org", fields: ["orgId", "status"] },
+        index: { name: "by_org", fields: ["orgId", "status"], partition: true },
       },
     ]);
     expect(schemaDiff.toStatements()).toEqual([

@@ -5,7 +5,9 @@ import {
   assertQueryField,
   compareSqliteJsonValues,
   type FilterObject,
+  type FilterValue,
   matchesFilter,
+  normalizeFilterValue,
 } from "../db/filters";
 import type { QueryState } from "../db/query-builder";
 import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
@@ -18,7 +20,12 @@ import {
 import type { DatabaseWriter } from "../db/writer";
 import type { MutationCtx } from "../functions/types";
 import type { Rules } from "../permissions/types";
-import { type Schema, TABLE_VERSION_TABLE_NAME } from "../schema/types";
+import {
+  PARTITION_VERSION_TABLE_NAME,
+  type Schema,
+  TABLE_VERSION_TABLE_NAME,
+  type TableIndex,
+} from "../schema/types";
 
 import {
   assertKnownTable,
@@ -27,12 +34,16 @@ import {
   buildRuntimeSelectQuery,
   COUNT_SCAN_BUDGET_MESSAGE,
   type CommitGuard,
+  createEnsurePartitionVersionRows,
+  createGuardedPartitionVersionBumps,
   createGuardedTableVersionBumps,
   DEFAULT_SCAN_BUDGET_MESSAGE,
   deserializeRuntimeDocument,
   deserializeVersionedRuntimeDocument,
   getNextRuntimeScanPosition,
   getRuntimeScanQueryOptions,
+  type PartitionVersionKey,
+  type PartitionVersionRead,
   type RuntimeDocument,
   type RuntimeScanPosition,
   type StoredDocumentRow,
@@ -47,7 +58,7 @@ import {
   ValidationRuntimeError,
   withDatabaseErrorHandling,
 } from "./errors";
-import { logRuntimeEvent } from "./logging";
+import { emitRuntimeMetric, logRuntimeEvent } from "./logging";
 import {
   assertCanDelete,
   assertCanInsert,
@@ -62,13 +73,26 @@ type SessionDatabase = Pick<RuntimeDatabase, "batch" | "prepare">;
 interface PendingMutationWrite {
   readonly baseRev?: number;
   readonly document?: RuntimeDocument;
+  readonly previousDocument?: RuntimeDocument;
   readonly serializedData?: string;
   readonly type: "delete" | "insert" | "update";
 }
 
 interface TableVersionReadResult<TRow extends Record<string, unknown>> {
+  readonly partition?: PartitionReadTarget;
   readonly rows: readonly TRow[];
   readonly version: unknown;
+}
+
+interface PartitionReadTarget extends PartitionVersionKey {
+  readonly fields: readonly string[];
+}
+
+interface OccConflictMetricEvent {
+  readonly partitionAligned: boolean;
+  readonly partitioned: boolean;
+  readonly scope: "partition" | "row" | "table";
+  readonly table: string;
 }
 
 interface ScanBudget {
@@ -77,6 +101,11 @@ interface ScanBudget {
 }
 
 type CommitOperation =
+  | {
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+      readonly type: "ensure-partition-versions";
+    }
   | {
       readonly params: readonly (string | number | null)[];
       readonly sql: string;
@@ -95,14 +124,49 @@ type CommitOperation =
       readonly expectedChanges: number;
       readonly params: readonly (string | number | null)[];
       readonly sql: string;
+      readonly type: "bump-partition-versions";
+    }
+  | {
+      readonly partitionVersions: ReadonlyMap<string, PartitionVersionRead>;
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+      readonly type: "assert-partition-versions";
+    }
+  | {
+      readonly expectedChanges: number;
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
       readonly type: "delete" | "insert" | "update";
     };
 
 const MUTATION_QUERY_CHUNK_SIZE = 256;
 const D1_SESSION_REQUIRED_MESSAGE =
   "Baseflare runtime misconfiguration: APP_DB does not support D1 Sessions required for consistent mutations.";
+const OCC_CONFLICT_RETRY_METRIC = "baseflare.runtime.occ.conflict_retries";
+const OCC_RETRY_EXHAUSTION_METRIC = "baseflare.runtime.occ.retry_exhaustions";
+const OCC_CONTENTION_WARNING_THRESHOLD = 10;
+const OCC_CONTENTION_WARNING_WINDOW_MS = 60_000;
+const OCC_CONTENTION_WARNING_DEDUP_MS = 600_000;
+const occContentionWarningState = new Map<
+  string,
+  { count: number; lastWarnedAtMs: number; windowStartedAtMs: number }
+>();
 const missingTableVersionRowMessage = (tableName: string): string =>
   `Missing internal table version row for "${tableName}"; run applyRuntimeSchema before handling runtime traffic`;
+const missingPartitionVersionRowMessage = (
+  partition: PartitionVersionKey
+): string =>
+  `Missing internal partition version row for "${partition.tableName}/${partition.partitionKey}/${partition.partitionValue}"; run applyRuntimeSchema before handling runtime traffic`;
+const missingPositivePartitionVersionRowMessage = (
+  partition: PartitionVersionRead
+): string =>
+  `Partition version row for "${partition.tableName}/${partition.partitionKey}/${partition.partitionValue}" was present during the read phase (version ${partition.version}) but is now missing; this indicates data corruption or unexpected manual deletion`;
+
+declare const __BASEFLARE_DEV_WARNINGS__: boolean | undefined;
+
+export function resetOccContentionWarningStateForTest(): void {
+  occContentionWarningState.clear();
+}
 
 function createBaseQueryState(): QueryState {
   return { order: { field: "_id", direction: "asc" } };
@@ -132,6 +196,116 @@ function mergeFilters(
   return left ? { AND: [left, right] } : right;
 }
 
+function partitionVersionId(key: PartitionVersionKey): string {
+  return JSON.stringify([key.tableName, key.partitionKey, key.partitionValue]);
+}
+
+function serializePartitionValue(values: readonly FilterValue[]): string {
+  return JSON.stringify(values.map((value) => normalizeFilterValue(value)));
+}
+
+function isFilterValue(value: unknown): value is FilterValue {
+  const type = typeof value;
+  return (
+    value === null ||
+    type === "boolean" ||
+    type === "number" ||
+    type === "string"
+  );
+}
+
+function getEqualityValue(
+  filter: FilterObject | undefined,
+  fieldName: string
+): FilterValue | undefined {
+  if (!filter) {
+    return undefined;
+  }
+
+  const fieldFilter = filter[fieldName];
+  if (isFilterValue(fieldFilter)) {
+    return fieldFilter;
+  }
+
+  if (
+    fieldFilter &&
+    typeof fieldFilter === "object" &&
+    !Array.isArray(fieldFilter) &&
+    "eq" in fieldFilter &&
+    isFilterValue(fieldFilter.eq)
+  ) {
+    return fieldFilter.eq;
+  }
+
+  for (const nested of filter.AND ?? []) {
+    const value = getEqualityValue(nested, fieldName);
+    if (value !== undefined) {
+      return value;
+    }
+  }
+
+  return undefined;
+}
+
+function getPartitionIndex(table: {
+  readonly indexes: readonly TableIndex[];
+}): TableIndex | undefined {
+  return table.indexes.find((index) => index.partition === true);
+}
+
+function getPartitionReadTarget(
+  tableName: string,
+  table: { readonly indexes: readonly TableIndex[] },
+  state: QueryState
+): PartitionReadTarget | undefined {
+  const partitionIndex = getPartitionIndex(table);
+  if (!partitionIndex) {
+    return undefined;
+  }
+
+  const values: FilterValue[] = [];
+  for (const field of partitionIndex.fields) {
+    const value = getEqualityValue(state.filter, field);
+    if (value === undefined) {
+      return undefined;
+    }
+    values.push(value);
+  }
+
+  return {
+    fields: partitionIndex.fields,
+    partitionKey: partitionIndex.name,
+    partitionValue: serializePartitionValue(values),
+    tableName,
+  };
+}
+
+function getDocumentPartition(
+  tableName: string,
+  table: { readonly indexes: readonly TableIndex[] },
+  document: RuntimeDocument
+): PartitionVersionKey | undefined {
+  const partitionIndex = getPartitionIndex(table);
+  if (!partitionIndex) {
+    return undefined;
+  }
+
+  const values: FilterValue[] = [];
+  for (const field of partitionIndex.fields) {
+    const value = document[field];
+    if (!isFilterValue(value)) {
+      return undefined;
+    }
+    values.push(value);
+  }
+
+  return {
+    partitionKey: partitionIndex.name,
+    partitionValue: serializePartitionValue(values),
+    tableName,
+  };
+}
+
 function assertDirection(value: string): asserts value is QueryOrderDirection {
   if (value !== "asc" && value !== "desc") {
     throw new Error(
@@ -155,6 +329,68 @@ function hasCommittedEffect(write: PendingMutationWrite): boolean {
     write.type === "update" ||
     write.baseRev !== undefined
   );
+}
+
+function emitOccMetric(name: string, event: OccConflictMetricEvent): void {
+  emitRuntimeMetric(name, 1, {
+    partitionAligned: event.partitionAligned,
+    partitioned: event.partitioned,
+    scope: event.scope,
+    table: event.table,
+  });
+}
+
+function recordOccConflictRetryMetrics(
+  events: readonly OccConflictMetricEvent[]
+): void {
+  for (const event of events) {
+    emitOccMetric(OCC_CONFLICT_RETRY_METRIC, event);
+    if (
+      typeof __BASEFLARE_DEV_WARNINGS__ !== "undefined" &&
+      __BASEFLARE_DEV_WARNINGS__
+    ) {
+      maybeWarnOccContention(event);
+    }
+  }
+}
+
+function recordOccRetryExhaustionMetrics(
+  events: readonly OccConflictMetricEvent[]
+): void {
+  for (const event of events) {
+    emitOccMetric(OCC_RETRY_EXHAUSTION_METRIC, event);
+  }
+}
+
+function maybeWarnOccContention(event: OccConflictMetricEvent): void {
+  if (event.scope !== "table" || event.partitionAligned) {
+    return;
+  }
+
+  const now = Date.now();
+  const state = occContentionWarningState.get(event.table);
+  const currentState =
+    state && now - state.windowStartedAtMs <= OCC_CONTENTION_WARNING_WINDOW_MS
+      ? state
+      : { count: 0, lastWarnedAtMs: 0, windowStartedAtMs: now };
+
+  currentState.count += 1;
+  occContentionWarningState.set(event.table, currentState);
+
+  const canWarn =
+    currentState.count >= OCC_CONTENTION_WARNING_THRESHOLD &&
+    now - currentState.lastWarnedAtMs >= OCC_CONTENTION_WARNING_DEDUP_MS;
+  if (!canWarn) {
+    return;
+  }
+
+  currentState.lastWarnedAtMs = now;
+  logRuntimeEvent("warn", "runtime.occ_contention", {
+    message: event.partitioned
+      ? `Table "${event.table}" has contention on non-partition-aligned reads; route hot reads through its partition index.`
+      : `Table "${event.table}" has contention on table-level reads; add a partition index if writes cluster around one access axis.`,
+    table: event.table,
+  });
 }
 
 function compareDocuments(
@@ -242,8 +478,11 @@ function isRetryableConflict(error: unknown): boolean {
   return error instanceof RetryableMutationConflictError;
 }
 
-function requiresChangeCount(operation: CommitOperation): boolean {
+function requiresChangeCount(
+  operation: CommitOperation
+): operation is Extract<CommitOperation, { readonly expectedChanges: number }> {
   return (
+    operation.type === "bump-partition-versions" ||
     operation.type === "bump-table-versions" ||
     operation.type === "delete" ||
     operation.type === "insert" ||
@@ -392,8 +631,14 @@ class MutationQueryBuilder implements QueryBuilder<RuntimeDocument> {
 }
 
 export class RetryableMutationConflictError extends Error {
-  constructor(message = "Mutation commit conflicted with a concurrent write") {
+  readonly conflicts: readonly OccConflictMetricEvent[];
+
+  constructor(
+    message = "Mutation commit conflicted with a concurrent write",
+    conflicts: readonly OccConflictMetricEvent[] = []
+  ) {
     super(message);
+    this.conflicts = conflicts;
     this.name = "RetryableMutationConflictError";
   }
 }
@@ -405,6 +650,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   private readonly pendingWrites = new Map<
     string,
     Map<string, PendingMutationWrite>
+  >();
+  private readonly partitionReadVersions = new Map<
+    string,
+    PartitionVersionRead
   >();
   private readonly rowReadRevisions = new Map<string, Map<string, number>>();
   private readonly rules?: Rules;
@@ -431,6 +680,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       return;
     }
 
+    const conflictMetricEvents =
+      this.createOccConflictMetricEvents(mutatedTables);
     const operations = this.buildCommitOperations(mutatedTables);
     const statements = operations.map((operation) =>
       bindStatement(this.database, operation.sql, operation.params)
@@ -441,7 +692,11 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       this.validateCommitResults(operations, results);
     } catch (error) {
       if (isRetryableConflict(error)) {
-        throw new RetryableMutationConflictError();
+        recordOccConflictRetryMetrics(conflictMetricEvents);
+        throw new RetryableMutationConflictError(
+          undefined,
+          conflictMetricEvents
+        );
       }
 
       // RuntimeError subclasses raised during result validation propagate
@@ -526,7 +781,13 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     this.setPendingWrite(
       tableName,
       id,
-      this.createUpdatedWrite(existing.baseRev, existing.write, id, validated)
+      this.createUpdatedWrite(
+        existing.baseRev,
+        existing.write,
+        id,
+        validated,
+        existing.document
+      )
     );
   }
 
@@ -549,7 +810,13 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     this.setPendingWrite(
       tableName,
       id,
-      this.createUpdatedWrite(existing.baseRev, existing.write, id, validated)
+      this.createUpdatedWrite(
+        existing.baseRev,
+        existing.write,
+        id,
+        validated,
+        existing.document
+      )
     );
   }
 
@@ -571,6 +838,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     this.setPendingWrite(tableName, id, {
       type: "delete",
       baseRev: existing.write?.baseRev ?? existing.baseRev,
+      previousDocument: existing.write?.previousDocument ?? existing.document,
     });
   }
 
@@ -621,16 +889,19 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     budget: ScanBudget,
     scanBudgetMessage: string
   ): Promise<RuntimeDocument[]> {
+    const table = assertKnownTable(this.schema, tableName);
+    const partition = getPartitionReadTarget(tableName, table, state);
     const chunkSize = getMutationQueryChunkSize(state, shadowedBaseIds.size);
     if (chunkSize === 0) {
-      const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
+      const read = await this.fetchReadVersionAndRows<StoredDocumentRow>(
         tableName,
+        partition,
         {
           sql: `SELECT _id, _data, _rev FROM ${tableName} LIMIT 0`,
           params: [],
         }
       );
-      this.recordTableReadVersion(tableName, read.version);
+      this.recordReadVersion(tableName, read);
       return [];
     }
 
@@ -639,8 +910,9 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
     while (true) {
       const scanOptions = getRuntimeScanQueryOptions(scanPosition, cursor);
-      const read = await this.fetchTableVersionAndRows<StoredDocumentRow>(
+      const read = await this.fetchReadVersionAndRows<StoredDocumentRow>(
         tableName,
+        partition,
         buildRuntimeSelectQuery(tableName, state, {
           cursor: scanOptions.cursor,
           limit: chunkSize,
@@ -649,11 +921,11 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       );
       const { rows } = read;
       if (rows.length === 0) {
-        this.recordTableReadVersion(tableName, read.version);
+        this.recordReadVersion(tableName, read);
         break;
       }
 
-      this.recordTableReadVersion(tableName, read.version);
+      this.recordReadVersion(tableName, read);
       scanPosition = getNextRuntimeScanPosition(
         tableName,
         state,
@@ -773,18 +1045,38 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     this.assertMutatedTablesHaveCommittedWrites(mutatedTables);
 
     const guard = this.createCommitGuard();
+    const partitionBumpTargets = this.getPartitionBumpTargets(mutatedTables);
     const checkedTableNames = [
       ...new Set([...mutatedTables, ...this.tableReadVersions.keys()]),
     ];
-    const operations: CommitOperation[] = [
-      this.createTableVersionAssertionOperation(checkedTableNames),
-      createGuardedTableVersionBumps(mutatedTables, guard),
-    ];
+    const operations: CommitOperation[] = [];
+    if (partitionBumpTargets.length > 0) {
+      operations.push(createEnsurePartitionVersionRows(partitionBumpTargets));
+    }
+    operations.push(
+      this.createTableVersionAssertionOperation(checkedTableNames)
+    );
+    if (this.partitionReadVersions.size > 0) {
+      operations.push(this.createPartitionVersionAssertionOperation());
+    }
+    operations.push(createGuardedTableVersionBumps(mutatedTables, guard));
+    if (partitionBumpTargets.length > 0) {
+      operations.push(
+        createGuardedPartitionVersionBumps(
+          partitionBumpTargets,
+          guard,
+          mutatedTables.length
+        )
+      );
+    }
     // D1 batches run statements in order inside one SQLite transaction, and
     // changes() observes the immediately previous statement. The plural
     // version bump is the OCC gate; if it affects 0 rows, every following
     // document write is already a SQL-level no-op through this chain.
-    let expectedPreviousChanges = mutatedTables.length;
+    let expectedPreviousChanges =
+      partitionBumpTargets.length > 0
+        ? partitionBumpTargets.length
+        : mutatedTables.length;
 
     for (const tableName of mutatedTables) {
       expectedPreviousChanges = this.appendWriteStatementsForTable(
@@ -795,6 +1087,103 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     return operations;
+  }
+
+  private createOccConflictMetricEvents(
+    mutatedTables: readonly string[]
+  ): OccConflictMetricEvent[] {
+    const tableNames = new Set<string>(mutatedTables);
+    const partitionAlignedTables = new Set<string>();
+
+    for (const tableName of this.tableReadVersions.keys()) {
+      tableNames.add(tableName);
+    }
+
+    for (const partition of this.partitionReadVersions.values()) {
+      tableNames.add(partition.tableName);
+      partitionAlignedTables.add(partition.tableName);
+    }
+
+    return [...tableNames].sort().map((tableName) => {
+      const table = assertKnownTable(this.schema, tableName);
+      const partitioned = getPartitionIndex(table) !== undefined;
+      let scope: OccConflictMetricEvent["scope"] = "row";
+      if (this.tableReadVersions.has(tableName)) {
+        scope = "table";
+      } else if (partitionAlignedTables.has(tableName)) {
+        scope = "partition";
+      }
+
+      return {
+        partitionAligned:
+          partitionAlignedTables.has(tableName) &&
+          !this.tableReadVersions.has(tableName),
+        partitioned,
+        scope,
+        table: tableName,
+      };
+    });
+  }
+
+  private getPartitionBumpTargets(
+    mutatedTables: readonly string[]
+  ): PartitionVersionKey[] {
+    const targets = new Map<string, PartitionVersionKey>();
+
+    for (const tableName of mutatedTables) {
+      const table = assertKnownTable(this.schema, tableName);
+      const writes = this.pendingWrites.get(tableName);
+      if (!(writes && getPartitionIndex(table))) {
+        continue;
+      }
+
+      for (const write of writes.values()) {
+        if (!hasCommittedEffect(write)) {
+          continue;
+        }
+
+        for (const partition of this.getWritePartitions(
+          tableName,
+          table,
+          write
+        )) {
+          targets.set(partitionVersionId(partition), partition);
+        }
+      }
+    }
+
+    return [...targets.values()].sort((left, right) =>
+      partitionVersionId(left).localeCompare(partitionVersionId(right))
+    );
+  }
+
+  private getWritePartitions(
+    tableName: string,
+    table: { readonly indexes: readonly TableIndex[] },
+    write: PendingMutationWrite
+  ): PartitionVersionKey[] {
+    const partitions = new Map<string, PartitionVersionKey>();
+    const addPartition = (document: RuntimeDocument | undefined): void => {
+      if (!document) {
+        return;
+      }
+
+      const partition = getDocumentPartition(tableName, table, document);
+      if (partition) {
+        partitions.set(partitionVersionId(partition), partition);
+      }
+    };
+
+    if (write.type === "insert") {
+      addPartition(write.document);
+    } else if (write.type === "update") {
+      addPartition(write.previousDocument);
+      addPartition(write.document);
+    } else {
+      addPartition(write.previousDocument);
+    }
+
+    return [...partitions.values()];
   }
 
   private assertMutatedTablesHaveCommittedWrites(
@@ -823,6 +1212,29 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     };
   }
 
+  private createPartitionVersionAssertionOperation(): CommitOperation {
+    const partitions = [...this.partitionReadVersions.values()].sort(
+      (left, right) =>
+        partitionVersionId(left).localeCompare(partitionVersionId(right))
+    );
+    const conditions = partitions
+      .map(
+        () => "(table_name = ? AND partition_key = ? AND partition_value = ?)"
+      )
+      .join(" OR ");
+
+    return {
+      type: "assert-partition-versions",
+      sql: `SELECT table_name, partition_key, partition_value, version FROM ${PARTITION_VERSION_TABLE_NAME} WHERE ${conditions}`,
+      params: partitions.flatMap((partition) => [
+        partition.tableName,
+        partition.partitionKey,
+        partition.partitionValue,
+      ]),
+      partitionVersions: this.partitionReadVersions,
+    };
+  }
+
   private createRuntimeDocument(
     id: string,
     document: Record<string, unknown>
@@ -838,7 +1250,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     baseRev: number | undefined,
     existingWrite: PendingMutationWrite | undefined,
     id: string,
-    document: Record<string, unknown>
+    document: Record<string, unknown>,
+    previousDocument: RuntimeDocument
   ): PendingMutationWrite {
     const runtimeDocument = this.createRuntimeDocument(id, document);
     const serializedData = serialize(document)._data;
@@ -851,6 +1264,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       type: "update",
       baseRev: existingWrite?.baseRev ?? baseRev,
       document: runtimeDocument,
+      previousDocument: existingWrite?.previousDocument ?? previousDocument,
       serializedData,
     };
   }
@@ -1031,6 +1445,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
     return {
       insertedIds,
+      partitionVersions: [...this.partitionReadVersions.values()],
       rowRevisions,
       tableVersions: this.tableReadVersions,
     };
@@ -1140,32 +1555,46 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
         continue;
       }
 
-      const changes = result.meta?.changes;
+      if (operation.type === "assert-partition-versions") {
+        this.validatePartitionVersionAssertion(operation, result);
+        continue;
+      }
+
       if (requiresChangeCount(operation)) {
-        if (changes === undefined) {
-          throw new InternalRuntimeError(
-            `Mutation commit operation "${operation.type}" did not report a D1 change count`
-          );
-        }
-
-        if (changes !== operation.expectedChanges) {
-          // Document writes are SQL-gated by changes(), so an under-applied
-          // plural bump means later writes were already no-ops inside the D1
-          // batch. The global SQL guard should be binary today, but any
-          // under-application is still safest to retry.
-          if (
-            operation.type === "bump-table-versions" &&
-            changes < operation.expectedChanges
-          ) {
-            throw new RetryableMutationConflictError();
-          }
-
-          throw new InternalRuntimeError(
-            `Mutation commit operation "${operation.type}" applied ${changes} rows but expected ${operation.expectedChanges}`
-          );
-        }
+        this.validateCommitChangeCount(operation, result.meta?.changes);
       }
     }
+  }
+
+  private validateCommitChangeCount(
+    operation: Extract<CommitOperation, { expectedChanges: number }>,
+    changes: number | undefined
+  ): void {
+    if (changes === undefined) {
+      throw new InternalRuntimeError(
+        `Mutation commit operation "${operation.type}" did not report a D1 change count`
+      );
+    }
+
+    if (changes === operation.expectedChanges) {
+      return;
+    }
+
+    // Document writes are SQL-gated by changes(), so an under-applied plural
+    // bump means later writes were already no-ops inside the D1 batch. The
+    // global SQL guard should be binary today, but any under-application is
+    // still safest to retry.
+    if (
+      (operation.type === "bump-table-versions" ||
+        operation.type === "bump-partition-versions") &&
+      changes < operation.expectedChanges
+    ) {
+      throw new RetryableMutationConflictError();
+    }
+
+    throw new InternalRuntimeError(
+      `Mutation commit operation "${operation.type}" applied ${changes} rows but expected ${operation.expectedChanges}`
+    );
   }
 
   private validateTableVersionAssertion(
@@ -1190,6 +1619,52 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
 
       const readVersion = operation.tableVersions.get(tableName);
       if (readVersion !== undefined && version !== readVersion) {
+        throw new RetryableMutationConflictError();
+      }
+    }
+  }
+
+  private validatePartitionVersionAssertion(
+    operation: Extract<CommitOperation, { type: "assert-partition-versions" }>,
+    result: D1Result
+  ): void {
+    const versions = new Map(
+      (result.results ?? []).flatMap((row) => {
+        if (
+          typeof row.table_name !== "string" ||
+          typeof row.partition_key !== "string" ||
+          typeof row.partition_value !== "string" ||
+          typeof row.version !== "number"
+        ) {
+          return [];
+        }
+
+        return [
+          [
+            partitionVersionId({
+              tableName: row.table_name,
+              partitionKey: row.partition_key,
+              partitionValue: row.partition_value,
+            }),
+            row.version,
+          ] as const,
+        ];
+      })
+    );
+
+    for (const partition of operation.partitionVersions.values()) {
+      const version = versions.get(partitionVersionId(partition));
+      if (typeof version !== "number") {
+        if (partition.version === 0) {
+          continue;
+        }
+
+        throw new InternalRuntimeError(
+          missingPositivePartitionVersionRowMessage(partition)
+        );
+      }
+
+      if (version !== partition.version) {
         throw new RetryableMutationConflictError();
       }
     }
@@ -1254,6 +1729,71 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     };
   }
 
+  private async fetchReadVersionAndRows<TRow extends Record<string, unknown>>(
+    tableName: string,
+    partition: PartitionReadTarget | undefined,
+    query: {
+      readonly params: readonly (string | number | null)[];
+      readonly sql: string;
+    }
+  ): Promise<TableVersionReadResult<TRow>> {
+    if (!partition) {
+      return this.fetchTableVersionAndRows(tableName, query);
+    }
+
+    const versionSql = `SELECT version FROM ${PARTITION_VERSION_TABLE_NAME} WHERE table_name = ? AND partition_key = ? AND partition_value = ? LIMIT 1`;
+    const partitionParams = [
+      partition.tableName,
+      partition.partitionKey,
+      partition.partitionValue,
+    ];
+    const results = await withDatabaseErrorHandling(
+      "Failed to run D1 mutation partition read",
+      async () =>
+        this.database.batch([
+          bindStatement(this.database, versionSql, partitionParams),
+          bindStatement(this.database, query.sql, query.params),
+        ])
+    );
+    const versionResult = results[0];
+    const queryResult = results[1];
+    if (!(versionResult && queryResult)) {
+      throw new InternalRuntimeError(
+        "D1 mutation partition read did not return all batch results"
+      );
+    }
+
+    ensureSuccessfulD1Result(
+      versionResult,
+      `Failed to run D1 query "${versionSql}"`
+    );
+    ensureSuccessfulD1Result(
+      queryResult,
+      `Failed to run D1 query "${query.sql}"`
+    );
+
+    return {
+      partition,
+      version:
+        versionResult.results?.[0] === undefined
+          ? 0
+          : versionResult.results[0].version,
+      rows: (queryResult.results ?? []) as readonly TRow[],
+    };
+  }
+
+  private recordReadVersion(
+    tableName: string,
+    read: TableVersionReadResult<Record<string, unknown>>
+  ): void {
+    if (read.partition) {
+      this.recordPartitionReadVersion(read.partition, read.version);
+      return;
+    }
+
+    this.recordTableReadVersion(tableName, read.version);
+  }
+
   private recordTableReadVersion(tableName: string, version: unknown): void {
     if (typeof version !== "number") {
       throw new InternalRuntimeError(missingTableVersionRowMessage(tableName));
@@ -1266,6 +1806,28 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     }
 
     if (existing !== version) {
+      throw new RetryableMutationConflictError();
+    }
+  }
+
+  private recordPartitionReadVersion(
+    partition: PartitionVersionKey,
+    version: unknown
+  ): void {
+    if (typeof version !== "number") {
+      throw new InternalRuntimeError(
+        missingPartitionVersionRowMessage(partition)
+      );
+    }
+
+    const key = partitionVersionId(partition);
+    const existing = this.partitionReadVersions.get(key);
+    if (existing === undefined) {
+      this.partitionReadVersions.set(key, { ...partition, version });
+      return;
+    }
+
+    if (existing.version !== version) {
       throw new RetryableMutationConflictError();
     }
   }
@@ -1324,6 +1886,7 @@ export async function withMutationRetry<TResult>(
         attempt === maxAttempts - 1
       ) {
         if (error instanceof RetryableMutationConflictError) {
+          recordOccRetryExhaustionMetrics(error.conflicts);
           logRuntimeEvent("error", "mutation.retry_exhausted", {
             attempts: maxAttempts,
             functionName,
