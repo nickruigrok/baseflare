@@ -538,12 +538,14 @@ export class RealtimeConnectionDO {
       );
     }
 
-    for (const subscription of subscriptions) {
-      await this.registerSubscription(
-        parseObject(subscription, "Realtime subscription"),
-        socket
-      );
-    }
+    await Promise.all(
+      subscriptions.map((subscription) =>
+        this.registerSubscription(
+          parseObject(subscription, "Realtime subscription"),
+          socket
+        )
+      )
+    );
     socket.send(JSON.stringify({ type: "restored" }));
   }
 
@@ -693,7 +695,8 @@ export class RealtimeSubscriptionDO {
         typeof body.limit === "number" ? body.limit : 100
       );
       this.advanceLastSeenSequence(events.at(-1)?.sequence);
-      return jsonResponse({ events, ok: true });
+      const result = await this.reEvaluateActiveRegistrations();
+      return jsonResponse({ ...result, events, ok: true });
     }
 
     if (url.pathname === "/registrations") {

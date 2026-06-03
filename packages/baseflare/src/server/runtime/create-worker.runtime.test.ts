@@ -1024,6 +1024,78 @@ describe("worker runtime", () => {
     expect(missingBody.delivered).toBe(0);
   });
 
+  it("restores realtime subscriptions without serial register round trips", async () => {
+    let activeRegistrations = 0;
+    let maxActiveRegistrations = 0;
+    const registerRequests: unknown[] = [];
+    const subscriptionDo = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        activeRegistrations += 1;
+        maxActiveRegistrations = Math.max(
+          maxActiveRegistrations,
+          activeRegistrations
+        );
+        registerRequests.push(await request.json());
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        activeRegistrations -= 1;
+        return Response.json({ ok: true });
+      }
+    );
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(JSON.parse(String(event.data)) as { type: string });
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+          },
+          {
+            args: { ownerToken: "owner-b" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-b",
+          },
+        ],
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 3; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(registerRequests).toHaveLength(2);
+    expect(maxActiveRegistrations).toBe(2);
+    expect(messages.map((message) => message.type).sort()).toEqual([
+      "restored",
+      "subscribed",
+      "subscribed",
+    ]);
+    expect(messages.at(-1)?.type).toBe("restored");
+  });
+
   it("keeps realtime registration failures from blocking other subscribers", async () => {
     const errorSpy = vi
       .spyOn(console, "error")
@@ -1191,6 +1263,89 @@ describe("worker runtime", () => {
     };
 
     expect(registrationsBody.lastSeenSequence).toBe(body.events[0]?.sequence);
+  });
+
+  it("re-evaluates active realtime registrations during catch-up", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveries.push(await request.json());
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string, queryName: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName,
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await register("sub-bad", "todos:renamed");
+    await register("sub-good", "todos:list");
+    await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken: "owner-a", text: "catch-up-delivered" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      },
+      worker,
+      { ...env, REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace() }
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      events: Array<{ sequence: number }>;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body.events).toHaveLength(1);
+    expect(body).toEqual(
+      expect.objectContaining({ evaluated: 1, failed: 1, ok: true })
+    );
+    expect(deliveries).toHaveLength(1);
+    expect(
+      (
+        deliveries[0] as {
+          result: Array<{ text: string }>;
+          subscriptionId: string;
+        }
+      ).subscriptionId
+    ).toBe("sub-good");
+    expect(
+      (
+        deliveries[0] as {
+          result: Array<{ text: string }>;
+        }
+      ).result.map((todo) => todo.text)
+    ).toEqual(["catch-up-delivered"]);
   });
 
   it("uses realtime outbox sequence instead of event id for catch-up", async () => {
