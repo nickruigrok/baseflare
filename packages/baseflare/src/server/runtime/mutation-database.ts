@@ -76,9 +76,11 @@ import {
 import {
   createRealtimeOutboxEvent,
   createRealtimeOutboxOperation,
-  type RealtimeMutationNotifier,
-  type RealtimeOutboxEvent,
-} from "./realtime";
+} from "./realtime/outbox";
+import type {
+  RealtimeMutationNotifier,
+  RealtimeOutboxEvent,
+} from "./realtime/types";
 import type { D1DatabaseSession, D1Result, RuntimeDatabase } from "./types";
 
 type SessionDatabase = Pick<RuntimeDatabase, "batch" | "prepare">;

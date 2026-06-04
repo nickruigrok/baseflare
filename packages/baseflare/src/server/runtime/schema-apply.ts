@@ -3,6 +3,7 @@ import {
   createIndexStatement,
   createPartitionVersionStatements,
   createRealtimeOutboxStatements,
+  createRealtimeShardMetadataStatements,
   createTableVersionStatements,
   type Schema,
   type SqlStatement,
@@ -46,6 +47,7 @@ export async function applyRuntimeSchema(
   statements.push(...createTableVersionStatements(tableNames));
   statements.push(...createPartitionVersionStatements());
   statements.push(...createRealtimeOutboxStatements());
+  statements.push(...createRealtimeShardMetadataStatements());
 
   await withDatabaseErrorHandling(
     "Failed to apply runtime schema",

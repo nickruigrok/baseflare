@@ -1,0 +1,291 @@
+import { generateId } from "baseflare/values";
+import { REALTIME_OUTBOX_TABLE_NAME } from "../../schema/types";
+import { bindStatement } from "../d1";
+import { InternalRuntimeError } from "../errors";
+import { logRuntimeEvent } from "../logging";
+import type {
+  BaseflareExecutionContext,
+  BaseflareRuntimeEnv,
+  DurableObjectNamespace,
+  DurableObjectStub,
+  RuntimeDatabase,
+} from "../types";
+import {
+  getRealtimeAffectedSubscriptionRouteTargets,
+  getRealtimeSubscriptionShardName,
+} from "./routing";
+import { fetchRoutableRealtimeShardGenerations } from "./shards";
+import type {
+  RealtimeMutationNotifier,
+  RealtimeOutboxEvent,
+  RealtimeOutboxOperation,
+  RealtimePartitionTarget,
+  RealtimeSequencedOutboxEvent,
+  RealtimeShardGeneration,
+  RealtimeSubscriptionRouteTarget,
+} from "./types";
+import {
+  JSON_HEADERS,
+  REALTIME_CATCH_UP_EVENT_LIMIT,
+  REALTIME_OUTBOX_CLEANUP_LIMIT,
+} from "./types";
+
+export function createRealtimeOutboxResponseEvents(
+  events: readonly RealtimeSequencedOutboxEvent[]
+): Array<RealtimeOutboxEvent & { readonly sequence: number }> {
+  return events.map((event) => ({
+    eventId: event.eventId,
+    partitions: event.partitions,
+    sequence: event.sequence,
+    tables: event.tables,
+  }));
+}
+
+export function createRealtimeOutboxOperation(
+  event: RealtimeOutboxEvent,
+  expectedPreviousChanges: number
+): RealtimeOutboxOperation {
+  return {
+    event,
+    expectedChanges: 1,
+    params: [
+      event.eventId,
+      Date.now(),
+      JSON.stringify(event.tables),
+      JSON.stringify(event.partitions),
+      expectedPreviousChanges,
+    ],
+    sql: `INSERT INTO ${REALTIME_OUTBOX_TABLE_NAME} (event_id, created_at, tables, partitions)
+          SELECT ?, ?, ?, ? WHERE changes() = ?`,
+    type: "insert-realtime-outbox",
+  };
+}
+
+export function createRealtimeOutboxEvent(
+  tableNames: readonly string[],
+  partitions: readonly RealtimePartitionTarget[]
+): RealtimeOutboxEvent {
+  return {
+    eventId: generateId(),
+    partitions: [...partitions].sort((left, right) =>
+      `${left.tableName}/${left.partitionKey}/${left.partitionValue}`.localeCompare(
+        `${right.tableName}/${right.partitionKey}/${right.partitionValue}`
+      )
+    ),
+    tables: [...tableNames].sort(),
+  };
+}
+
+export function createRealtimeMutationNotifier(
+  env: BaseflareRuntimeEnv,
+  ctx: BaseflareExecutionContext
+): RealtimeMutationNotifier | undefined {
+  if (!env.REALTIME_SUBSCRIPTIONS) {
+    return undefined;
+  }
+  const subscriptionNamespace = env.REALTIME_SUBSCRIPTIONS;
+
+  return {
+    enabled: true,
+    notify(events) {
+      for (const event of events) {
+        ctx.waitUntil(
+          notifyRealtimeSubscriptionShards(
+            env.APP_DB,
+            subscriptionNamespace,
+            event
+          ).catch((error: unknown) => {
+            logRuntimeEvent("error", "runtime.realtime_notify_failed", {
+              errorName: error instanceof Error ? error.name : typeof error,
+              eventId: event.eventId,
+            });
+          })
+        );
+      }
+    },
+  };
+}
+
+async function notifyRealtimeSubscriptionShards(
+  database: Pick<RuntimeDatabase, "prepare">,
+  namespace: DurableObjectNamespace,
+  event: RealtimeOutboxEvent
+): Promise<void> {
+  const generations = await fetchRoutableRealtimeShardGenerations(database);
+  const stubs = getRealtimeSubscriptionStubs(
+    namespace,
+    getRealtimeAffectedSubscriptionRouteTargets(event),
+    generations
+  );
+  await Promise.all(
+    stubs.map(({ generation, shardName, stub }) =>
+      stub
+        .fetch("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId: event.eventId, shardName }),
+          headers: JSON_HEADERS,
+          method: "POST",
+        })
+        .then((response) => {
+          if (!response.ok) {
+            throw new InternalRuntimeError(
+              `Realtime notify failed for ${shardName} with status ${response.status}`
+            );
+          }
+        })
+        .catch((error: unknown) => {
+          logRuntimeEvent("error", "runtime.realtime_notify_failed", {
+            errorName: error instanceof Error ? error.name : typeof error,
+            eventId: event.eventId,
+            generationId: generation.generationId,
+            shardName,
+          });
+        })
+    )
+  );
+}
+
+function getRealtimeSubscriptionStubs(
+  namespace: DurableObjectNamespace,
+  routes: readonly RealtimeSubscriptionRouteTarget[],
+  generations: readonly RealtimeShardGeneration[]
+): Array<{
+  readonly generation: RealtimeShardGeneration;
+  readonly shardName: string;
+  readonly stub: DurableObjectStub;
+}> {
+  const stubs = new Map<
+    string,
+    {
+      readonly generation: RealtimeShardGeneration;
+      readonly shardName: string;
+      readonly stub: DurableObjectStub;
+    }
+  >();
+  for (const generation of generations) {
+    for (const route of routes) {
+      const shardName = getRealtimeSubscriptionShardName(route, generation);
+      stubs.set(shardName, {
+        generation,
+        shardName,
+        stub: namespace.get(namespace.idFromName(shardName)),
+      });
+    }
+  }
+
+  return [...stubs.values()];
+}
+
+export async function fetchRealtimeOutboxEvents(
+  database: Pick<RuntimeDatabase, "prepare">,
+  afterSequence: number | null,
+  limit: number
+): Promise<
+  Array<{
+    readonly createdAt: number;
+    readonly eventId: string;
+    readonly partitions: readonly RealtimePartitionTarget[];
+    readonly sequence: number;
+    readonly tables: readonly string[];
+  }>
+> {
+  const boundedLimit = Math.min(
+    Math.max(limit, 1),
+    REALTIME_CATCH_UP_EVENT_LIMIT
+  );
+  const sql =
+    afterSequence === null
+      ? `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} ORDER BY sequence ASC LIMIT ?`
+      : `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE sequence > ? ORDER BY sequence ASC LIMIT ?`;
+  const params =
+    afterSequence === null ? [boundedLimit] : [afterSequence, boundedLimit];
+  const result = await bindStatement(database, sql, params).all<{
+    created_at: number;
+    event_id: string;
+    partitions: string;
+    sequence: number;
+    tables: string;
+  }>();
+
+  return (result.results ?? []).map((row) => ({
+    createdAt: row.created_at,
+    eventId: row.event_id,
+    partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
+    sequence: row.sequence,
+    tables: JSON.parse(row.tables) as string[],
+  }));
+}
+
+export async function fetchRealtimeOutboxEventById(
+  database: Pick<RuntimeDatabase, "prepare">,
+  eventId: string
+): Promise<{
+  readonly createdAt: number;
+  readonly eventId: string;
+  readonly partitions: readonly RealtimePartitionTarget[];
+  readonly sequence: number;
+  readonly tables: readonly string[];
+} | null> {
+  const row = await bindStatement(
+    database,
+    `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
+    [eventId]
+  ).first<{
+    created_at: number;
+    event_id: string;
+    partitions: string;
+    sequence: number;
+    tables: string;
+  }>();
+  if (!row) {
+    return null;
+  }
+
+  return {
+    createdAt: row.created_at,
+    eventId: row.event_id,
+    partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
+    sequence: row.sequence,
+    tables: JSON.parse(row.tables) as string[],
+  };
+}
+
+export async function fetchOldestRealtimeOutboxSequence(
+  database: Pick<RuntimeDatabase, "prepare">
+): Promise<number | null> {
+  const row = await bindStatement(
+    database,
+    `SELECT MIN(sequence) AS sequence FROM ${REALTIME_OUTBOX_TABLE_NAME}`,
+    []
+  ).first<{ sequence: number | null }>();
+
+  return typeof row?.sequence === "number" ? row.sequence : null;
+}
+
+export async function deleteRealtimeOutboxEventsBefore(
+  database: Pick<RuntimeDatabase, "prepare">,
+  createdBefore: number,
+  limit: number,
+  protectedSequence: number | null = null
+): Promise<void> {
+  const boundedLimit = Math.min(
+    Math.max(limit, 1),
+    REALTIME_OUTBOX_CLEANUP_LIMIT
+  );
+  const sequenceGuard = protectedSequence == null ? "" : "AND sequence < ?";
+  const params =
+    protectedSequence == null
+      ? [createdBefore, boundedLimit]
+      : [createdBefore, protectedSequence, boundedLimit];
+  await bindStatement(
+    database,
+    `DELETE FROM ${REALTIME_OUTBOX_TABLE_NAME}
+     WHERE sequence IN (
+       SELECT sequence FROM ${REALTIME_OUTBOX_TABLE_NAME}
+       WHERE created_at < ?
+       ${sequenceGuard}
+       ORDER BY created_at ASC
+       LIMIT ?
+     )`,
+    params
+  ).run();
+}

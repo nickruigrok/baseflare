@@ -10,6 +10,11 @@ const FILTER_LOGIC_FIELD_NAMES = new Set(["AND", "OR", "NOT"]);
 export const TABLE_VERSION_TABLE_NAME = "_bf_table_versions";
 export const PARTITION_VERSION_TABLE_NAME = "_bf_partition_versions";
 export const REALTIME_OUTBOX_TABLE_NAME = "_bf_realtime_outbox";
+export const REALTIME_SHARD_CURSORS_TABLE_NAME = "_bf_realtime_shard_cursors";
+export const REALTIME_SHARD_GENERATIONS_TABLE_NAME =
+  "_bf_realtime_shard_generations";
+export const REALTIME_AUTOSCALE_STATE_TABLE_NAME =
+  "_bf_realtime_autoscale_state";
 
 export interface TableIndexOptions {
   readonly partition?: boolean;
@@ -173,6 +178,31 @@ export function createRealtimeOutboxStatements(): SqlStatement[] {
     },
     {
       sql: `CREATE INDEX IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME}_created_at ON ${REALTIME_OUTBOX_TABLE_NAME} (created_at)`,
+      params: [],
+    },
+  ];
+}
+
+export function createRealtimeShardMetadataStatements(): SqlStatement[] {
+  return [
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_SHARD_GENERATIONS_TABLE_NAME} (generation_id INTEGER PRIMARY KEY, subscription_shard_count INTEGER NOT NULL CHECK(subscription_shard_count > 0), status TEXT NOT NULL CHECK(status IN ('active', 'draining', 'retired')), created_at INTEGER NOT NULL, drain_after INTEGER)`,
+      params: [],
+    },
+    {
+      sql: `INSERT OR IGNORE INTO ${REALTIME_SHARD_GENERATIONS_TABLE_NAME} (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (1, 1, 'active', 0, NULL)`,
+      params: [],
+    },
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_SHARD_CURSORS_TABLE_NAME} (shard_name TEXT PRIMARY KEY, generation_id INTEGER NOT NULL, last_processed_outbox_sequence INTEGER, updated_at INTEGER NOT NULL)`,
+      params: [],
+    },
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_AUTOSCALE_STATE_TABLE_NAME} (id INTEGER PRIMARY KEY CHECK(id = 1), scale_up_started_at INTEGER, scale_down_started_at INTEGER, updated_at INTEGER NOT NULL)`,
+      params: [],
+    },
+    {
+      sql: `INSERT OR IGNORE INTO ${REALTIME_AUTOSCALE_STATE_TABLE_NAME} (id, scale_up_started_at, scale_down_started_at, updated_at) VALUES (1, NULL, NULL, 0)`,
       params: [],
     },
   ];

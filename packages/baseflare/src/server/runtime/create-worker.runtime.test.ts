@@ -1,6 +1,9 @@
 import {
   createExecutionContext,
   env,
+  runDurableObjectAlarm,
+  runInDurableObject,
+  SELF,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import {
@@ -32,17 +35,27 @@ import { defineTable } from "../schema/define-table";
 import { createWorker } from "./create-worker";
 import { createFunctionIndex } from "./function-index";
 import { buildBaseflareManifest } from "./manifest";
+import { RealtimeConnectionDO } from "./realtime/connection-do";
 import {
-  configureRealtimeRuntime,
+  createRealtimeGlobalSubscriptionRouteTarget,
+  createRealtimePartitionSubscriptionRouteTarget,
+  createRealtimeTableSubscriptionRouteTarget,
+  getRealtimeAffectedSubscriptionRouteTargets,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
+} from "./realtime/routing";
+import { evaluateRealtimeAutoscalingForTest } from "./realtime/shards";
+import {
+  configureRealtimeRuntime,
+  resetRealtimeRuntimeStateForTest,
+} from "./realtime/shared";
+import { RealtimeSubscriptionDO } from "./realtime/subscription-do";
+import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
-  RealtimeConnectionDO,
-  RealtimeSubscriptionDO,
-  resetRealtimeRuntimeStateForTest,
-} from "./realtime";
+  REALTIME_MAX_SUBSCRIPTION_SHARDS,
+} from "./realtime/types";
 import { applyRuntimeSchema } from "./schema-apply";
 import type {
   BaseflareManifest,
@@ -56,6 +69,8 @@ import type {
 declare module "cloudflare:test" {
   interface ProvidedEnv {
     APP_DB: D1Database;
+    REALTIME_CONNECTIONS: DurableObjectNamespace;
+    REALTIME_SUBSCRIPTIONS: DurableObjectNamespace;
   }
 }
 
@@ -86,6 +101,47 @@ class FakeDurableObjectNamespace implements DurableObjectNamespace {
   idFromName(name: string): DurableObjectId {
     return { name };
   }
+}
+
+type AttachedTestWebSocket = WebSocket & {
+  accept(): void;
+  deserializeAttachment?: () => unknown;
+  serializeAttachment?: (attachment: unknown) => void;
+};
+
+class FakeRealtimeDurableObjectState {
+  readonly acceptedSockets: AttachedTestWebSocket[] = [];
+  readonly attachments = new WeakMap<AttachedTestWebSocket, unknown>();
+  private readonly hibernatedSockets: readonly AttachedTestWebSocket[];
+  alarmTime: number | null = null;
+
+  constructor(hibernatedSockets: readonly AttachedTestWebSocket[] = []) {
+    this.hibernatedSockets = hibernatedSockets;
+  }
+
+  acceptWebSocket(socket: AttachedTestWebSocket): void {
+    socket.serializeAttachment = (attachment: unknown) => {
+      this.attachments.set(socket, attachment);
+    };
+    socket.deserializeAttachment = () => this.attachments.get(socket);
+    this.acceptedSockets.push(socket);
+    socket.accept?.();
+  }
+
+  getWebSockets(): AttachedTestWebSocket[] {
+    return [...this.hibernatedSockets, ...this.acceptedSockets];
+  }
+
+  storage = {
+    deleteAlarm: () => {
+      this.alarmTime = null;
+      return Promise.resolve();
+    },
+    setAlarm: (scheduledTime: number) => {
+      this.alarmTime = scheduledTime;
+      return Promise.resolve();
+    },
+  };
 }
 
 const schema = defineSchema({
@@ -121,10 +177,10 @@ let rowConflictAttempts = 0;
 let tableConflictAttempts = 0;
 let exhaustedConflictAttempts = 0;
 let multiTableConflictAttempts = 0;
-let realtimeDependencyProbeCalls = 0;
+let realtimeDependencyTrackingQueryCalls = 0;
 let realtimeDynamicDependencyOwnerToken = "owner-a";
-let realtimeConcurrencyActive = 0;
-let realtimeConcurrencyMaxActive = 0;
+let activeRealtimeConcurrencyQueries = 0;
+let maxActiveRealtimeConcurrencyQueries = 0;
 
 const rules = defineRules({
   labels: {
@@ -273,7 +329,7 @@ const uniqueTodo = query({
   },
 });
 
-const realtimeDependencyProbe = query({
+const realtimeDependencyTrackingQuery = query({
   args: {
     id: v.optional(v.id("todos")),
     mode: v.union(
@@ -285,7 +341,7 @@ const realtimeDependencyProbe = query({
     ownerToken: v.string(),
   },
   handler(ctx, args) {
-    realtimeDependencyProbeCalls += 1;
+    realtimeDependencyTrackingQueryCalls += 1;
     if (args.mode === "broad-labels") {
       return ctx.db.query("labels").collect();
     }
@@ -307,16 +363,16 @@ const realtimeDependencyProbe = query({
   },
 });
 
-const realtimeConcurrencyProbe = query({
+const realtimeConcurrencyTrackingQuery = query({
   args: { ownerToken: v.string() },
   async handler(ctx, args) {
-    realtimeConcurrencyActive += 1;
-    realtimeConcurrencyMaxActive = Math.max(
-      realtimeConcurrencyMaxActive,
-      realtimeConcurrencyActive
+    activeRealtimeConcurrencyQueries += 1;
+    maxActiveRealtimeConcurrencyQueries = Math.max(
+      maxActiveRealtimeConcurrencyQueries,
+      activeRealtimeConcurrencyQueries
     );
     await new Promise((resolve) => setTimeout(resolve, 10));
-    realtimeConcurrencyActive -= 1;
+    activeRealtimeConcurrencyQueries -= 1;
     return ctx.db
       .query("todos")
       .filter({ ownerToken: args.ownerToken })
@@ -658,13 +714,13 @@ function createManifest(
       { definition: getTodo, exportName: "get", modulePath: "todos" },
       { definition: uniqueTodo, exportName: "unique", modulePath: "todos" },
       {
-        definition: realtimeDependencyProbe,
-        exportName: "dependencyProbe",
+        definition: realtimeDependencyTrackingQuery,
+        exportName: "dependencyTracking",
         modulePath: "realtime",
       },
       {
-        definition: realtimeConcurrencyProbe,
-        exportName: "concurrencyProbe",
+        definition: realtimeConcurrencyTrackingQuery,
+        exportName: "concurrencyTracking",
         modulePath: "realtime",
       },
       {
@@ -850,6 +906,7 @@ async function createRealtimeOutboxEvent(
   eventId: string,
   createdAt = Date.now(),
   options: {
+    readonly bumpVersions?: boolean;
     readonly partitions?: readonly {
       readonly partitionKey: string;
       readonly partitionValue: string;
@@ -868,6 +925,38 @@ async function createRealtimeOutboxEvent(
       JSON.stringify(options.partitions ?? [])
     )
     .run();
+  if (options.bumpVersions === false) {
+    return;
+  }
+
+  const tables = options.tables ?? ["todos"];
+  for (const tableName of tables) {
+    await env.APP_DB.prepare(
+      "UPDATE _bf_table_versions SET version = version + 1 WHERE table_name = ?"
+    )
+      .bind(tableName)
+      .run();
+  }
+  for (const partition of options.partitions ?? []) {
+    await env.APP_DB.prepare(
+      "INSERT OR IGNORE INTO _bf_partition_versions (table_name, partition_key, partition_value, version) VALUES (?, ?, ?, 0)"
+    )
+      .bind(
+        partition.tableName,
+        partition.partitionKey,
+        partition.partitionValue
+      )
+      .run();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_partition_versions SET version = version + 1 WHERE table_name = ? AND partition_key = ? AND partition_value = ?"
+    )
+      .bind(
+        partition.tableName,
+        partition.partitionKey,
+        partition.partitionValue
+      )
+      .run();
+  }
 }
 
 function todoOwnerPartition(ownerToken: string): {
@@ -898,17 +987,17 @@ function realtimeRegistrationKey(
   return JSON.stringify([connectionKey, subscriptionId]);
 }
 
-interface RealtimeIndexDebugState {
+interface RealtimeIndexTestState {
   readonly registrationKeysByPartition: Map<string, Set<string>>;
   readonly registrationKeysByTable: Map<string, Set<string>>;
   readonly registrationKeysWithoutDependencies: Set<string>;
   readonly registrations: Map<string, { leaseExpiresAt: number }>;
 }
 
-function getRealtimeIndexDebugState(
+function getRealtimeIndexTestState(
   subscriptionDo: RealtimeSubscriptionDO
-): RealtimeIndexDebugState {
-  return subscriptionDo as unknown as RealtimeIndexDebugState;
+): RealtimeIndexTestState {
+  return subscriptionDo as unknown as RealtimeIndexTestState;
 }
 
 async function getRealtimeOutboxSequence(eventId: string): Promise<number> {
@@ -969,6 +1058,92 @@ function getFirstRealtimeDelivery(delivery: unknown): {
   }
 
   return item;
+}
+
+interface RealtimeClientMessage {
+  message?: {
+    result: Array<{ text: string }>;
+    sequence: number | null;
+    subscriptionId: string;
+  };
+  subscriptionId?: string;
+  type: string;
+}
+
+async function waitFor(
+  predicate: () => boolean,
+  attempts = 200
+): Promise<void> {
+  for (let attempt = 0; attempt < attempts && !predicate(); attempt += 1) {
+    await new Promise((resolve) => {
+      setTimeout(resolve, 5);
+    });
+  }
+}
+
+function realtimeConnectionStub(clientId: string) {
+  return env.REALTIME_CONNECTIONS.get(
+    env.REALTIME_CONNECTIONS.idFromName(
+      getRealtimeConnectionShardName(clientId)
+    )
+  );
+}
+
+// Opens a real WebSocket against the live Worker + Durable Objects and waits for
+// the "subscribed" acknowledgement, returning the client and its message log.
+async function openRealtimeClient(input: {
+  clientId: string;
+  ownerToken: string;
+  subscriptionId: string;
+}): Promise<{
+  client: WebSocket & { accept?: () => void };
+  messages: RealtimeClientMessage[];
+}> {
+  const response = await SELF.fetch(
+    new Request(`http://example.com/api/subscribe?clientId=${input.clientId}`, {
+      headers: {
+        authorization: `Bearer ${input.ownerToken}`,
+        upgrade: "websocket",
+      },
+      method: "GET",
+    })
+  );
+  const client = (response as Response & { readonly webSocket?: WebSocket })
+    .webSocket as WebSocket & { accept?: () => void };
+  const messages: RealtimeClientMessage[] = [];
+  client.accept?.();
+  client.addEventListener("message", (event) => {
+    messages.push(JSON.parse(String(event.data)) as RealtimeClientMessage);
+  });
+  client.send(
+    JSON.stringify({
+      args: { ownerToken: input.ownerToken },
+      epoch: 1,
+      queryName: "todos:list",
+      subscriptionId: input.subscriptionId,
+      type: "subscribe",
+    })
+  );
+  await waitFor(() =>
+    messages.some((message) => message.type === "subscribed")
+  );
+  return { client, messages };
+}
+
+async function createTodoViaSelf(
+  ownerToken: string,
+  text: string
+): Promise<void> {
+  const response = await SELF.fetch(
+    new Request("http://example.com/api/mutation/todos:create", {
+      body: rpcBody({ ownerToken, text }),
+      headers: { authorization: `Bearer ${ownerToken}` },
+      method: "POST",
+    })
+  );
+  if (!response.ok) {
+    throw new Error(`Mutation failed with status ${response.status}`);
+  }
 }
 
 async function createDetailedTodoViaRpc(args: {
@@ -1054,9 +1229,9 @@ describe("worker runtime", () => {
     resetRealtimeRuntimeStateForTest();
     exhaustedConflictAttempts = 0;
     multiTableConflictAttempts = 0;
-    realtimeConcurrencyActive = 0;
-    realtimeConcurrencyMaxActive = 0;
-    realtimeDependencyProbeCalls = 0;
+    activeRealtimeConcurrencyQueries = 0;
+    maxActiveRealtimeConcurrencyQueries = 0;
+    realtimeDependencyTrackingQueryCalls = 0;
     realtimeDynamicDependencyOwnerToken = "owner-a";
     rowConflictAttempts = 0;
     tableConflictAttempts = 0;
@@ -1077,6 +1252,16 @@ describe("worker runtime", () => {
     ).run();
     await env.APP_DB.prepare(
       "UPDATE _bf_table_versions SET version = 0 WHERE table_name = 'todos'"
+    ).run();
+    await env.APP_DB.prepare("DELETE FROM _bf_realtime_shard_cursors").run();
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_realtime_shard_generations"
+    ).run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (1, 1, 'active', 0, NULL)"
+    ).run();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_autoscale_state SET scale_up_started_at = NULL, scale_down_started_at = NULL, updated_at = 0 WHERE id = 1"
     ).run();
   });
 
@@ -1116,6 +1301,165 @@ describe("worker runtime", () => {
     expect(createdAtIndex?.name).toBe("_bf_realtime_outbox_created_at");
   });
 
+  it("applies realtime shard metadata", async () => {
+    const generation = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE generation_id = 1"
+    ).first<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+    const cursorTable = await env.APP_DB.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = '_bf_realtime_shard_cursors'"
+    ).first<{ sql: string }>();
+    const autoscaleState = await env.APP_DB.prepare(
+      "SELECT id FROM _bf_realtime_autoscale_state WHERE id = 1"
+    ).first<{ id: number }>();
+
+    expect(generation).toEqual({
+      generation_id: 1,
+      status: "active",
+      subscription_shard_count: 1,
+    });
+    expect(cursorTable?.sql).toContain("last_processed_outbox_sequence");
+    expect(autoscaleState?.id).toBe(1);
+  });
+
+  it("scales realtime subscription generations geometrically", async () => {
+    const startedAt = 1_000_000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: startedAt,
+    });
+    const scaleUpResult = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: startedAt + 10 * 60 * 1000,
+    });
+    const generationsAfterScaleUp = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations ORDER BY generation_id"
+    ).all<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+
+    expect(scaleUpResult).toBe("scaled_up");
+    expect(generationsAfterScaleUp.results).toEqual([
+      {
+        generation_id: 1,
+        status: "draining",
+        subscription_shard_count: 1,
+      },
+      {
+        generation_id: 2,
+        status: "active",
+        subscription_shard_count: 2,
+      },
+    ]);
+
+    const lowLoadStartedAt = startedAt + 20 * 60 * 1000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 0,
+      now: lowLoadStartedAt,
+    });
+    const scaleDownResult = await evaluateRealtimeAutoscalingForTest(
+      env.APP_DB,
+      {
+        activeRegistrationCount: 0,
+        now: lowLoadStartedAt + 24 * 60 * 60 * 1000,
+      }
+    );
+    const activeGeneration = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
+    ).first<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+
+    expect(scaleDownResult).toBe("scaled_down");
+    expect(activeGeneration).toEqual({
+      generation_id: 3,
+      status: "active",
+      subscription_shard_count: 1,
+    });
+
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_realtime_shard_generations"
+    ).run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (1, 1, 'active', 0, NULL)"
+    ).run();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_autoscale_state SET scale_up_started_at = NULL, scale_down_started_at = NULL, updated_at = 0 WHERE id = 1"
+    ).run();
+  });
+
+  it("never scales realtime subscription shards beyond the cap", async () => {
+    // Start at the maximum generation size.
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_realtime_shard_generations"
+    ).run();
+    await env.APP_DB.prepare(
+      `INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (1, ${REALTIME_MAX_SUBSCRIPTION_SHARDS}, 'active', 0, NULL)`
+    ).run();
+
+    // Sustained high load across the full scale-up window must NOT create a
+    // larger generation once the v1 shard cap is reached.
+    const startedAt = 2_000_000;
+    const overCapRegistrations = REALTIME_MAX_SUBSCRIPTION_SHARDS * 2000;
+    const first = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: overCapRegistrations,
+      now: startedAt,
+    });
+    const second = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: overCapRegistrations,
+      now: startedAt + 10 * 60 * 1000,
+    });
+
+    expect(first).toBeNull();
+    expect(second).toBeNull();
+    const generations = await env.APP_DB.prepare(
+      "SELECT subscription_shard_count, status FROM _bf_realtime_shard_generations ORDER BY generation_id"
+    ).all<{ status: string; subscription_shard_count: number }>();
+    expect(generations.results).toEqual([
+      {
+        status: "active",
+        subscription_shard_count: REALTIME_MAX_SUBSCRIPTION_SHARDS,
+      },
+    ]);
+  });
+
+  it("uses realtime pressure signals for autoscaling decisions", async () => {
+    const startedAt = 2_000_000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 10,
+      now: startedAt,
+      outboxLagMs: 60_000,
+      pendingWorkCount: 1000,
+    });
+    const scaleUpResult = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 10,
+      now: startedAt + 10 * 60 * 1000,
+      outboxLagMs: 60_000,
+      pendingWorkCount: 1000,
+    });
+    const activeGeneration = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
+    ).first<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+
+    expect(scaleUpResult).toBe("scaled_up");
+    expect(activeGeneration).toEqual({
+      generation_id: 2,
+      status: "active",
+      subscription_shard_count: 2,
+    });
+  });
+
   it("routes realtime subscribe requests to the connection Durable Object", async () => {
     const connections = new FakeDurableObjectNamespace();
     const response = await invoke(
@@ -1135,6 +1479,191 @@ describe("worker runtime", () => {
     );
     expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
       "/api/subscribe"
+    );
+  });
+
+  it("delivers realtime updates through configured Durable Object bindings", async () => {
+    createRealtimeRuntimeId();
+    const response = await SELF.fetch(
+      new Request("http://example.com/api/subscribe?clientId=real-do-client", {
+        headers: {
+          authorization: "Bearer owner-a",
+          upgrade: "websocket",
+        },
+        method: "GET",
+      })
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{
+      message?: { result: Array<{ text: string }>; subscriptionId: string };
+      subscriptionId?: string;
+      type: string;
+    }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          message?: {
+            result: Array<{ text: string }>;
+            subscriptionId: string;
+          };
+          subscriptionId?: string;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-real-do",
+        type: "subscribe",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const mutationResponse = await SELF.fetch(
+      new Request("http://example.com/api/mutation/todos:create", {
+        body: rpcBody({ ownerToken: "owner-a", text: "real-do-delivery" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      })
+    );
+    expect(mutationResponse.ok).toBe(true);
+    const outboxRow = await env.APP_DB.prepare(
+      "SELECT event_id FROM _bf_realtime_outbox ORDER BY sequence DESC LIMIT 1"
+    ).first<{ event_id: string }>();
+    expect(outboxRow?.event_id).toEqual(expect.any(String));
+    const catchUpResponse = await env.REALTIME_SUBSCRIPTIONS.get(
+      env.REALTIME_SUBSCRIPTIONS.idFromName("subscription:g1:0")
+    ).fetch("https://baseflare.internal/catch-up", {
+      body: JSON.stringify({
+        afterSequence: null,
+        shardName: "subscription:g1:0",
+      }),
+      headers: { "content-type": "application/json" },
+      method: "POST",
+    });
+    expect(catchUpResponse.ok).toBe(true);
+    const catchUpResult = (await catchUpResponse.json()) as {
+      evaluated: number;
+      failed: number;
+    };
+    expect(catchUpResult).toMatchObject({ failed: 0 });
+    for (
+      let attempt = 0;
+      attempt < 200 && !messages.some((message) => message.type === "delivery");
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const delivery = messages.find((message) => message.type === "delivery");
+    expect(messages[0]).toEqual({
+      subscriptionId: "sub-real-do",
+      type: "subscribed",
+    });
+    expect(delivery).toEqual({
+      message: {
+        result: expect.arrayContaining([
+          expect.objectContaining({ text: "real-do-delivery" }),
+        ]),
+        sequence: 1,
+        subscriptionId: "sub-real-do",
+      },
+      type: "delivery",
+    });
+  });
+
+  // Real Durable Object coverage. workerd's test runtime cannot force genuine
+  // hibernation *eviction*, so these exercise the real Hibernation API surface
+  // (getWebSockets, serialize/deserialize attachments), real state.storage alarm
+  // scheduling, and real cross-DO delivery. Actual eviction is staging-only
+  // (pnpm test:perf:cloudflare).
+  it("delivers realtime updates through a real reconciliation alarm", async () => {
+    // Re-register the worker's realtime runtime (cleared by beforeEach) so the
+    // subscription DO can resolve runtime:1 during re-evaluation.
+    createRealtimeRuntimeId();
+    const { messages } = await openRealtimeClient({
+      clientId: "alarm-client",
+      ownerToken: "owner-a",
+      subscriptionId: "sub-alarm",
+    });
+    await createTodoViaSelf("owner-a", "alarm-delivered");
+
+    // The notify fast path does not auto-deliver in the test env, so the only
+    // way this reaches the socket is the real scheduled state.storage alarm.
+    const ran = await runDurableObjectAlarm(
+      realtimeConnectionStub("alarm-client")
+    );
+    expect(ran).toBe(true);
+
+    await waitFor(() =>
+      messages.some((message) => message.type === "delivery")
+    );
+    const delivery = messages.find((message) => message.type === "delivery");
+    expect(delivery?.message).toEqual(
+      expect.objectContaining({
+        result: expect.arrayContaining([
+          expect.objectContaining({ text: "alarm-delivered" }),
+        ]),
+        subscriptionId: "sub-alarm",
+      })
+    );
+  });
+
+  it("persists realtime socket attachments through the real Hibernation API", async () => {
+    createRealtimeRuntimeId();
+    const { messages } = await openRealtimeClient({
+      clientId: "hibernation-client",
+      ownerToken: "owner-a",
+      subscriptionId: "sub-hib",
+    });
+    await createTodoViaSelf("owner-a", "hibernation-delivered");
+    await runDurableObjectAlarm(realtimeConnectionStub("hibernation-client"));
+    await waitFor(() =>
+      messages.some((message) => message.type === "delivery")
+    );
+    const deliveredSequence =
+      messages.find((message) => message.type === "delivery")?.message
+        ?.sequence ?? null;
+    expect(deliveredSequence).not.toBeNull();
+
+    // Inspect the live Durable Object's real Hibernation API state: the socket
+    // attachment must round-trip through serialize/deserialize with its
+    // subscriptions and the latest delivered outbox sequence persisted.
+    await runInDurableObject(
+      realtimeConnectionStub("hibernation-client"),
+      (_instance, state) => {
+        interface StoredAttachment {
+          connectionKey: string;
+          latestDeliveredOutboxSequence: number | null;
+          subscriptions: Array<{ queryName: string; subscriptionId: string }>;
+        }
+        // N=1 routes every client to the same connection shard, so locate this
+        // client's socket by its persisted connection key.
+        const sockets = state.getWebSockets() as Array<{
+          deserializeAttachment(): unknown;
+        }>;
+        const attachment = sockets
+          .map((socket) => socket.deserializeAttachment() as StoredAttachment)
+          .find((value) => value?.connectionKey === "hibernation-client");
+        expect(attachment).toBeDefined();
+        expect(attachment?.subscriptions).toEqual([
+          expect.objectContaining({
+            queryName: "todos:list",
+            subscriptionId: "sub-hib",
+          }),
+        ]);
+        expect(attachment?.latestDeliveredOutboxSequence).toBe(
+          deliveredSequence
+        );
+      }
     );
   });
 
@@ -1184,6 +1713,239 @@ describe("worker runtime", () => {
     expect(first).toMatch(/^connection:\d+$/);
     expect(shardNumber).toBeGreaterThanOrEqual(0);
     expect(shardNumber).toBeLessThan(shardCount);
+  });
+
+  it("keeps N=1 realtime subscription routes on the default generation shard", () => {
+    expect(
+      getRealtimeSubscriptionShardName(
+        createRealtimeGlobalSubscriptionRouteTarget()
+      )
+    ).toBe("subscription:g1:0");
+    expect(
+      getRealtimeSubscriptionShardName(
+        createRealtimeTableSubscriptionRouteTarget("todos")
+      )
+    ).toBe("subscription:g1:0");
+    expect(
+      getRealtimeSubscriptionShardName(
+        createRealtimePartitionSubscriptionRouteTarget(
+          todoOwnerPartition("owner-a")
+        )
+      )
+    ).toBe("subscription:g1:0");
+  });
+
+  it("keeps future realtime subscription shard routing deterministic and bounded", () => {
+    const shardCount = 32;
+    const partitionRoute = createRealtimePartitionSubscriptionRouteTarget(
+      todoOwnerPartition("owner-a")
+    );
+    const tableRoute = createRealtimeTableSubscriptionRouteTarget("todos");
+    const first = getRealtimeSubscriptionShardName(partitionRoute, shardCount);
+    const second = getRealtimeSubscriptionShardName(partitionRoute, shardCount);
+    const tableShard = getRealtimeSubscriptionShardName(tableRoute, shardCount);
+    const shardNumber = Number(first.split(":").at(2));
+
+    expect(first).toBe(second);
+    expect(first).toMatch(/^subscription:g1:\d+$/);
+    expect(tableShard).toMatch(/^subscription:g1:\d+$/);
+    expect(shardNumber).toBeGreaterThanOrEqual(0);
+    expect(shardNumber).toBeLessThan(shardCount);
+  });
+
+  it("derives realtime subscription routes from affected tables and partitions", () => {
+    const routes = getRealtimeAffectedSubscriptionRouteTargets({
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    expect(routes).toEqual([
+      {
+        type: "global",
+      },
+      {
+        partition: todoOwnerPartition("owner-a"),
+        type: "partition",
+      },
+      {
+        tableName: "todos",
+        type: "table",
+      },
+    ]);
+  });
+
+  it("migrates partition-aligned realtime registrations to their home shard", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const partitionShardName = getRealtimeSubscriptionShardName(
+      createRealtimePartitionSubscriptionRouteTarget(
+        todoOwnerPartition("owner-a")
+      ),
+      8
+    );
+    const subscriptions = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ ok: true }))
+    );
+    const connections = new FakeDurableObjectNamespace((_name, request) => {
+      const pathname = new URL(request.url).pathname;
+      if (pathname === "/deliver-batch") {
+        return Promise.resolve(
+          Response.json({
+            delivered: 1,
+            deliveredSubscriptions: ["sub-a"],
+            ok: true,
+          })
+        );
+      }
+
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    await createTodoViaRpc("owner-a", "owner-a-sharded");
+    await createRealtimeOutboxEvent("owner-a-sharded", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "owner-a-sharded",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: unknown[];
+    };
+
+    expect(registrationsBody.registrations).toHaveLength(0);
+    expect(
+      subscriptions.requests.some((request) => {
+        return (
+          request.name === partitionShardName &&
+          new URL(request.request.url).pathname === "/adopt-registration"
+        );
+      })
+    ).toBe(true);
+    expect(
+      connections.requests.some((request) => {
+        return new URL(request.request.url).pathname === "/subscription-moved";
+      })
+    ).toBe(true);
+  });
+
+  it("keeps source realtime registrations active when shard adoption fails", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname === "/adopt-registration") {
+        return Promise.resolve(new Response("failed", { status: 500 }));
+      }
+
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(
+        Response.json({
+          delivered: 1,
+          deliveredSubscriptions: ["sub-a"],
+          ok: true,
+        })
+      )
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    await createTodoViaRpc("owner-a", "owner-a-adoption-failed");
+    await createRealtimeOutboxEvent("owner-a-adoption-failed", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "owner-a-adoption-failed",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: unknown[];
+    };
+
+    expect(registrationsBody.registrations).toHaveLength(1);
   });
 
   it("delivers realtime messages only to sockets for the target connection key", async () => {
@@ -1363,12 +2125,14 @@ describe("worker runtime", () => {
       },
     } as unknown as WebSocket;
     const internals = connectionDo as unknown as {
-      socketConnectionKeys: Map<WebSocket, string>;
+      socketStates: Map<WebSocket, { attachment: { connectionKey: string } }>;
       sockets: Set<WebSocket>;
       socketsByConnectionKey: Map<string, Set<WebSocket>>;
     };
     internals.sockets.add(socket);
-    internals.socketConnectionKeys.set(socket, "client-a");
+    internals.socketStates.set(socket, {
+      attachment: { connectionKey: "client-a" },
+    });
     internals.socketsByConnectionKey.set("client-a", new Set([socket]));
 
     const response = await connectionDo.fetch(
@@ -1445,11 +2209,11 @@ describe("worker runtime", () => {
       clientBMessages.push(JSON.parse(String(event.data)) as unknown);
     });
     const internals = connectionDo as unknown as {
-      socketConnectionKeys: Map<WebSocket, string>;
+      socketStates: Map<WebSocket, { attachment: { connectionKey: string } }>;
     };
-    const [clientAKey, clientBKey] = [
-      ...internals.socketConnectionKeys.values(),
-    ];
+    const [clientAKey, clientBKey] = [...internals.socketStates.values()].map(
+      ({ attachment }) => attachment.connectionKey
+    );
 
     expect(clientAKey).toMatch(/^anonymous:/);
     expect(clientBKey).toMatch(/^anonymous:/);
@@ -1544,21 +2308,43 @@ describe("worker runtime", () => {
       },
     } as unknown as WebSocket;
     const internals = connectionDo as unknown as {
-      socketAuthorizationHeaders: Map<WebSocket, string>;
-      socketConnectionKeys: Map<WebSocket, string>;
-      socketConnectionNames: Map<WebSocket, string>;
-      socketRuntimeIds: Map<WebSocket, string>;
+      socketStates: Map<
+        WebSocket,
+        {
+          attachment: {
+            authorizationHeader?: string;
+            connectionKey: string;
+            connectionName: string;
+            latestDeliveredOutboxSequence: number | null;
+            runtimeId: string;
+            subscriptions: unknown[];
+          };
+        }
+      >;
       sockets: Set<WebSocket>;
       socketsByConnectionKey: Map<string, Set<WebSocket>>;
     };
     internals.sockets.add(failedSocket);
     internals.sockets.add(activeSocket);
-    internals.socketAuthorizationHeaders.set(failedSocket, "Bearer owner-a");
-    internals.socketConnectionKeys.set(failedSocket, "client-a");
-    internals.socketConnectionKeys.set(activeSocket, "client-a");
-    internals.socketConnectionNames.set(failedSocket, "connection:0");
-    internals.socketConnectionNames.set(activeSocket, "connection:0");
-    internals.socketRuntimeIds.set(failedSocket, "runtime:1");
+    internals.socketStates.set(failedSocket, {
+      attachment: {
+        authorizationHeader: "Bearer owner-a",
+        connectionKey: "client-a",
+        connectionName: "connection:0",
+        latestDeliveredOutboxSequence: null,
+        runtimeId: "runtime:1",
+        subscriptions: [],
+      },
+    });
+    internals.socketStates.set(activeSocket, {
+      attachment: {
+        connectionKey: "client-a",
+        connectionName: "connection:0",
+        latestDeliveredOutboxSequence: null,
+        runtimeId: "runtime:1",
+        subscriptions: [],
+      },
+    });
     internals.socketsByConnectionKey.set(
       "client-a",
       new Set([failedSocket, activeSocket])
@@ -1588,10 +2374,7 @@ describe("worker runtime", () => {
       },
     ]);
     expect(internals.sockets.has(failedSocket)).toBe(false);
-    expect(internals.socketAuthorizationHeaders.has(failedSocket)).toBe(false);
-    expect(internals.socketConnectionKeys.has(failedSocket)).toBe(false);
-    expect(internals.socketConnectionNames.has(failedSocket)).toBe(false);
-    expect(internals.socketRuntimeIds.has(failedSocket)).toBe(false);
+    expect(internals.socketStates.has(failedSocket)).toBe(false);
     expect(internals.socketsByConnectionKey.get("client-a")).toEqual(
       new Set([activeSocket])
     );
@@ -1619,10 +2402,7 @@ describe("worker runtime", () => {
     const client = (response as Response & { readonly webSocket?: WebSocket })
       .webSocket as WebSocket & { accept?: () => void };
     const internals = connectionDo as unknown as {
-      socketAuthorizationHeaders: Map<WebSocket, string>;
-      socketConnectionKeys: Map<WebSocket, string>;
-      socketConnectionNames: Map<WebSocket, string>;
-      socketRuntimeIds: Map<WebSocket, string>;
+      socketStates: Map<WebSocket, unknown>;
       sockets: Set<WebSocket>;
       socketsByConnectionKey: Map<string, Set<WebSocket>>;
     };
@@ -1639,11 +2419,178 @@ describe("worker runtime", () => {
     }
 
     expect(internals.sockets.size).toBe(0);
-    expect(internals.socketAuthorizationHeaders.size).toBe(0);
-    expect(internals.socketConnectionKeys.size).toBe(0);
-    expect(internals.socketConnectionNames.size).toBe(0);
-    expect(internals.socketRuntimeIds.size).toBe(0);
+    expect(internals.socketStates.size).toBe(0);
     expect(internals.socketsByConnectionKey.size).toBe(0);
+  });
+
+  it("stores realtime socket attachments through the hibernation API", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const registerRequests: unknown[] = [];
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          registerRequests.push(await request.json());
+          return Response.json({ ok: true });
+        }
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as AttachedTestWebSocket;
+    client.accept?.();
+    const [socket] = state.acceptedSockets;
+    if (!socket) {
+      throw new Error("Expected hibernated realtime socket");
+    }
+
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        type: "subscribe",
+      })
+    );
+
+    expect(registerRequests).toHaveLength(1);
+    expect(state.alarmTime).toBeTypeOf("number");
+    expect(state.attachments.get(socket)).toEqual(
+      expect.objectContaining({
+        authorizationHeader: "Bearer owner-a",
+        connectionKey: "client-a",
+        connectionName: getRealtimeConnectionShardName("client-a"),
+        latestDeliveredOutboxSequence: null,
+        runtimeId: "runtime:1",
+        subscriptions: [
+          expect.objectContaining({
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+            subscriptionShardName: getRealtimeSubscriptionShardName(),
+          }),
+        ],
+      })
+    );
+  });
+
+  it("restores hibernated realtime subscriptions and catches up from attachments", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionRequests: Array<{ body: unknown; path: string }> = [];
+    let connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          subscriptionRequests.push({
+            body: await request.json(),
+            path: new URL(request.url).pathname,
+          });
+          return Response.json({ events: [], ok: true });
+        }
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const [socket] = state.acceptedSockets;
+    if (!socket) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as AttachedTestWebSocket;
+    client.accept?.();
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 2,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        type: "subscribe",
+      })
+    );
+    await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          result: [],
+          sequence: 42,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    subscriptionRequests.length = 0;
+
+    connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          subscriptionRequests.push({
+            body: await request.json(),
+            path: new URL(request.url).pathname,
+          });
+          return Response.json({ events: [], ok: true });
+        }
+      ),
+    });
+    await connectionDo.alarm();
+
+    for (
+      let attempt = 0;
+      attempt < 20 && subscriptionRequests.length < 2;
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(subscriptionRequests).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          body: expect.objectContaining({
+            connectionKey: "client-a",
+            epoch: 2,
+            queryName: "todos:list",
+            runtimeId: "runtime:1",
+            subscriptionId: "sub-a",
+          }),
+          path: "/register",
+        }),
+        expect.objectContaining({
+          body: expect.objectContaining({ afterSequence: 42 }),
+          path: "/catch-up",
+        }),
+      ])
+    );
   });
 
   it("restores realtime subscriptions without serial register round trips", async () => {
@@ -1715,17 +2662,12 @@ describe("worker runtime", () => {
         type: "restore",
       })
     );
-    for (let attempt = 0; attempt < 20 && messages.length < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
     expect(registerRequests).toHaveLength(2);
     expect(maxActiveRegistrations).toBe(2);
-    expect(messages.map((message) => message.type).sort()).toEqual([
-      "restored",
-      "subscribed",
-      "subscribed",
-    ]);
     expect(messages.at(-1)).toEqual({
       failed: [],
       reconciled: true,
@@ -1786,18 +2728,11 @@ describe("worker runtime", () => {
         type: "restore",
       })
     );
-    for (
-      let attempt = 0;
-      attempt < 40 && messages.length < REALTIME_MAX_RESTORE_SUBSCRIPTIONS + 1;
-      attempt += 1
-    ) {
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
     expect(registerRequests).toHaveLength(REALTIME_MAX_RESTORE_SUBSCRIPTIONS);
-    expect(
-      messages.filter((message) => message.type === "subscribed")
-    ).toHaveLength(REALTIME_MAX_RESTORE_SUBSCRIPTIONS);
     expect(messages.at(-1)).toMatchObject({ type: "restored" });
   });
 
@@ -1865,6 +2800,7 @@ describe("worker runtime", () => {
   });
 
   it("reports partial realtime restore failures after successful registrations", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const registerRequests: unknown[] = [];
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
@@ -1937,16 +2873,12 @@ describe("worker runtime", () => {
         type: "restore",
       })
     );
-    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
     expect(registerRequests).toHaveLength(1);
     expect(messages[0]).toEqual({
-      subscriptionId: "sub-good",
-      type: "subscribed",
-    });
-    expect(messages[1]).toEqual({
       failed: [
         {
           error: 'Realtime field "queryName" must be a non-empty string',
@@ -1957,6 +2889,26 @@ describe("worker runtime", () => {
       reconciled: true,
       type: "restored",
     });
+    // The restore metric must reflect only the registration that succeeded as
+    // accepted, and report the failed registration as rejected.
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.restore_subscriptions",
+        tags: { result: "accepted" },
+        value: 1,
+      })
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.restore_subscriptions",
+        tags: { result: "rejected" },
+        value: 1,
+      })
+    );
   });
 
   it("reports realtime restore failures when registration returns an error response", async () => {
@@ -2037,12 +2989,11 @@ describe("worker runtime", () => {
         type: "restore",
       })
     );
-    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
     expect(messages).toEqual([
-      { subscriptionId: "sub-good", type: "subscribed" },
       {
         failed: [
           {
@@ -2114,13 +3065,13 @@ describe("worker runtime", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
-    expect(catchUpBody).toEqual({ afterSequence: 42 });
-    expect(messages).toEqual([{ subscriptionId: "sub-a", type: "subscribed" }]);
+    expect(catchUpBody).toEqual(expect.objectContaining({ afterSequence: 42 }));
+    expect(messages).toEqual([]);
 
     catchUpResponse.resolve(
       Response.json({ evaluated: 0, events: [], failed: 0, ok: true })
     );
-    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
@@ -2189,7 +3140,9 @@ describe("worker runtime", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
-    expect(catchUpBody).toEqual({ afterSequence: null });
+    expect(catchUpBody).toEqual(
+      expect.objectContaining({ afterSequence: null })
+    );
     expect(messages.at(-1)).toEqual({
       failed: [],
       reconciled: true,
@@ -2266,7 +3219,7 @@ describe("worker runtime", () => {
 
     client.send(
       JSON.stringify({
-        afterSequence: 0,
+        afterSequence: sequence - 1,
         subscriptions: [
           {
             args: { ownerToken: "owner-a" },
@@ -2278,12 +3231,11 @@ describe("worker runtime", () => {
         type: "restore",
       })
     );
-    for (let attempt = 0; attempt < 30 && messages.length < 3; attempt += 1) {
+    for (let attempt = 0; attempt < 30 && messages.length < 2; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
     expect(messages).toEqual([
-      { subscriptionId: "sub-a", type: "subscribed" },
       {
         message: {
           result: expect.arrayContaining([
@@ -2353,12 +3305,11 @@ describe("worker runtime", () => {
         type: "restore",
       })
     );
-    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
     expect(messages).toEqual([
-      { subscriptionId: "sub-a", type: "subscribed" },
       {
         failed: [
           {
@@ -2479,6 +3430,78 @@ describe("worker runtime", () => {
         type: "error",
       },
     ]);
+  });
+
+  it("targets realtime unsubscribe to the moved subscription shard", async () => {
+    const subscriptions = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ ok: true }))
+    );
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ subscriptionId?: string; type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as {
+          subscriptionId?: string;
+          type: string;
+        }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        type: "subscribe",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    await connectionDo.fetch(
+      new Request("https://baseflare.internal/subscription-moved", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          subscriptionId: "sub-a",
+          subscriptionShardName: "subscription:g2:7",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    client.send(
+      JSON.stringify({ subscriptionId: "sub-a", type: "unsubscribe" })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 2; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    const unregisterRequest = subscriptions.requests.find((request) => {
+      return new URL(request.request.url).pathname === "/unregister";
+    });
+    expect(unregisterRequest?.name).toBe("subscription:g2:7");
+    expect(messages.at(-1)).toEqual({
+      subscriptionId: "sub-a",
+      type: "unsubscribed",
+    });
   });
 
   it("keeps malformed realtime restore envelopes on the socket error path", async () => {
@@ -2711,10 +3734,12 @@ describe("worker runtime", () => {
       })
     );
     const registrationsBody = (await registrationsResponse.json()) as {
-      lastSeenSequence: number | null;
+      lastProcessedOutboxSequence: number | null;
     };
 
-    expect(registrationsBody.lastSeenSequence).toBe(body.events[0]?.sequence);
+    expect(registrationsBody.lastProcessedOutboxSequence).toBe(
+      body.events[0]?.sequence
+    );
   });
 
   it("skips realtime re-evaluation when catch-up has no events", async () => {
@@ -2759,6 +3784,78 @@ describe("worker runtime", () => {
 
     expect(body).toEqual({ evaluated: 0, events: [], failed: 0, ok: true });
     expect(connections.requests).toHaveLength(0);
+  });
+
+  it("fully re-evaluates realtime subscriptions when catch-up history has a gap", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "gap-recovered");
+    await createRealtimeOutboxEvent("gap-deleted", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await createRealtimeOutboxEvent("gap-retained", Date.now(), {
+      partitions: [todoOwnerPartition("owner-b")],
+      tables: ["todos"],
+    });
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("gap-deleted")
+      .run();
+    const deliveries: unknown[] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) => {
+        deliveries.push(request.json());
+        return Promise.resolve(
+          Response.json({
+            delivered: 1,
+            deliveredSubscriptions: ["sub-gap"],
+            ok: true,
+          })
+        );
+      }),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-gap",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: 0, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      recoveredByFullReevaluation: boolean;
+    };
+
+    expect(body).toEqual(
+      expect.objectContaining({
+        evaluated: 1,
+        failed: 0,
+        recoveredByFullReevaluation: true,
+      })
+    );
+    expect(deliveries).toHaveLength(1);
   });
 
   it("removes expired realtime outbox rows during catch-up cleanup", async () => {
@@ -2914,6 +4011,154 @@ describe("worker runtime", () => {
     ]);
   });
 
+  it("skips the D1 re-query when subscription versions are unchanged", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    // Seed a todo so the table version is non-zero and captured in the snapshot.
+    await createTodoViaRpc("owner-a", "seed");
+    const deliveries: unknown[] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) => {
+        deliveries.push(request.json());
+        return Promise.resolve(Response.json({ delivered: 1, ok: true }));
+      }),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-unchanged",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const catchUp = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/catch-up", {
+          body: JSON.stringify({ afterSequence: null, limit: 10 }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    // First catch-up captures the dependency + version snapshot (evaluates once).
+    const firstBody = (await (await catchUp()).json()) as { evaluated: number };
+    expect(firstBody.evaluated).toBe(1);
+    const deliveredAfterFirst = deliveries.length;
+
+    // A later outbox event lands for the same dependency WITHOUT bumping the
+    // version. Version-first reconciliation must skip the D1 re-query entirely.
+    await createRealtimeOutboxEvent("no-version-change", Date.now(), {
+      bumpVersions: false,
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    const response = await catchUp();
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+    };
+
+    expect(response.status).toBe(200);
+    // evaluated counts registrations whose query was re-run against D1; zero
+    // proves the dependent registration was skipped on the matching version.
+    expect(body).toEqual(expect.objectContaining({ evaluated: 0, failed: 0 }));
+    expect(deliveries).toHaveLength(deliveredAfterFirst);
+  });
+
+  it("heals a missed delivery during live reconciliation while the socket stays open", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const sentFrames: Array<{
+      message: { result: Array<{ text: string }>; subscriptionId: string };
+      type: string;
+    }> = [];
+    const socket = {
+      send(payload: string) {
+        sentFrames.push(JSON.parse(payload));
+      },
+    } as unknown as WebSocket;
+
+    let connectionDo: RealtimeConnectionDO;
+    const subscriptions = new FakeDurableObjectNamespace(
+      async (_name, _request) => {
+        // Stand in for the subscription DO: a catch-up heals the missed update by
+        // delivering it back to the still-open connection socket, as in production.
+        await connectionDo.fetch(
+          new Request("https://baseflare.internal/deliver-batch", {
+            body: JSON.stringify({
+              connectionKey: "client-a",
+              deliveries: [
+                {
+                  result: [{ text: "healed" }],
+                  sequence: 7,
+                  subscriptionId: "sub-a",
+                },
+              ],
+            }),
+            headers: { "content-type": "application/json" },
+            method: "POST",
+          })
+        );
+        return Response.json({ evaluated: 1, events: [], failed: 0, ok: true });
+      }
+    );
+    connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+
+    const internals = connectionDo as unknown as {
+      sockets: Set<WebSocket>;
+      socketStates: Map<WebSocket, { attachment: Record<string, unknown> }>;
+      socketsByConnectionKey: Map<string, Set<WebSocket>>;
+    };
+    internals.sockets.add(socket);
+    internals.socketStates.set(socket, {
+      attachment: {
+        authorizationHeader: "Bearer owner-a",
+        connectionKey: "client-a",
+        connectionName: getRealtimeConnectionShardName("client-a"),
+        latestDeliveredOutboxSequence: 1,
+        runtimeId,
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+            subscriptionShardName: getRealtimeSubscriptionShardName(),
+          },
+        ],
+      },
+    });
+    internals.socketsByConnectionKey.set("client-a", new Set([socket]));
+
+    await connectionDo.alarm();
+
+    expect(sentFrames).toEqual([
+      {
+        message: {
+          result: [{ text: "healed" }],
+          sequence: 7,
+          subscriptionId: "sub-a",
+        },
+        type: "delivery",
+      },
+    ]);
+  });
+
   it("skips realtime notify re-evaluation for unrelated partitions", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
@@ -2937,7 +4182,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-a",
         }),
@@ -2984,7 +4229,7 @@ describe("worker runtime", () => {
       failed: 0,
       ok: true,
     });
-    expect(realtimeDependencyProbeCalls).toBe(2);
+    expect(realtimeDependencyTrackingQueryCalls).toBe(2);
     expect(deliveries).toHaveLength(2);
   });
 
@@ -3007,7 +4252,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-a",
         }),
@@ -3015,7 +4260,7 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
 
     expect(
       indexState.registrationKeysWithoutDependencies.has(registrationKey)
@@ -3062,7 +4307,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-a",
         }),
@@ -3082,7 +4327,7 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    realtimeDependencyProbeCalls = 0;
+    realtimeDependencyTrackingQueryCalls = 0;
     await createRealtimeOutboxEvent("todos-broad-table", Date.now(), {
       tables: ["todos"],
     });
@@ -3100,7 +4345,7 @@ describe("worker runtime", () => {
       failed: 0,
       ok: true,
     });
-    expect(realtimeDependencyProbeCalls).toBe(1);
+    expect(realtimeDependencyTrackingQueryCalls).toBe(1);
   });
 
   it("updates realtime dependency indexes when snapshots move", async () => {
@@ -3125,7 +4370,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-a",
         }),
@@ -3159,7 +4404,7 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
 
     expect(
       indexState.registrationKeysByPartition
@@ -3192,7 +4437,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-a",
         }),
@@ -3223,7 +4468,7 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
 
     expect(
       indexState.registrationKeysWithoutDependencies.has(registrationKey)
@@ -3254,7 +4499,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-a",
         }),
@@ -3287,7 +4532,7 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
 
     expect(await response.json()).toEqual({
       evaluated: 0,
@@ -3333,7 +4578,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-a",
         }),
@@ -3353,7 +4598,7 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
     const registration = indexState.registrations.get(registrationKey);
     expect(registration).toBeDefined();
     if (registration) {
@@ -3400,7 +4645,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-labels",
         }),
@@ -3441,7 +4686,7 @@ describe("worker runtime", () => {
       failed: 0,
       ok: true,
     });
-    expect(realtimeDependencyProbeCalls).toBe(2);
+    expect(realtimeDependencyTrackingQueryCalls).toBe(2);
   });
 
   it("treats point reads as table dependencies", async () => {
@@ -3463,7 +4708,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-get",
         }),
@@ -3496,7 +4741,7 @@ describe("worker runtime", () => {
       failed: 0,
       ok: true,
     });
-    expect(realtimeDependencyProbeCalls).toBe(2);
+    expect(realtimeDependencyTrackingQueryCalls).toBe(2);
   });
 
   it("filters realtime catch-up by combined event dependencies", async () => {
@@ -3517,7 +4762,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-catch-up",
         }),
@@ -3578,7 +4823,7 @@ describe("worker runtime", () => {
         ok: true,
       })
     );
-    expect(realtimeDependencyProbeCalls).toBe(2);
+    expect(realtimeDependencyTrackingQueryCalls).toBe(2);
   });
 
   it("emits realtime catch-up re-evaluation and outbox lag metrics", async () => {
@@ -3600,7 +4845,7 @@ describe("worker runtime", () => {
           connectionName: "connection:0",
           epoch: 1,
           leaseExpiresAt: Date.now() + 60_000,
-          queryName: "realtime:dependencyProbe",
+          queryName: "realtime:dependencyTracking",
           runtimeId,
           subscriptionId: "sub-catch-up-metric",
         }),
@@ -3785,7 +5030,7 @@ describe("worker runtime", () => {
       })
     );
     const body = (await registrationsResponse.json()) as {
-      lastSeenSequence: number | null;
+      lastProcessedOutboxSequence: number | null;
     };
     const row = await env.APP_DB.prepare(
       "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
@@ -3794,7 +5039,7 @@ describe("worker runtime", () => {
       .first<{ sequence: number }>();
 
     expect(response.status).toBe(200);
-    expect(body.lastSeenSequence).toBe(row?.sequence);
+    expect(body.lastProcessedOutboxSequence).toBe(row?.sequence);
   });
 
   it("skips realtime re-evaluation when notify references an unknown event", async () => {
@@ -3847,12 +5092,12 @@ describe("worker runtime", () => {
       })
     );
     const registrationsBody = (await registrationsResponse.json()) as {
-      lastSeenSequence: number | null;
+      lastProcessedOutboxSequence: number | null;
     };
 
     expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
     expect(deliveries).toHaveLength(0);
-    expect(registrationsBody.lastSeenSequence).toBeNull();
+    expect(registrationsBody.lastProcessedOutboxSequence).toBeNull();
   });
 
   it("keeps realtime notify cursors monotonic for out-of-order events", async () => {
@@ -3899,10 +5144,10 @@ describe("worker runtime", () => {
       })
     );
     const body = (await registrationsResponse.json()) as {
-      lastSeenSequence: number | null;
+      lastProcessedOutboxSequence: number | null;
     };
 
-    expect(body.lastSeenSequence).toBe(newerRow?.sequence);
+    expect(body.lastProcessedOutboxSequence).toBe(newerRow?.sequence);
   });
 
   it("does not regress realtime cursors when catch-up returns older events", async () => {
@@ -3958,10 +5203,10 @@ describe("worker runtime", () => {
       })
     );
     const body = (await registrationsResponse.json()) as {
-      lastSeenSequence: number | null;
+      lastProcessedOutboxSequence: number | null;
     };
 
-    expect(body.lastSeenSequence).toBe(newerRow?.sequence);
+    expect(body.lastProcessedOutboxSequence).toBe(newerRow?.sequence);
   });
 
   it("ignores stale realtime registration epochs and keeps leases for delivery cleanup", async () => {
@@ -4618,7 +5863,7 @@ describe("worker runtime", () => {
             connectionName: "connection:0",
             epoch: 1,
             leaseExpiresAt: Date.now() + 60_000,
-            queryName: "realtime:concurrencyProbe",
+            queryName: "realtime:concurrencyTracking",
             runtimeId,
             subscriptionId,
           }),
@@ -4646,8 +5891,8 @@ describe("worker runtime", () => {
     };
 
     expect(body).toEqual({ evaluated: 12, failed: 0, ok: true });
-    expect(realtimeConcurrencyMaxActive).toBeGreaterThan(1);
-    expect(realtimeConcurrencyMaxActive).toBeLessThanOrEqual(8);
+    expect(maxActiveRealtimeConcurrencyQueries).toBeGreaterThan(1);
+    expect(maxActiveRealtimeConcurrencyQueries).toBeLessThanOrEqual(8);
   });
 
   it("renews expired realtime leases after successful delivery", async () => {

@@ -27,7 +27,7 @@ import {
   createStorageReaderPlaceholder,
   createStorageWriterPlaceholder,
 } from "./placeholders";
-import type { RealtimeMutationNotifier } from "./realtime";
+import type { RealtimeMutationNotifier } from "./realtime/types";
 import type { BaseflareExecutionContext, RuntimeDatabase } from "./types";
 
 interface InvocationOptions {

@@ -1,6 +1,14 @@
 import { env } from "cloudflare:test";
 import { v } from "baseflare/values";
-import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from "vitest";
 import { query } from "../functions/query";
 import { defineRules } from "../permissions/define-rules";
 import { defineSchema } from "../schema/define-schema";
@@ -9,12 +17,14 @@ import { createFunctionIndex } from "./function-index";
 import { buildBaseflareManifest } from "./manifest";
 import {
   configureRealtimeRuntime,
+  resetRealtimeRuntimeStateForTest,
+} from "./realtime/shared";
+import { RealtimeSubscriptionDO } from "./realtime/subscription-do";
+import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_REEVALUATION_CONCURRENCY,
-  RealtimeSubscriptionDO,
-  resetRealtimeRuntimeStateForTest,
-} from "./realtime";
+} from "./realtime/types";
 import { applyRuntimeSchema } from "./schema-apply";
 import type {
   BaseflareManifest,
@@ -68,14 +78,14 @@ const rules = defineRules({
   },
 });
 
-let dependencyProbeCalls = 0;
+let realtimeDependencyTrackingQueryCalls = 0;
 let slowActiveQueries = 0;
 let slowMaxActiveQueries = 0;
 
-const dependencyProbe = query({
+const realtimeDependencyTrackingQuery = query({
   args: { ownerToken: v.string() },
   handler(ctx, args) {
-    dependencyProbeCalls += 1;
+    realtimeDependencyTrackingQueryCalls += 1;
     return ctx.db
       .query("todos")
       .filter({ ownerToken: args.ownerToken })
@@ -83,7 +93,7 @@ const dependencyProbe = query({
   },
 });
 
-const slowProbe = query({
+const slowRealtimeQuery = query({
   args: { ownerToken: v.string() },
   async handler(ctx, args) {
     slowActiveQueries += 1;
@@ -101,11 +111,11 @@ function createManifest(): BaseflareManifest {
   return buildBaseflareManifest({
     queries: [
       {
-        definition: dependencyProbe,
+        definition: realtimeDependencyTrackingQuery,
         exportName: "dependency",
         modulePath: "perf",
       },
-      { definition: slowProbe, exportName: "slow", modulePath: "perf" },
+      { definition: slowRealtimeQuery, exportName: "slow", modulePath: "perf" },
     ],
     rules,
     schema,
@@ -148,7 +158,8 @@ async function registerSubscription(
   runtimeId: string,
   subscriptionId: string,
   queryName: string,
-  ownerToken: string
+  ownerToken: string,
+  options: { readonly shardName?: string } = {}
 ): Promise<void> {
   await subscriptionDo.fetch(
     new Request("https://baseflare.internal/register", {
@@ -160,6 +171,7 @@ async function registerSubscription(
         leaseExpiresAt: Date.now() + 60_000,
         queryName,
         runtimeId,
+        shardName: options.shardName,
         subscriptionId,
       }),
       headers: { "content-type": "application/json" },
@@ -175,7 +187,7 @@ describe("realtime local performance gate", () => {
 
   beforeEach(async () => {
     resetRealtimeRuntimeStateForTest();
-    dependencyProbeCalls = 0;
+    realtimeDependencyTrackingQueryCalls = 0;
     slowActiveQueries = 0;
     slowMaxActiveQueries = 0;
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -186,6 +198,71 @@ describe("realtime local performance gate", () => {
     await env.APP_DB.prepare(
       "UPDATE _bf_table_versions SET version = 0 WHERE table_name = 'todos'"
     ).run();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it("handles 25k registrations distributed across subscription shards", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const shardCount = 32;
+    const registrationCount = 25_000;
+    const registrationChunkSize = 500;
+    const subscriptionDos = Array.from(
+      { length: shardCount },
+      () =>
+        new RealtimeSubscriptionDO(null, {
+          APP_DB: env.APP_DB,
+          REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+          REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+        })
+    );
+
+    for (
+      let startIndex = 0;
+      startIndex < registrationCount;
+      startIndex += registrationChunkSize
+    ) {
+      const endIndex = Math.min(
+        startIndex + registrationChunkSize,
+        registrationCount
+      );
+      await Promise.all(
+        Array.from({ length: endIndex - startIndex }, (_value, offset) => {
+          const registrationIndex = startIndex + offset;
+          const shardIndex = registrationIndex % shardCount;
+          return registerSubscription(
+            subscriptionDos[shardIndex] as RealtimeSubscriptionDO,
+            runtimeId,
+            `sub-${registrationIndex}`,
+            "perf:dependency",
+            `owner-${shardIndex}`,
+            { shardName: `subscription:g1:${shardIndex}` }
+          );
+        })
+      );
+    }
+
+    const registrationCounts = await Promise.all(
+      subscriptionDos.map(async (subscriptionDo) => {
+        const response = await subscriptionDo.fetch(
+          new Request("https://baseflare.internal/registrations", {
+            body: "{}",
+            method: "POST",
+          })
+        );
+        const body = (await response.json()) as { registrations: unknown[] };
+        return body.registrations.length;
+      })
+    );
+
+    expect(registrationCounts.reduce((total, count) => total + count, 0)).toBe(
+      registrationCount
+    );
+    expect(Math.max(...registrationCounts)).toBeLessThanOrEqual(
+      Math.ceil(registrationCount / shardCount)
+    );
   });
 
   it("skips unrelated partition subscriptions under load", async () => {
@@ -224,7 +301,7 @@ describe("realtime local performance gate", () => {
         method: "POST",
       })
     );
-    dependencyProbeCalls = 0;
+    realtimeDependencyTrackingQueryCalls = 0;
     await createRealtimeOutboxEvent("unrelated-owner-b", "owner-b");
 
     const response = await subscriptionDo.fetch(
@@ -241,7 +318,7 @@ describe("realtime local performance gate", () => {
     };
 
     expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
-    expect(dependencyProbeCalls).toBe(0);
+    expect(realtimeDependencyTrackingQueryCalls).toBe(0);
   });
 
   it("keeps hot re-evaluation concurrency bounded", async () => {

@@ -21,11 +21,9 @@ import {
 } from "./execution";
 import { createFunctionIndex } from "./function-index";
 import { getRequestLogFields, logRuntimeEvent } from "./logging";
-import {
-  configureRealtimeRuntime,
-  createRealtimeMutationNotifier,
-  routeRealtimeSubscribe,
-} from "./realtime";
+import { routeRealtimeSubscribe } from "./realtime/connection-do";
+import { createRealtimeMutationNotifier } from "./realtime/outbox";
+import { configureRealtimeRuntime } from "./realtime/shared";
 import { readRequestBodyText } from "./request-body";
 import type {
   BaseflareExecutionContext,
