@@ -1806,6 +1806,103 @@ describe("worker runtime", () => {
     ]);
   });
 
+  const runRealtimeMoveRollbackScenario = async (
+    unregisterHandler: () => Promise<Response>
+  ): Promise<{
+    readonly errorLog: ReturnType<typeof vi.spyOn>;
+    readonly registrations: unknown[];
+    readonly subscriptionPaths: string[];
+  }> => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const subscriptionPaths: string[] = [];
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      const pathname = new URL(request.url).pathname;
+      subscriptionPaths.push(pathname);
+      if (pathname === "/unregister") {
+        return unregisterHandler();
+      }
+
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const connections = new FakeDurableObjectNamespace((_name, request) => {
+      const pathname = new URL(request.url).pathname;
+      if (pathname === "/subscription-moved") {
+        return Promise.resolve(new Response("failed", { status: 500 }));
+      }
+
+      return Promise.resolve(
+        Response.json({
+          delivered: 1,
+          deliveredSubscriptions: ["sub-a"],
+          ok: true,
+        })
+      );
+    });
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "owner-a-move-rollback");
+    await createRealtimeOutboxEvent("owner-a-move-rollback", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "owner-a-move-rollback",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: unknown[];
+    };
+
+    return {
+      errorLog,
+      registrations: registrationsBody.registrations,
+      subscriptionPaths,
+    };
+  };
+
   it("migrates partition-aligned realtime registrations to their home shard", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await env.APP_DB.prepare(
@@ -1826,7 +1923,7 @@ describe("worker runtime", () => {
     );
     const connections = new FakeDurableObjectNamespace((_name, request) => {
       const pathname = new URL(request.url).pathname;
-      if (pathname === "/deliver-batch") {
+      if (pathname === "/deliver") {
         return Promise.resolve(
           Response.json({
             delivered: 1,
@@ -1980,6 +2077,64 @@ describe("worker runtime", () => {
     expect(registrationsBody.registrations).toHaveLength(1);
   });
 
+  it("keeps source realtime registrations active when shard move rollback succeeds", async () => {
+    const { errorLog, registrations, subscriptionPaths } =
+      await runRealtimeMoveRollbackScenario(() =>
+        Promise.resolve(Response.json({ ok: true }))
+      );
+
+    expect(registrations).toHaveLength(1);
+    expect(subscriptionPaths).toContain("/unregister");
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_move_failed",
+        status: 500,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).not.toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_move_cleanup_failed",
+      })
+    );
+  });
+
+  it("logs realtime shard move cleanup failures when rollback returns non-ok", async () => {
+    const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
+      () => Promise.resolve(Response.json({ ok: false }, { status: 503 }))
+    );
+
+    expect(registrations).toHaveLength(1);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_move_cleanup_failed",
+        connectionKey: "client-a",
+        status: 503,
+        subscriptionId: "sub-a",
+      })
+    );
+  });
+
+  it("logs realtime shard move cleanup failures when rollback throws", async () => {
+    const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
+      () => Promise.reject(new Error("rollback unavailable"))
+    );
+
+    expect(registrations).toHaveLength(1);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "Error",
+        event: "runtime.realtime_registration_move_cleanup_failed",
+        connectionKey: "client-a",
+        subscriptionId: "sub-a",
+      })
+    );
+  });
+
   // Migration delivery suppression guard: a migrated registration must not
   // re-deliver the result the source shard already delivered. Two mechanisms
   // make this safe: unchanged results are suppressed on re-evaluation, and
@@ -1990,7 +2145,7 @@ describe("worker runtime", () => {
     const deliveredIds: string[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        if (new URL(request.url).pathname === "/deliver-batch") {
+        if (new URL(request.url).pathname === "/deliver") {
           const body = (await request.json()) as {
             deliveries: Array<{ subscriptionId: string }>;
           };
@@ -2143,9 +2298,13 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-a",
-          result: [{ text: "only-a" }],
-          sequence: 123,
-          subscriptionId: "sub-a",
+          deliveries: [
+            {
+              result: [{ text: "only-a" }],
+              sequence: 123,
+              subscriptionId: "sub-a",
+            },
+          ],
         }),
         headers: { "content-type": "application/json" },
         method: "POST",
@@ -2171,8 +2330,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-missing",
-          result: [],
-          subscriptionId: "sub-missing",
+          deliveries: [{ result: [], subscriptionId: "sub-missing" }],
         }),
         headers: { "content-type": "application/json" },
         method: "POST",
@@ -2183,9 +2341,22 @@ describe("worker runtime", () => {
     };
 
     expect(missingBody.delivered).toBe(0);
+    await expect(
+      connectionDo.fetch(
+        new Request("https://baseflare.internal/deliver", {
+          body: JSON.stringify({
+            connectionKey: "client-a",
+            result: [{ text: "legacy-flat-payload" }],
+            subscriptionId: "sub-legacy",
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      )
+    ).rejects.toThrow('Realtime field "deliveries" must be an array');
   });
 
-  it("delivers realtime batches as individual client messages", async () => {
+  it("delivers realtime messages as individual client messages", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
@@ -2209,7 +2380,7 @@ describe("worker runtime", () => {
     });
 
     const batchResponse = await connectionDo.fetch(
-      new Request("https://baseflare.internal/deliver-batch", {
+      new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-a",
           deliveries: [
@@ -2288,7 +2459,7 @@ describe("worker runtime", () => {
     internals.socketsByConnectionKey.set("client-a", new Set([socket]));
 
     const response = await connectionDo.fetch(
-      new Request("https://baseflare.internal/deliver-batch", {
+      new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-a",
           deliveries: [
@@ -2375,8 +2546,9 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: clientAKey,
-          result: [{ text: "anonymous-a" }],
-          subscriptionId: "sub-a",
+          deliveries: [
+            { result: [{ text: "anonymous-a" }], subscriptionId: "sub-a" },
+          ],
         }),
         headers: { "content-type": "application/json" },
         method: "POST",
@@ -2427,8 +2599,9 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "shared-client",
-          result: [{ text: "shared" }],
-          subscriptionId: "sub-shared",
+          deliveries: [
+            { result: [{ text: "shared" }], subscriptionId: "sub-shared" },
+          ],
         }),
         headers: { "content-type": "application/json" },
         method: "POST",
@@ -2506,8 +2679,12 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-a",
-          result: [{ text: "still-delivered" }],
-          subscriptionId: "sub-a",
+          deliveries: [
+            {
+              result: [{ text: "still-delivered" }],
+              subscriptionId: "sub-a",
+            },
+          ],
         }),
         headers: { "content-type": "application/json" },
         method: "POST",
@@ -2692,9 +2869,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-a",
-          result: [],
-          sequence: 42,
-          subscriptionId: "sub-a",
+          deliveries: [{ result: [], sequence: 42, subscriptionId: "sub-a" }],
         }),
         headers: { "content-type": "application/json" },
         method: "POST",
@@ -4359,7 +4534,7 @@ describe("worker runtime", () => {
         // Stand in for the subscription DO: a catch-up heals the missed update by
         // delivering it back to the still-open connection socket, as in production.
         await connectionDo.fetch(
-          new Request("https://baseflare.internal/deliver-batch", {
+          new Request("https://baseflare.internal/deliver", {
             body: JSON.stringify({
               connectionKey: "client-a",
               deliveries: [
@@ -5657,7 +5832,7 @@ describe("worker runtime", () => {
     expect(response.status).toBe(200);
     expect(connections.requests).toHaveLength(1);
     expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
-      "/deliver-batch"
+      "/deliver"
     );
     expect(deliveries).toHaveLength(1);
     const delivery = getFirstRealtimeDelivery(deliveries[0]);
@@ -5899,7 +6074,7 @@ describe("worker runtime", () => {
     ).toEqual(["sub-a", "sub-b"]);
     expect(connections.requests).toHaveLength(1);
     expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
-      "/deliver-batch"
+      "/deliver"
     );
   });
 

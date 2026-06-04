@@ -7,7 +7,7 @@ import { bindStatement } from "../d1";
 import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
 import { executeQueryDefinition } from "../execution";
 import { logRuntimeEvent } from "../logging";
-import type { D1Database } from "../types";
+import type { D1Database, DurableObjectStub } from "../types";
 import {
   createRealtimeOutboxResponseEvents,
   deleteRealtimeOutboxEventsBefore,
@@ -636,7 +636,7 @@ export class RealtimeSubscriptionDO {
   ): Promise<RealtimeDeliveryResult> {
     const deliveryResponse = await this.env.REALTIME_CONNECTIONS.get(
       this.env.REALTIME_CONNECTIONS.idFromName(group.connectionName)
-    ).fetch("https://baseflare.internal/deliver-batch", {
+    ).fetch("https://baseflare.internal/deliver", {
       body: JSON.stringify({
         connectionKey: group.connectionKey,
         deliveries: group.deliveries.map((delivery) => delivery.message),
@@ -1045,15 +1045,13 @@ export class RealtimeSubscriptionDO {
       method: "POST",
     });
     if (!connectionUpdateResponse.ok) {
-      await targetStub.fetch("https://baseflare.internal/unregister", {
-        body: JSON.stringify({
-          connectionKey: registration.connectionKey,
-          subscriptionId: registration.subscriptionId,
-        }),
-        headers: JSON_HEADERS,
-        method: "POST",
-      });
+      await this.rollbackAdoptedRegistration(
+        targetStub,
+        targetShardName,
+        registration
+      );
       logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
+        connectionKey: registration.connectionKey,
         shardName: targetShardName,
         status: connectionUpdateResponse.status,
         subscriptionId: registration.subscriptionId,
@@ -1062,6 +1060,53 @@ export class RealtimeSubscriptionDO {
     }
 
     this.deleteRegistrationByKey(registrationKey);
+  }
+
+  private async rollbackAdoptedRegistration(
+    targetStub: DurableObjectStub,
+    targetShardName: string,
+    registration: StoredRealtimeRegistration
+  ): Promise<void> {
+    try {
+      const response = await targetStub.fetch(
+        "https://baseflare.internal/unregister",
+        {
+          body: JSON.stringify({
+            connectionKey: registration.connectionKey,
+            subscriptionId: registration.subscriptionId,
+          }),
+          headers: JSON_HEADERS,
+          method: "POST",
+        }
+      );
+      if (!response.ok) {
+        this.logRegistrationMoveCleanupFailure(registration, targetShardName, {
+          status: response.status,
+        });
+      }
+    } catch (error) {
+      this.logRegistrationMoveCleanupFailure(registration, targetShardName, {
+        errorName: error instanceof Error ? error.name : typeof error,
+      });
+    }
+  }
+
+  private logRegistrationMoveCleanupFailure(
+    registration: StoredRealtimeRegistration,
+    targetShardName: string,
+    detail: { readonly errorName?: string; readonly status?: number }
+  ): void {
+    logRuntimeEvent(
+      "error",
+      "runtime.realtime_registration_move_cleanup_failed",
+      {
+        connectionKey: registration.connectionKey,
+        errorName: detail.errorName,
+        shardName: targetShardName,
+        status: detail.status,
+        subscriptionId: registration.subscriptionId,
+      }
+    );
   }
 
   private addRegistrationToIndex(

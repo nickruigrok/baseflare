@@ -113,12 +113,7 @@ export class RealtimeConnectionDO {
     if (request.method === "POST" && url.pathname === "/deliver") {
       const message = await readJsonObject(request);
       const delivered = this.deliver(message);
-      return jsonResponse({ delivered, ok: true });
-    }
-
-    if (request.method === "POST" && url.pathname === "/deliver-batch") {
-      const message = await readJsonObject(request);
-      return jsonResponse({ ...this.deliverBatch(message), ok: true });
+      return jsonResponse({ ...delivered, ok: true });
     }
 
     if (request.method === "POST" && url.pathname === "/subscription-moved") {
@@ -480,15 +475,7 @@ export class RealtimeConnectionDO {
     }
   }
 
-  private deliver(message: Record<string, unknown>): number {
-    const connectionKey = getStringField(message, "connectionKey");
-    const { connectionKey: _connectionKey, ...deliveryMessage } = message;
-    return this.deliverMessages(connectionKey, [deliveryMessage]);
-  }
-
-  private deliverBatch(
-    message: Record<string, unknown>
-  ): RealtimeDeliveryResult {
+  private deliver(message: Record<string, unknown>): RealtimeDeliveryResult {
     const connectionKey = getStringField(message, "connectionKey");
     const deliveries = message.deliveries;
     if (!Array.isArray(deliveries)) {
@@ -497,13 +484,13 @@ export class RealtimeConnectionDO {
       );
     }
 
-    return this.deliverBatchMessages(
+    return this.deliverMessages(
       connectionKey,
       deliveries.map((delivery) => parseObject(delivery, "Realtime delivery"))
     );
   }
 
-  private deliverBatchMessages(
+  private deliverMessages(
     connectionKey: string,
     messages: readonly Record<string, unknown>[]
   ): RealtimeDeliveryResult {
@@ -527,23 +514,6 @@ export class RealtimeConnectionDO {
       delivered,
       deliveredSubscriptions: [...deliveredSubscriptions],
     };
-  }
-
-  private deliverMessages(
-    connectionKey: string,
-    messages: readonly Record<string, unknown>[]
-  ): number {
-    const sockets = this.socketsByConnectionKey.get(connectionKey);
-    if (!sockets || messages.length === 0) {
-      return 0;
-    }
-
-    let delivered = 0;
-    for (const message of messages) {
-      delivered += this.deliverMessageToSockets(sockets, message);
-    }
-
-    return delivered;
   }
 
   private deliverMessageToSockets(
