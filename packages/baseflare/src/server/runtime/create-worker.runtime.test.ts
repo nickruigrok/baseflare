@@ -122,6 +122,7 @@ let tableConflictAttempts = 0;
 let exhaustedConflictAttempts = 0;
 let multiTableConflictAttempts = 0;
 let realtimeDependencyProbeCalls = 0;
+let realtimeDynamicDependencyOwnerToken = "owner-a";
 let realtimeConcurrencyActive = 0;
 let realtimeConcurrencyMaxActive = 0;
 
@@ -277,6 +278,7 @@ const realtimeDependencyProbe = query({
     id: v.optional(v.id("todos")),
     mode: v.union(
       v.literal("broad-labels"),
+      v.literal("dynamic-partition-todos"),
       v.literal("get-todo"),
       v.literal("partition-todos")
     ),
@@ -292,9 +294,14 @@ const realtimeDependencyProbe = query({
       return args.id ? ctx.db.get("todos", args.id) : null;
     }
 
+    const ownerToken =
+      args.mode === "dynamic-partition-todos"
+        ? realtimeDynamicDependencyOwnerToken
+        : args.ownerToken;
+
     return ctx.db
       .query("todos")
-      .filter({ ownerToken: args.ownerToken })
+      .filter({ ownerToken })
       .order("text", "asc")
       .collect();
   },
@@ -875,6 +882,35 @@ function todoOwnerPartition(ownerToken: string): {
   };
 }
 
+function todoOwnerPartitionId(ownerToken: string): string {
+  const partition = todoOwnerPartition(ownerToken);
+  return JSON.stringify([
+    partition.tableName,
+    partition.partitionKey,
+    partition.partitionValue,
+  ]);
+}
+
+function realtimeRegistrationKey(
+  connectionKey: string,
+  subscriptionId: string
+): string {
+  return JSON.stringify([connectionKey, subscriptionId]);
+}
+
+interface RealtimeIndexDebugState {
+  readonly registrationKeysByPartition: Map<string, Set<string>>;
+  readonly registrationKeysByTable: Map<string, Set<string>>;
+  readonly registrationKeysWithoutDependencies: Set<string>;
+  readonly registrations: Map<string, { leaseExpiresAt: number }>;
+}
+
+function getRealtimeIndexDebugState(
+  subscriptionDo: RealtimeSubscriptionDO
+): RealtimeIndexDebugState {
+  return subscriptionDo as unknown as RealtimeIndexDebugState;
+}
+
 async function getRealtimeOutboxSequence(eventId: string): Promise<number> {
   const row = await env.APP_DB.prepare(
     "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
@@ -1021,6 +1057,7 @@ describe("worker runtime", () => {
     realtimeConcurrencyActive = 0;
     realtimeConcurrencyMaxActive = 0;
     realtimeDependencyProbeCalls = 0;
+    realtimeDynamicDependencyOwnerToken = "owner-a";
     rowConflictAttempts = 0;
     tableConflictAttempts = 0;
     vi.spyOn(console, "error").mockImplementation(() => undefined);
@@ -2949,6 +2986,400 @@ describe("worker runtime", () => {
     });
     expect(realtimeDependencyProbeCalls).toBe(2);
     expect(deliveries).toHaveLength(2);
+  });
+
+  it("indexes realtime registrations after dependency capture", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+
+    expect(
+      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+    ).toBe(true);
+
+    await createTodoViaRpc("owner-a", "owner-a-indexed");
+    await createRealtimeOutboxEvent("owner-a-index-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "owner-a-index-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(
+      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+    ).toBe(false);
+    expect(
+      indexState.registrationKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(registrationKey)
+    ).toBe(true);
+  });
+
+  it("routes broad table events to partition-indexed realtime registrations", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "owner-a-broad-prime");
+    await createRealtimeOutboxEvent("owner-a-broad-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "owner-a-broad-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    realtimeDependencyProbeCalls = 0;
+    await createRealtimeOutboxEvent("todos-broad-table", Date.now(), {
+      tables: ["todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "todos-broad-table" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(await response.json()).toEqual({
+      evaluated: 1,
+      failed: 0,
+      ok: true,
+    });
+    expect(realtimeDependencyProbeCalls).toBe(1);
+  });
+
+  it("updates realtime dependency indexes when snapshots move", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: {
+            mode: "dynamic-partition-todos",
+            ownerToken: "owner-a",
+          },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "owner-a-dynamic");
+    await createRealtimeOutboxEvent("dynamic-owner-a-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "dynamic-owner-a-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    realtimeDynamicDependencyOwnerToken = "owner-b";
+    await createTodoViaRpc("owner-b", "owner-b-dynamic");
+    await createRealtimeOutboxEvent("dynamic-owner-a-move", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "dynamic-owner-a-move" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+
+    expect(
+      indexState.registrationKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(registrationKey)
+    ).not.toBe(true);
+    expect(
+      indexState.registrationKeysByPartition
+        .get(todoOwnerPartitionId("owner-b"))
+        ?.has(registrationKey)
+    ).toBe(true);
+  });
+
+  it("removes unregistered realtime registrations from dependency indexes", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "owner-a-unregister-index");
+    await createRealtimeOutboxEvent("owner-a-unregister-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "owner-a-unregister-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/unregister", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+
+    expect(
+      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+    ).toBe(false);
+    expect(
+      indexState.registrationKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(registrationKey)
+    ).not.toBe(true);
+  });
+
+  it("keeps realtime dependency indexes after failed re-evaluation", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "owner-a-failed-index");
+    await createRealtimeOutboxEvent("owner-a-failed-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "owner-a-failed-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    resetRealtimeRuntimeStateForTest();
+    await createRealtimeOutboxEvent("owner-a-failed-runtime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "owner-a-failed-runtime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+
+    expect(await response.json()).toEqual({
+      evaluated: 0,
+      failed: 1,
+      ok: true,
+    });
+    expect(
+      indexState.registrationKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(registrationKey)
+    ).toBe(true);
+  });
+
+  it("removes expired realtime registrations from dependency indexes", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    let shouldDeliver = true;
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(
+          shouldDeliver
+            ? Response.json({
+                delivered: 1,
+                deliveredSubscriptions: ["sub-a"],
+                ok: true,
+              })
+            : Response.json({
+                delivered: 0,
+                deliveredSubscriptions: [],
+                ok: true,
+              })
+        )
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "owner-a-expired-index");
+    await createRealtimeOutboxEvent("owner-a-expired-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "owner-a-expired-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const indexState = getRealtimeIndexDebugState(subscriptionDo);
+    const registration = indexState.registrations.get(registrationKey);
+    expect(registration).toBeDefined();
+    if (registration) {
+      registration.leaseExpiresAt = Date.now() - 1;
+    }
+    shouldDeliver = false;
+    await createTodoViaRpc("owner-a", "owner-a-expired-index-next");
+    await createRealtimeOutboxEvent("owner-a-expired-delete", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "owner-a-expired-delete" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(indexState.registrations.has(registrationKey)).toBe(false);
+    expect(
+      indexState.registrationKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(registrationKey)
+    ).not.toBe(true);
   });
 
   it("keeps broad table dependencies subscribed to table events", async () => {

@@ -373,34 +373,6 @@ function getPartitionDependencyTable(partitionId: string): string | undefined {
   }
 }
 
-function isRealtimeEventRelevant(
-  registration: StoredRealtimeRegistration,
-  targets: RealtimeAffectedTargets
-): boolean {
-  if (!registration.dependencies) {
-    return true;
-  }
-
-  for (const tableName of registration.dependencies.tables) {
-    if (targets.tables.has(tableName)) {
-      return true;
-    }
-  }
-
-  for (const partitionId of registration.dependencies.partitions) {
-    if (targets.partitions.has(partitionId)) {
-      return true;
-    }
-
-    const tableName = getPartitionDependencyTable(partitionId);
-    if (tableName && targets.broadTables.has(tableName)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
 function getRealtimeShardName(
   prefix: string,
   key: string,
@@ -1064,6 +1036,9 @@ export class RealtimeSubscriptionDO {
     string,
     StoredRealtimeRegistration
   >();
+  private readonly registrationKeysByPartition = new Map<string, Set<string>>();
+  private readonly registrationKeysByTable = new Map<string, Set<string>>();
+  private readonly registrationKeysWithoutDependencies = new Set<string>();
   private readonly reEvaluatingRegistrations = new Set<string>();
   private lastOutboxCleanupAt = 0;
   private lastSeenSequence: number | null = null;
@@ -1089,14 +1064,18 @@ export class RealtimeSubscriptionDO {
       );
       const existing = this.registrations.get(registrationKey);
       if (!existing || registration.epoch >= existing.epoch) {
+        if (existing) {
+          this.removeRegistrationFromIndexes(registrationKey, existing);
+        }
         this.registrations.set(registrationKey, registration);
+        this.registrationKeysWithoutDependencies.add(registrationKey);
       }
       return jsonResponse({ ok: true });
     }
 
     if (url.pathname === "/unregister") {
       const body = await readJsonObject(request);
-      this.registrations.delete(
+      this.deleteRegistrationByKey(
         createRegistrationKey(
           getStringField(body, "connectionKey"),
           getStringField(body, "subscriptionId")
@@ -1217,24 +1196,22 @@ export class RealtimeSubscriptionDO {
     let failed = 0;
     let skipped = 0;
     const pendingDeliveries: PendingRealtimeDelivery[] = [];
-    const storedRegistrations = this.getStoredRegistrations();
-    const registrations = storedRegistrations.filter((registration) =>
-      isRealtimeEventRelevant(registration, targets)
-    );
-    skipped += storedRegistrations.length - registrations.length;
+    const registrationKeys = [...this.getRelevantRegistrationKeys(targets)];
+    skipped += Math.max(0, this.registrations.size - registrationKeys.length);
     let nextRegistrationIndex = 0;
     const evaluateNextRegistration = async (): Promise<void> => {
-      while (nextRegistrationIndex < registrations.length) {
-        const registration = registrations[nextRegistrationIndex];
+      while (nextRegistrationIndex < registrationKeys.length) {
+        const registrationKey = registrationKeys[nextRegistrationIndex];
         nextRegistrationIndex += 1;
+        if (!registrationKey) {
+          continue;
+        }
+
+        const registration = this.registrations.get(registrationKey);
         if (!registration) {
           continue;
         }
 
-        const registrationKey = createRegistrationKey(
-          registration.connectionKey,
-          registration.subscriptionId
-        );
         if (this.reEvaluatingRegistrations.has(registrationKey)) {
           skipped += 1;
           continue;
@@ -1269,7 +1246,7 @@ export class RealtimeSubscriptionDO {
         {
           length: Math.min(
             REALTIME_REEVALUATION_CONCURRENCY,
-            registrations.length
+            registrationKeys.length
           ),
         },
         () => evaluateNextRegistration()
@@ -1356,7 +1333,10 @@ export class RealtimeSubscriptionDO {
           continue;
         }
 
-        delivery.registration.dependencies = delivery.dependencies;
+        this.updateRegistrationDependencies(
+          delivery.registration,
+          delivery.dependencies
+        );
         delivery.registration.lastResultJson = delivery.resultJson;
         delivery.registration.leaseExpiresAt = leaseExpiresAt;
       }
@@ -1510,7 +1490,7 @@ export class RealtimeSubscriptionDO {
     );
     const resultJson = JSON.stringify(result);
     if (resultJson === registration.lastResultJson) {
-      registration.dependencies = dependencies;
+      this.updateRegistrationDependencies(registration, dependencies);
       return null;
     }
 
@@ -1533,11 +1513,152 @@ export class RealtimeSubscriptionDO {
       return;
     }
 
-    this.registrations.delete(
+    this.deleteRegistrationByKey(
       createRegistrationKey(
         registration.connectionKey,
         registration.subscriptionId
       )
     );
+  }
+
+  private getRelevantRegistrationKeys(
+    targets: RealtimeAffectedTargets
+  ): Set<string> {
+    const registrationKeys = new Set(this.registrationKeysWithoutDependencies);
+
+    for (const tableName of targets.tables) {
+      this.addIndexedRegistrationKeys(
+        registrationKeys,
+        this.registrationKeysByTable.get(tableName)
+      );
+    }
+
+    for (const partitionId of targets.partitions) {
+      this.addIndexedRegistrationKeys(
+        registrationKeys,
+        this.registrationKeysByPartition.get(partitionId)
+      );
+    }
+
+    for (const tableName of targets.broadTables) {
+      this.addPartitionRegistrationKeysForTable(registrationKeys, tableName);
+    }
+
+    return registrationKeys;
+  }
+
+  private addPartitionRegistrationKeysForTable(
+    target: Set<string>,
+    tableName: string
+  ): void {
+    for (const [partitionId, registrationKeys] of this
+      .registrationKeysByPartition) {
+      if (getPartitionDependencyTable(partitionId) === tableName) {
+        this.addIndexedRegistrationKeys(target, registrationKeys);
+      }
+    }
+  }
+
+  private addIndexedRegistrationKeys(
+    target: Set<string>,
+    registrationKeys: ReadonlySet<string> | undefined
+  ): void {
+    if (!registrationKeys) {
+      return;
+    }
+
+    for (const registrationKey of registrationKeys) {
+      target.add(registrationKey);
+    }
+  }
+
+  private updateRegistrationDependencies(
+    registration: StoredRealtimeRegistration,
+    dependencies: RealtimeDependencySet
+  ): void {
+    const registrationKey = createRegistrationKey(
+      registration.connectionKey,
+      registration.subscriptionId
+    );
+    this.removeRegistrationFromIndexes(registrationKey, registration);
+    registration.dependencies = dependencies;
+
+    for (const tableName of dependencies.tables) {
+      this.addRegistrationToIndex(
+        this.registrationKeysByTable,
+        tableName,
+        registrationKey
+      );
+    }
+
+    for (const partitionId of dependencies.partitions) {
+      this.addRegistrationToIndex(
+        this.registrationKeysByPartition,
+        partitionId,
+        registrationKey
+      );
+    }
+  }
+
+  private addRegistrationToIndex(
+    index: Map<string, Set<string>>,
+    indexKey: string,
+    registrationKey: string
+  ): void {
+    const registrationKeys = index.get(indexKey) ?? new Set<string>();
+    registrationKeys.add(registrationKey);
+    index.set(indexKey, registrationKeys);
+  }
+
+  private deleteRegistrationByKey(registrationKey: string): void {
+    const registration = this.registrations.get(registrationKey);
+    if (!registration) {
+      return;
+    }
+
+    this.removeRegistrationFromIndexes(registrationKey, registration);
+    this.registrations.delete(registrationKey);
+  }
+
+  private removeRegistrationFromIndexes(
+    registrationKey: string,
+    registration: StoredRealtimeRegistration
+  ): void {
+    this.registrationKeysWithoutDependencies.delete(registrationKey);
+    if (!registration.dependencies) {
+      return;
+    }
+
+    for (const tableName of registration.dependencies.tables) {
+      this.removeRegistrationFromIndex(
+        this.registrationKeysByTable,
+        tableName,
+        registrationKey
+      );
+    }
+
+    for (const partitionId of registration.dependencies.partitions) {
+      this.removeRegistrationFromIndex(
+        this.registrationKeysByPartition,
+        partitionId,
+        registrationKey
+      );
+    }
+  }
+
+  private removeRegistrationFromIndex(
+    index: Map<string, Set<string>>,
+    indexKey: string,
+    registrationKey: string
+  ): void {
+    const registrationKeys = index.get(indexKey);
+    if (!registrationKeys) {
+      return;
+    }
+
+    registrationKeys.delete(registrationKey);
+    if (registrationKeys.size === 0) {
+      index.delete(indexKey);
+    }
   }
 }
