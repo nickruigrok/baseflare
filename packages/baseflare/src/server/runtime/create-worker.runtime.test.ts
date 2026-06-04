@@ -119,6 +119,8 @@ let tableConflictAttempts = 0;
 let exhaustedConflictAttempts = 0;
 let multiTableConflictAttempts = 0;
 let realtimeDependencyProbeCalls = 0;
+let realtimeConcurrencyActive = 0;
+let realtimeConcurrencyMaxActive = 0;
 
 const rules = defineRules({
   labels: {
@@ -291,6 +293,23 @@ const realtimeDependencyProbe = query({
       .query("todos")
       .filter({ ownerToken: args.ownerToken })
       .order("text", "asc")
+      .collect();
+  },
+});
+
+const realtimeConcurrencyProbe = query({
+  args: { ownerToken: v.string() },
+  async handler(ctx, args) {
+    realtimeConcurrencyActive += 1;
+    realtimeConcurrencyMaxActive = Math.max(
+      realtimeConcurrencyMaxActive,
+      realtimeConcurrencyActive
+    );
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    realtimeConcurrencyActive -= 1;
+    return ctx.db
+      .query("todos")
+      .filter({ ownerToken: args.ownerToken })
       .collect();
   },
 });
@@ -634,6 +653,11 @@ function createManifest(
         modulePath: "realtime",
       },
       {
+        definition: realtimeConcurrencyProbe,
+        exportName: "concurrencyProbe",
+        modulePath: "realtime",
+      },
+      {
         definition: permissionShapeProbe,
         exportName: "permissionShapes",
         modulePath: "todos",
@@ -860,6 +884,54 @@ async function getRealtimeOutboxSequence(eventId: string): Promise<number> {
   return row.sequence;
 }
 
+function getRealtimeDeliveryItems(delivery: unknown): Array<{
+  connectionKey?: string;
+  result: Array<{ text: string }>;
+  sequence?: number | null;
+  subscriptionId: string;
+}> {
+  const body = delivery as {
+    connectionKey?: string;
+    deliveries?: Array<{
+      result: Array<{ text: string }>;
+      sequence?: number | null;
+      subscriptionId: string;
+    }>;
+    result?: Array<{ text: string }>;
+    sequence?: number | null;
+    subscriptionId?: string;
+  };
+  if (Array.isArray(body.deliveries)) {
+    return body.deliveries.map((item) => ({
+      ...item,
+      connectionKey: body.connectionKey,
+    }));
+  }
+
+  return [
+    {
+      connectionKey: body.connectionKey,
+      result: body.result ?? [],
+      sequence: body.sequence,
+      subscriptionId: body.subscriptionId ?? "",
+    },
+  ];
+}
+
+function getFirstRealtimeDelivery(delivery: unknown): {
+  connectionKey?: string;
+  result: Array<{ text: string }>;
+  sequence?: number | null;
+  subscriptionId: string;
+} {
+  const [item] = getRealtimeDeliveryItems(delivery);
+  if (!item) {
+    throw new Error("Missing realtime delivery item");
+  }
+
+  return item;
+}
+
 async function createDetailedTodoViaRpc(args: {
   completed?: boolean;
   deletedAt?: number;
@@ -943,6 +1015,8 @@ describe("worker runtime", () => {
     resetRealtimeRuntimeStateForTest();
     exhaustedConflictAttempts = 0;
     multiTableConflictAttempts = 0;
+    realtimeConcurrencyActive = 0;
+    realtimeConcurrencyMaxActive = 0;
     realtimeDependencyProbeCalls = 0;
     rowConflictAttempts = 0;
     tableConflictAttempts = 0;
@@ -1154,6 +1228,147 @@ describe("worker runtime", () => {
     };
 
     expect(missingBody.delivered).toBe(0);
+  });
+
+  it("delivers realtime batches as individual client messages", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const clientMessages: unknown[] = [];
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      clientMessages.push(JSON.parse(String(event.data)) as unknown);
+    });
+
+    const batchResponse = await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver-batch", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          deliveries: [
+            {
+              result: [{ text: "first" }],
+              sequence: 1,
+              subscriptionId: "sub-a",
+            },
+            {
+              result: [{ text: "second" }],
+              sequence: 1,
+              subscriptionId: "sub-b",
+            },
+          ],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await batchResponse.json()) as {
+      delivered: number;
+      deliveredSubscriptions: string[];
+    };
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(body.delivered).toBe(2);
+    expect(body.deliveredSubscriptions).toEqual(["sub-a", "sub-b"]);
+    expect(clientMessages).toEqual([
+      {
+        message: {
+          result: [{ text: "first" }],
+          sequence: 1,
+          subscriptionId: "sub-a",
+        },
+        type: "delivery",
+      },
+      {
+        message: {
+          result: [{ text: "second" }],
+          sequence: 1,
+          subscriptionId: "sub-b",
+        },
+        type: "delivery",
+      },
+    ]);
+  });
+
+  it("reports only accepted subscriptions from realtime batch delivery", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const sentPayloads: string[] = [];
+    const socket = {
+      send(payload: string) {
+        const message = JSON.parse(payload) as {
+          message: { subscriptionId: string };
+        };
+        if (message.message.subscriptionId === "sub-b") {
+          throw new Error("Socket closed");
+        }
+
+        sentPayloads.push(payload);
+      },
+    } as unknown as WebSocket;
+    const internals = connectionDo as unknown as {
+      socketConnectionKeys: Map<WebSocket, string>;
+      sockets: Set<WebSocket>;
+      socketsByConnectionKey: Map<string, Set<WebSocket>>;
+    };
+    internals.sockets.add(socket);
+    internals.socketConnectionKeys.set(socket, "client-a");
+    internals.socketsByConnectionKey.set("client-a", new Set([socket]));
+
+    const response = await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver-batch", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          deliveries: [
+            { result: [], sequence: 1, subscriptionId: "sub-a" },
+            { result: [], sequence: 1, subscriptionId: "sub-b" },
+          ],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      delivered: number;
+      deliveredSubscriptions: string[];
+      ok: boolean;
+    };
+
+    expect(body).toEqual({
+      delivered: 1,
+      deliveredSubscriptions: ["sub-a"],
+      ok: true,
+    });
+    expect(sentPayloads).toHaveLength(1);
+  });
+
+  it("does not expose placeholder realtime reconcile behavior", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await connectionDo.fetch(
+      new Request("https://baseflare.internal/reconcile", { method: "POST" })
+    );
+
+    expect(response.status).toBe(404);
   });
 
   it("isolates anonymous realtime sockets from each other", async () => {
@@ -2190,30 +2405,12 @@ describe("worker runtime", () => {
     expect(response.status).toBe(200);
     expect(body).toEqual({ evaluated: 1, failed: 1, ok: true });
     expect(deliveries).toHaveLength(1);
-    expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-          sequence: number | null;
-          subscriptionId: string;
-        }
-      ).subscriptionId
-    ).toBe("sub-good");
-    expect(
-      (
-        deliveries[0] as {
-          sequence: number | null;
-        }
-      ).sequence
-    ).toBe(sequence);
-    expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-          subscriptionId: string;
-        }
-      ).result.map((todo) => todo.text)
-    ).toEqual(["still-delivered"]);
+    const delivery = getFirstRealtimeDelivery(deliveries[0]);
+    expect(delivery.subscriptionId).toBe("sub-good");
+    expect(delivery.sequence).toBe(sequence);
+    expect(delivery.result.map((todo) => todo.text)).toEqual([
+      "still-delivered",
+    ]);
     expect(errorSpy).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -2537,28 +2734,12 @@ describe("worker runtime", () => {
       expect.objectContaining({ evaluated: 1, failed: 1, ok: true })
     );
     expect(deliveries).toHaveLength(1);
-    expect(
-      (
-        deliveries[0] as {
-          sequence: number | null;
-        }
-      ).sequence
-    ).toBe(body.events[0]?.sequence);
-    expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-          subscriptionId: string;
-        }
-      ).subscriptionId
-    ).toBe("sub-good");
-    expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-        }
-      ).result.map((todo) => todo.text)
-    ).toEqual(["catch-up-delivered"]);
+    const delivery = getFirstRealtimeDelivery(deliveries[0]);
+    expect(delivery.sequence).toBe(body.events[0]?.sequence);
+    expect(delivery.subscriptionId).toBe("sub-good");
+    expect(delivery.result.map((todo) => todo.text)).toEqual([
+      "catch-up-delivered",
+    ]);
   });
 
   it("skips realtime notify re-evaluation for unrelated partitions", async () => {
@@ -3281,35 +3462,13 @@ describe("worker runtime", () => {
     expect(response.status).toBe(200);
     expect(connections.requests).toHaveLength(1);
     expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
-      "/deliver"
+      "/deliver-batch"
     );
     expect(deliveries).toHaveLength(1);
-    expect(
-      (
-        deliveries[0] as {
-          connectionKey: string;
-          result: Array<{ text: string }>;
-          subscriptionId: string;
-        }
-      ).subscriptionId
-    ).toBe("sub-1");
-    expect(
-      (
-        deliveries[0] as {
-          connectionKey: string;
-          result: Array<{ text: string }>;
-          subscriptionId: string;
-        }
-      ).connectionKey
-    ).toBe("client-a");
-    expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-          subscriptionId: string;
-        }
-      ).result.map((todo) => todo.text)
-    ).toEqual(["delivered"]);
+    const delivery = getFirstRealtimeDelivery(deliveries[0]);
+    expect(delivery.subscriptionId).toBe("sub-1");
+    expect(delivery.connectionKey).toBe("client-a");
+    expect(delivery.result.map((todo) => todo.text)).toEqual(["delivered"]);
   });
 
   it("deduplicates concurrent realtime re-evaluation for the same registration", async () => {
@@ -3394,7 +3553,9 @@ describe("worker runtime", () => {
         const delivery = await request.json();
         deliveries.push(delivery);
         if (
-          (delivery as { subscriptionId?: string }).subscriptionId === "sub-a"
+          getRealtimeDeliveryItems(delivery).some(
+            (item) => item.subscriptionId === "sub-a"
+          )
         ) {
           await deliveryGate.promise;
         }
@@ -3459,13 +3620,202 @@ describe("worker runtime", () => {
       ok: boolean;
     };
 
-    expect(secondBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: true });
     expect(firstBody).toEqual({ evaluated: 2, failed: 0, ok: true });
     expect(
-      deliveries.map(
-        (delivery) => (delivery as { subscriptionId: string }).subscriptionId
+      deliveries.flatMap((delivery) =>
+        getRealtimeDeliveryItems(delivery).map((item) => item.subscriptionId)
       )
     ).toEqual(["sub-a", "sub-b"]);
+    expect(connections.requests).toHaveLength(1);
+    expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
+      "/deliver-batch"
+    );
+  });
+
+  it("sends separate realtime delivery batches for different connection keys", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveries.push(await request.json());
+        return Response.json({ delivered: 1, ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (connectionKey: string, subscriptionId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey,
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "todos:list",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    await register("client-a", "sub-a");
+    await register("client-b", "sub-b");
+    await createTodoViaRpc("owner-a", "separate-batches");
+    await createRealtimeOutboxEvent("separate-batch-event");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "separate-batch-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 2, failed: 0, ok: true });
+    expect(connections.requests).toHaveLength(2);
+    expect(
+      deliveries.map(
+        (delivery) => (delivery as { connectionKey: string }).connectionKey
+      )
+    ).toEqual(["client-a", "client-b"]);
+  });
+
+  it("retries undelivered items from a partially acknowledged realtime batch", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    let deliveryAttempt = 0;
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveryAttempt += 1;
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        return Response.json({
+          delivered: 1,
+          deliveredSubscriptions: deliveryAttempt === 1 ? ["sub-a"] : ["sub-b"],
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "todos:list",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    await register("sub-a");
+    await register("sub-b");
+    await createTodoViaRpc("owner-a", "partial-batch");
+    await createRealtimeOutboxEvent("partial-batch-event");
+    const notify = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId: "partial-batch-event" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    const firstResponse = await notify();
+    const firstBody = (await firstResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    const secondResponse = await notify();
+    const secondBody = (await secondResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(firstBody).toEqual({ evaluated: 2, failed: 0, ok: true });
+    expect(secondBody).toEqual({ evaluated: 2, failed: 0, ok: true });
+    expect(
+      deliveries.map((delivery) =>
+        getRealtimeDeliveryItems(delivery).map((item) => item.subscriptionId)
+      )
+    ).toEqual([["sub-a", "sub-b"], ["sub-b"]]);
+  });
+
+  it("bounds realtime re-evaluation concurrency", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ delivered: 1, ok: true }))
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "realtime:concurrencyProbe",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    for (let index = 0; index < 12; index += 1) {
+      await register(`sub-${index}`);
+    }
+    await createTodoViaRpc("owner-a", "bounded-re-evaluation");
+    await createRealtimeOutboxEvent("bounded-re-evaluation-event");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "bounded-re-evaluation-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 12, failed: 0, ok: true });
+    expect(realtimeConcurrencyMaxActive).toBeGreaterThan(1);
+    expect(realtimeConcurrencyMaxActive).toBeLessThanOrEqual(8);
   });
 
   it("renews expired realtime leases after successful delivery", async () => {
@@ -3712,11 +4062,7 @@ describe("worker runtime", () => {
     expect(retriedBody).toEqual({ evaluated: 1, failed: 0, ok: true });
     expect(deliveries).toHaveLength(1);
     expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-        }
-      ).result.map((todo) => todo.text)
+      getFirstRealtimeDelivery(deliveries[0]).result.map((todo) => todo.text)
     ).toEqual(["retry-delivery"]);
 
     const duplicateResponse = await notify();
@@ -3799,11 +4145,7 @@ describe("worker runtime", () => {
     expect(retriedBody).toEqual({ evaluated: 1, failed: 0, ok: true });
     expect(deliveries).toHaveLength(1);
     expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-        }
-      ).result.map((todo) => todo.text)
+      getFirstRealtimeDelivery(deliveries[0]).result.map((todo) => todo.text)
     ).toEqual(["retry-non-ok-delivery"]);
 
     const duplicateResponse = await notify();
@@ -4042,11 +4384,7 @@ describe("worker runtime", () => {
     expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
     expect(deliveries).toHaveLength(1);
     expect(
-      (
-        deliveries[0] as {
-          result: Array<{ text: string }>;
-        }
-      ).result.map((todo) => todo.text)
+      getFirstRealtimeDelivery(deliveries[0]).result.map((todo) => todo.text)
     ).toEqual(["original-runtime"]);
   });
 

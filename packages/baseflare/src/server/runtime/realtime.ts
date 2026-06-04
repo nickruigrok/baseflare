@@ -99,7 +99,32 @@ interface RealtimeAffectedTargets {
   readonly tables: ReadonlySet<string>;
 }
 
+interface RealtimeDeliveryMessage {
+  readonly result: unknown;
+  readonly sequence: number | null;
+  readonly subscriptionId: string;
+}
+
+interface RealtimeDeliveryResult {
+  readonly delivered: number;
+  readonly deliveredSubscriptions: readonly string[];
+}
+
+interface PendingRealtimeDelivery {
+  readonly dependencies: RealtimeDependencySet;
+  readonly message: RealtimeDeliveryMessage;
+  readonly registration: StoredRealtimeRegistration;
+  readonly resultJson: string;
+}
+
+interface RealtimeDeliveryGroup {
+  readonly connectionKey: string;
+  readonly connectionName: string;
+  readonly deliveries: PendingRealtimeDelivery[];
+}
+
 const DEFAULT_REALTIME_SHARD_COUNT = 1;
+const REALTIME_REEVALUATION_CONCURRENCY = 8;
 const REALTIME_LEASE_MS = 60_000;
 const REALTIME_OUTBOX_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const REALTIME_OUTBOX_CLEANUP_LIMIT = 1000;
@@ -553,8 +578,9 @@ export class RealtimeConnectionDO {
       return jsonResponse({ delivered, ok: true });
     }
 
-    if (request.method === "POST" && url.pathname === "/reconcile") {
-      return jsonResponse({ ok: true });
+    if (request.method === "POST" && url.pathname === "/deliver-batch") {
+      const message = await readJsonObject(request);
+      return jsonResponse({ ...this.deliverBatch(message), ok: true });
     }
 
     return new Response("Not found", { status: 404 });
@@ -833,17 +859,79 @@ export class RealtimeConnectionDO {
   private deliver(message: Record<string, unknown>): number {
     const connectionKey = getStringField(message, "connectionKey");
     const { connectionKey: _connectionKey, ...deliveryMessage } = message;
-    const payload = JSON.stringify({
-      message: deliveryMessage,
-      type: "delivery",
-    });
+    return this.deliverMessages(connectionKey, [deliveryMessage]);
+  }
+
+  private deliverBatch(
+    message: Record<string, unknown>
+  ): RealtimeDeliveryResult {
+    const connectionKey = getStringField(message, "connectionKey");
+    const deliveries = message.deliveries;
+    if (!Array.isArray(deliveries)) {
+      throw new ValidationRuntimeError(
+        'Realtime field "deliveries" must be an array'
+      );
+    }
+
+    return this.deliverBatchMessages(
+      connectionKey,
+      deliveries.map((delivery) => parseObject(delivery, "Realtime delivery"))
+    );
+  }
+
+  private deliverBatchMessages(
+    connectionKey: string,
+    messages: readonly Record<string, unknown>[]
+  ): RealtimeDeliveryResult {
     const sockets = this.socketsByConnectionKey.get(connectionKey);
-    if (!sockets) {
+    if (!sockets || messages.length === 0) {
+      return { delivered: 0, deliveredSubscriptions: [] };
+    }
+
+    let delivered = 0;
+    const deliveredSubscriptions = new Set<string>();
+    for (const message of messages) {
+      const subscriptionId = getStringField(message, "subscriptionId");
+      const sent = this.deliverMessageToSockets(sockets, message);
+      delivered += sent;
+      if (sent > 0) {
+        deliveredSubscriptions.add(subscriptionId);
+      }
+    }
+
+    return {
+      delivered,
+      deliveredSubscriptions: [...deliveredSubscriptions],
+    };
+  }
+
+  private deliverMessages(
+    connectionKey: string,
+    messages: readonly Record<string, unknown>[]
+  ): number {
+    const sockets = this.socketsByConnectionKey.get(connectionKey);
+    if (!sockets || messages.length === 0) {
       return 0;
     }
 
     let delivered = 0;
-    for (const socket of sockets) {
+    for (const message of messages) {
+      delivered += this.deliverMessageToSockets(sockets, message);
+    }
+
+    return delivered;
+  }
+
+  private deliverMessageToSockets(
+    sockets: Set<RuntimeWebSocket>,
+    message: Record<string, unknown>
+  ): number {
+    const payload = JSON.stringify({
+      message,
+      type: "delivery",
+    });
+    let delivered = 0;
+    for (const socket of [...sockets]) {
       try {
         socket.send(payload);
         delivered += 1;
@@ -1005,41 +1093,203 @@ export class RealtimeSubscriptionDO {
   }> {
     let evaluated = 0;
     let failed = 0;
-    for (const registration of this.getStoredRegistrations()) {
-      if (!isRealtimeEventRelevant(registration, targets)) {
-        continue;
-      }
+    const pendingDeliveries: PendingRealtimeDelivery[] = [];
+    const registrations = this.getStoredRegistrations().filter((registration) =>
+      isRealtimeEventRelevant(registration, targets)
+    );
+    let nextRegistrationIndex = 0;
+    const evaluateNextRegistration = async (): Promise<void> => {
+      while (nextRegistrationIndex < registrations.length) {
+        const registration = registrations[nextRegistrationIndex];
+        nextRegistrationIndex += 1;
+        if (!registration) {
+          continue;
+        }
 
-      const registrationKey = createRegistrationKey(
-        registration.connectionKey,
-        registration.subscriptionId
-      );
-      if (this.reEvaluatingRegistrations.has(registrationKey)) {
-        continue;
-      }
-
-      this.reEvaluatingRegistrations.add(registrationKey);
-      try {
-        await this.reEvaluateRegistration(registration, targets.sequence);
-        evaluated += 1;
-      } catch (error) {
-        failed += 1;
-        this.deleteExpiredRegistration(registration);
-        logRuntimeEvent(
-          "error",
-          "runtime.realtime_registration_re_evaluation_failed",
-          {
-            errorName: error instanceof Error ? error.name : typeof error,
-            queryName: registration.queryName,
-            subscriptionId: registration.subscriptionId,
-          }
+        const registrationKey = createRegistrationKey(
+          registration.connectionKey,
+          registration.subscriptionId
         );
-      } finally {
-        this.reEvaluatingRegistrations.delete(registrationKey);
+        if (this.reEvaluatingRegistrations.has(registrationKey)) {
+          continue;
+        }
+
+        this.reEvaluatingRegistrations.add(registrationKey);
+        let shouldRelease = true;
+        try {
+          const delivery = await this.evaluateRegistration(
+            registration,
+            targets.sequence
+          );
+          if (delivery) {
+            pendingDeliveries.push(delivery);
+            shouldRelease = false;
+          } else {
+            evaluated += 1;
+          }
+        } catch (error) {
+          failed += 1;
+          this.deleteExpiredRegistration(registration);
+          this.logReEvaluationFailure(registration, error);
+        } finally {
+          if (shouldRelease) {
+            this.reEvaluatingRegistrations.delete(registrationKey);
+          }
+        }
       }
+    };
+    await Promise.all(
+      Array.from(
+        {
+          length: Math.min(
+            REALTIME_REEVALUATION_CONCURRENCY,
+            registrations.length
+          ),
+        },
+        () => evaluateNextRegistration()
+      )
+    );
+
+    const deliveryResult = await this.flushPendingDeliveries(pendingDeliveries);
+    evaluated += deliveryResult.evaluated;
+    failed += deliveryResult.failed;
+
+    return { evaluated, failed };
+  }
+
+  private async flushPendingDeliveries(
+    pendingDeliveries: readonly PendingRealtimeDelivery[]
+  ): Promise<{
+    readonly evaluated: number;
+    readonly failed: number;
+  }> {
+    let evaluated = 0;
+    let failed = 0;
+    for (const group of this.createPendingDeliveryGroups(pendingDeliveries)) {
+      const result = await this.flushPendingDeliveryGroup(group);
+      evaluated += result.evaluated;
+      failed += result.failed;
     }
 
     return { evaluated, failed };
+  }
+
+  private createPendingDeliveryGroups(
+    pendingDeliveries: readonly PendingRealtimeDelivery[]
+  ): RealtimeDeliveryGroup[] {
+    const deliveryGroups = new Map<string, RealtimeDeliveryGroup>();
+    for (const delivery of pendingDeliveries) {
+      const groupKey = JSON.stringify([
+        delivery.registration.connectionName,
+        delivery.registration.connectionKey,
+      ]);
+      const group = deliveryGroups.get(groupKey) ?? {
+        connectionKey: delivery.registration.connectionKey,
+        connectionName: delivery.registration.connectionName,
+        deliveries: [],
+      };
+      group.deliveries.push(delivery);
+      deliveryGroups.set(groupKey, group);
+    }
+
+    return [...deliveryGroups.values()];
+  }
+
+  private async flushPendingDeliveryGroup(
+    group: RealtimeDeliveryGroup
+  ): Promise<{
+    readonly evaluated: number;
+    readonly failed: number;
+  }> {
+    try {
+      const result = await this.deliverPendingGroup(group);
+      const deliveredSubscriptions = new Set(result.deliveredSubscriptions);
+      const leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
+      for (const delivery of group.deliveries) {
+        if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
+          this.deleteExpiredRegistration(delivery.registration);
+          continue;
+        }
+
+        delivery.registration.dependencies = delivery.dependencies;
+        delivery.registration.lastResultJson = delivery.resultJson;
+        delivery.registration.leaseExpiresAt = leaseExpiresAt;
+      }
+      return { evaluated: group.deliveries.length, failed: 0 };
+    } catch (error) {
+      for (const delivery of group.deliveries) {
+        this.deleteExpiredRegistration(delivery.registration);
+        this.logReEvaluationFailure(delivery.registration, error);
+      }
+      return { evaluated: 0, failed: group.deliveries.length };
+    } finally {
+      for (const delivery of group.deliveries) {
+        this.reEvaluatingRegistrations.delete(
+          createRegistrationKey(
+            delivery.registration.connectionKey,
+            delivery.registration.subscriptionId
+          )
+        );
+      }
+    }
+  }
+
+  private async deliverPendingGroup(
+    group: RealtimeDeliveryGroup
+  ): Promise<RealtimeDeliveryResult> {
+    const deliveryResponse = await this.env.REALTIME_CONNECTIONS.get(
+      this.env.REALTIME_CONNECTIONS.idFromName(group.connectionName)
+    ).fetch("https://baseflare.internal/deliver-batch", {
+      body: JSON.stringify({
+        connectionKey: group.connectionKey,
+        deliveries: group.deliveries.map((delivery) => delivery.message),
+      }),
+      headers: JSON_HEADERS,
+      method: "POST",
+    });
+    if (!deliveryResponse.ok) {
+      throw new InternalRuntimeError(
+        `Realtime delivery failed with status ${deliveryResponse.status}`
+      );
+    }
+
+    const deliveryResult = (await deliveryResponse.json()) as {
+      delivered?: unknown;
+      deliveredSubscriptions?: unknown;
+    };
+    const delivered =
+      typeof deliveryResult.delivered === "number"
+        ? deliveryResult.delivered
+        : 0;
+    const deliveredSubscriptions = Array.isArray(
+      deliveryResult.deliveredSubscriptions
+    )
+      ? deliveryResult.deliveredSubscriptions.filter(
+          (subscriptionId): subscriptionId is string =>
+            typeof subscriptionId === "string"
+        )
+      : group.deliveries.map(
+          (delivery) => delivery.registration.subscriptionId
+        );
+    return {
+      delivered,
+      deliveredSubscriptions: delivered > 0 ? deliveredSubscriptions : [],
+    };
+  }
+
+  private logReEvaluationFailure(
+    registration: StoredRealtimeRegistration,
+    error: unknown
+  ): void {
+    logRuntimeEvent(
+      "error",
+      "runtime.realtime_registration_re_evaluation_failed",
+      {
+        errorName: error instanceof Error ? error.name : typeof error,
+        queryName: registration.queryName,
+        subscriptionId: registration.subscriptionId,
+      }
+    );
   }
 
   private async cleanupRealtimeOutbox(): Promise<void> {
@@ -1062,10 +1312,10 @@ export class RealtimeSubscriptionDO {
     }
   }
 
-  private async reEvaluateRegistration(
+  private async evaluateRegistration(
     registration: StoredRealtimeRegistration,
     sequence: number | null
-  ): Promise<void> {
+  ): Promise<PendingRealtimeDelivery | null> {
     const runtime = configuredRealtimeRuntimes.get(registration.runtimeId);
     if (!runtime) {
       throw new InternalRuntimeError(
@@ -1110,42 +1360,19 @@ export class RealtimeSubscriptionDO {
     const resultJson = JSON.stringify(result);
     if (resultJson === registration.lastResultJson) {
       registration.dependencies = dependencies;
-      return;
+      return null;
     }
 
-    const deliveryResponse = await this.env.REALTIME_CONNECTIONS.get(
-      this.env.REALTIME_CONNECTIONS.idFromName(registration.connectionName)
-    ).fetch("https://baseflare.internal/deliver", {
-      body: JSON.stringify({
-        connectionKey: registration.connectionKey,
+    return {
+      dependencies,
+      message: {
         result,
         sequence,
         subscriptionId: registration.subscriptionId,
-      }),
-      headers: JSON_HEADERS,
-      method: "POST",
-    });
-    if (!deliveryResponse.ok) {
-      throw new InternalRuntimeError(
-        `Realtime delivery failed with status ${deliveryResponse.status}`
-      );
-    }
-
-    const deliveryResult = (await deliveryResponse.json()) as {
-      delivered?: unknown;
+      },
+      registration,
+      resultJson,
     };
-    const delivered =
-      typeof deliveryResult.delivered === "number"
-        ? deliveryResult.delivered
-        : 0;
-    if (delivered <= 0) {
-      this.deleteExpiredRegistration(registration);
-      return;
-    }
-
-    registration.dependencies = dependencies;
-    registration.lastResultJson = resultJson;
-    registration.leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
   }
 
   private deleteExpiredRegistration(
