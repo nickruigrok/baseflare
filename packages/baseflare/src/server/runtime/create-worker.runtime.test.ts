@@ -1980,6 +1980,126 @@ describe("worker runtime", () => {
     expect(registrationsBody.registrations).toHaveLength(1);
   });
 
+  // Migration delivery suppression guard: a migrated registration must not
+  // re-deliver the result the source shard already delivered. Two mechanisms
+  // make this safe: unchanged results are suppressed on re-evaluation, and
+  // adopt-registration carries lastResultJson to the target.
+  it("does not re-deliver an unchanged realtime result after a later notify", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "stable");
+    const deliveredIds: string[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/deliver-batch") {
+          const body = (await request.json()) as {
+            deliveries: Array<{ subscriptionId: string }>;
+          };
+          deliveredIds.push(
+            ...body.deliveries.map((item) => item.subscriptionId)
+          );
+          return Response.json({
+            delivered: body.deliveries.length,
+            deliveredSubscriptions: body.deliveries.map(
+              (item) => item.subscriptionId
+            ),
+            ok: true,
+          });
+        }
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ ok: true }))
+      ),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await createRealtimeOutboxEvent("ev1", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("ev1");
+    expect(deliveredIds.filter((id) => id === "sub-a")).toHaveLength(1);
+
+    // A later event bumps the version (forcing re-evaluation) but the query
+    // result is unchanged — it must not be delivered a second time.
+    await createRealtimeOutboxEvent("ev2", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("ev2");
+    expect(deliveredIds.filter((id) => id === "sub-a")).toHaveLength(1);
+  });
+
+  it("preserves lastResultJson when adopting a migrated registration", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const lastResultJson = JSON.stringify([{ text: "already-delivered" }]);
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/adopt-registration", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          lastResultJson,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          shardName: "subscription:g1:0",
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const body = (await registrationsResponse.json()) as {
+      registrations: Array<{ lastResultJson?: string; subscriptionId: string }>;
+    };
+
+    expect(body.registrations).toEqual([
+      expect.objectContaining({ lastResultJson, subscriptionId: "sub-a" }),
+    ]);
+  });
+
   it("delivers realtime messages only to sockets for the target connection key", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -2622,6 +2742,118 @@ describe("worker runtime", () => {
           path: "/catch-up",
         }),
       ])
+    );
+  });
+
+  it("logs and counts hibernation subscription restore failures", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionRequests: Array<{ path: string }> = [];
+    // First instance: subscribe so the hibernated attachment carries sub-a.
+    let connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ ok: true }))
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const [socket] = state.acceptedSockets;
+    if (!socket) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    (
+      response as Response & { readonly webSocket?: AttachedTestWebSocket }
+    ).webSocket?.accept?.();
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        type: "subscribe",
+      })
+    );
+
+    // Wake from hibernation against a subscription DO that rejects /register.
+    state.alarmTime = null;
+    let rejectRegisters = true;
+    connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        (_name, request) => {
+          const path = new URL(request.url).pathname;
+          subscriptionRequests.push({ path });
+          return Promise.resolve(
+            path === "/register" && rejectRegisters
+              ? Response.json({ ok: false }, { status: 503 })
+              : Response.json({ events: [], ok: true })
+          );
+        }
+      ),
+    });
+
+    // restoreHibernatedSockets fires restoreAttachedSubscriptions from the ctor.
+    await waitFor(() =>
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_hibernation_subscription_restore_failed"
+      )
+    );
+
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_hibernation_subscription_restore_failed",
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.restore_subscriptions",
+        tags: { result: "rejected" },
+        value: 1,
+      })
+    );
+    expect(state.alarmTime).toBeTypeOf("number");
+
+    rejectRegisters = false;
+    await connectionDo.alarm();
+
+    expect(
+      subscriptionRequests.filter(({ path }) => path === "/register")
+    ).toHaveLength(2);
+    expect(subscriptionRequests.some(({ path }) => path === "/catch-up")).toBe(
+      true
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.restore_subscriptions",
+        tags: { result: "accepted" },
+        value: 1,
+      })
     );
   });
 

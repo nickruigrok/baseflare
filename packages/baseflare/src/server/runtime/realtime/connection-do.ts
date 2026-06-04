@@ -93,6 +93,7 @@ export class RealtimeConnectionDO {
   >();
   private readonly sockets = new Set<RuntimeWebSocket>();
   private readonly state: RealtimeDurableObjectState;
+  private hasPendingHibernationRestoreRetry = false;
 
   constructor(
     state: RealtimeDurableObjectState | unknown,
@@ -581,26 +582,33 @@ export class RealtimeConnectionDO {
     }
 
     if (sockets.length > 0) {
-      this.restoreAttachedSubscriptions().catch((error: unknown) => {
-        logRuntimeEvent(
-          "error",
-          "runtime.realtime_hibernation_restore_failed",
-          {
-            errorName: error instanceof Error ? error.name : typeof error,
-          }
-        );
-      });
+      this.restoreAttachedSubscriptions({ reconcileAfterRestore: true }).catch(
+        (error: unknown) => {
+          logRuntimeEvent(
+            "error",
+            "runtime.realtime_hibernation_restore_failed",
+            {
+              errorName: error instanceof Error ? error.name : typeof error,
+            }
+          );
+        }
+      );
     }
   }
 
-  private async restoreAttachedSubscriptions(): Promise<void> {
+  private async restoreAttachedSubscriptions(options: {
+    readonly reconcileAfterRestore: boolean;
+  }): Promise<{
+    readonly accepted: number;
+    readonly rejected: number;
+  }> {
     const subscriptions = this.getAttachedSubscriptions();
     if (subscriptions.length === 0) {
       await this.scheduleReconciliation();
-      return;
+      return { accepted: 0, rejected: 0 };
     }
 
-    await Promise.allSettled(
+    const results = await Promise.allSettled(
       subscriptions.map(async ({ attachment, subscription }) => {
         const subscriptionTarget = await this.subscriptionTarget(
           subscription.subscriptionShardName
@@ -631,7 +639,62 @@ export class RealtimeConnectionDO {
         }
       })
     );
-    await this.reconcileActiveSubscriptions();
+    // Surface per-subscription registration failures (e.g. a subscription DO
+    // shard transiently unavailable on hibernation wakeup) instead of silently
+    // swallowing them — otherwise the subscription is stranded with no signal.
+    let rejected = 0;
+    for (const [index, result] of results.entries()) {
+      if (result.status !== "rejected") {
+        continue;
+      }
+      rejected += 1;
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_hibernation_subscription_restore_failed",
+        {
+          errorMessage:
+            result.reason instanceof Error ? result.reason.message : undefined,
+          errorName:
+            result.reason instanceof Error
+              ? result.reason.name
+              : typeof result.reason,
+          queryName: subscriptions[index]?.subscription.queryName,
+          subscriptionShardName:
+            subscriptions[index]?.subscription.subscriptionShardName,
+          subscriptionId: subscriptions[index]?.subscription.subscriptionId,
+        }
+      );
+    }
+    if (rejected > 0) {
+      emitRealtimeMetric(REALTIME_RESTORE_SUBSCRIPTIONS_METRIC, rejected, {
+        result: "rejected",
+      });
+    }
+    const accepted = subscriptions.length - rejected;
+    if (accepted > 0) {
+      emitRealtimeMetric(REALTIME_RESTORE_SUBSCRIPTIONS_METRIC, accepted, {
+        result: "accepted",
+      });
+    }
+    this.hasPendingHibernationRestoreRetry = rejected > 0;
+    let catchUpFailed = false;
+    if (options.reconcileAfterRestore && accepted > 0) {
+      try {
+        await this.catchUpActiveSubscriptions();
+      } catch (error) {
+        catchUpFailed = true;
+        logRuntimeEvent("error", "runtime.realtime_reconciliation_failed", {
+          errorName: error instanceof Error ? error.name : typeof error,
+        });
+        emitRealtimeMetric(REALTIME_RECONCILIATIONS_METRIC, 1, {
+          result: "failed",
+        });
+      }
+    }
+    if (rejected > 0 || catchUpFailed) {
+      await this.scheduleReconciliation();
+    }
+    return { accepted, rejected };
   }
 
   private getAttachedSubscriptions(): Array<{
@@ -829,28 +892,15 @@ export class RealtimeConnectionDO {
     }
 
     try {
-      const afterSequence = this.getReconciliationAfterSequence();
-      const targets = await this.subscriptionCatchUpTargets();
-      await Promise.all(
-        targets.map(async (target) => {
-          const response = await target.stub.fetch(
-            "https://baseflare.internal/catch-up",
-            {
-              body: JSON.stringify({
-                afterSequence,
-                shardName: target.shardName,
-              }),
-              headers: JSON_HEADERS,
-              method: "POST",
-            }
-          );
-          if (!response.ok) {
-            throw new InternalRuntimeError(
-              `Realtime reconciliation failed with status ${response.status}`
-            );
-          }
-        })
-      );
+      if (this.hasPendingHibernationRestoreRetry) {
+        const restoreResult = await this.restoreAttachedSubscriptions({
+          reconcileAfterRestore: false,
+        });
+        if (restoreResult.rejected > 0) {
+          return;
+        }
+      }
+      await this.catchUpActiveSubscriptions();
       emitRealtimeMetric(REALTIME_RECONCILIATIONS_METRIC, 1, {
         result: "reconciled",
       });
@@ -864,6 +914,31 @@ export class RealtimeConnectionDO {
     }
 
     await this.scheduleReconciliation();
+  }
+
+  private async catchUpActiveSubscriptions(): Promise<void> {
+    const afterSequence = this.getReconciliationAfterSequence();
+    const targets = await this.subscriptionCatchUpTargets();
+    await Promise.all(
+      targets.map(async (target) => {
+        const response = await target.stub.fetch(
+          "https://baseflare.internal/catch-up",
+          {
+            body: JSON.stringify({
+              afterSequence,
+              shardName: target.shardName,
+            }),
+            headers: JSON_HEADERS,
+            method: "POST",
+          }
+        );
+        if (!response.ok) {
+          throw new InternalRuntimeError(
+            `Realtime reconciliation failed with status ${response.status}`
+          );
+        }
+      })
+    );
   }
 
   private async scheduleReconciliation(): Promise<void> {
