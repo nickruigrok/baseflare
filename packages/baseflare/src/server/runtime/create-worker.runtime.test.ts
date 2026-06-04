@@ -1395,6 +1395,38 @@ describe("worker runtime", () => {
     ).run();
   });
 
+  it("keeps the active realtime shard generation when scale transition fails", async () => {
+    const startedAt = 1_500_000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: startedAt,
+    });
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 1, 'retired', 0, NULL)"
+    ).run();
+
+    await expect(
+      evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+        activeRegistrationCount: 1000,
+        now: startedAt + 10 * 60 * 1000,
+      })
+    ).rejects.toThrow();
+
+    const activeGeneration = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
+    ).first<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+
+    expect(activeGeneration).toEqual({
+      generation_id: 1,
+      status: "active",
+      subscription_shard_count: 1,
+    });
+  });
+
   it("never scales realtime subscription shards beyond the cap", async () => {
     // Start at the maximum generation size.
     await env.APP_DB.prepare(

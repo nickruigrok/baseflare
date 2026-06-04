@@ -97,7 +97,6 @@ export interface RealtimePressureSnapshot {
   readonly failedDeliveryRate?: number;
   readonly outboxLagMs?: number;
   readonly pendingWorkCount?: number;
-  readonly reconciliationLatencyMs?: number;
   readonly reEvaluationLatencyMs?: number;
 }
 

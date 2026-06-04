@@ -165,7 +165,7 @@ export async function fetchRealtimeVersionSnapshot(
 }
 
 export async function evaluateRealtimeAutoscaling(
-  database: Pick<RuntimeDatabase, "prepare">,
+  database: Pick<RuntimeDatabase, "batch" | "prepare">,
   input: {
     readonly pressure: RealtimePressureSnapshot;
     readonly now?: number;
@@ -266,8 +266,7 @@ function hasHighRealtimePressure(
       REALTIME_AUTOSCALE_MAX_LATENCY_MS ||
     (pressure.outboxLagMs ?? 0) >= REALTIME_AUTOSCALE_MAX_OUTBOX_LAG_MS ||
     (pressure.failedDeliveryRate ?? 0) >=
-      REALTIME_AUTOSCALE_MAX_FAILED_DELIVERY_RATE ||
-    (pressure.reconciliationLatencyMs ?? 0) >= REALTIME_AUTOSCALE_MAX_LATENCY_MS
+      REALTIME_AUTOSCALE_MAX_FAILED_DELIVERY_RATE
   );
 }
 
@@ -282,8 +281,7 @@ function hasLowRealtimePressure(
     (pressure.deliveryBatchLatencyMs ?? 0) <
       REALTIME_AUTOSCALE_LOW_LATENCY_MS &&
     (pressure.outboxLagMs ?? 0) < REALTIME_AUTOSCALE_LOW_OUTBOX_LAG_MS &&
-    (pressure.failedDeliveryRate ?? 0) === 0 &&
-    (pressure.reconciliationLatencyMs ?? 0) < REALTIME_AUTOSCALE_LOW_LATENCY_MS
+    (pressure.failedDeliveryRate ?? 0) === 0
   );
 }
 
@@ -307,7 +305,7 @@ async function retireDrainedRealtimeShardGenerations(
 }
 
 export function evaluateRealtimeAutoscalingForTest(
-  database: Pick<RuntimeDatabase, "prepare">,
+  database: Pick<RuntimeDatabase, "batch" | "prepare">,
   input: {
     readonly activeRegistrationCount: number;
     readonly deliveryBatchLatencyMs?: number;
@@ -316,7 +314,6 @@ export function evaluateRealtimeAutoscalingForTest(
     readonly outboxLagMs?: number;
     readonly pendingWorkCount?: number;
     readonly reEvaluationLatencyMs?: number;
-    readonly reconciliationLatencyMs?: number;
   }
 ): Promise<RealtimeMetricResult | null> {
   return evaluateRealtimeAutoscaling(database, {
@@ -328,13 +325,12 @@ export function evaluateRealtimeAutoscalingForTest(
       outboxLagMs: input.outboxLagMs,
       pendingWorkCount: input.pendingWorkCount,
       reEvaluationLatencyMs: input.reEvaluationLatencyMs,
-      reconciliationLatencyMs: input.reconciliationLatencyMs,
     },
   });
 }
 
 async function createRealtimeShardGeneration(
-  database: Pick<RuntimeDatabase, "prepare">,
+  database: Pick<RuntimeDatabase, "batch" | "prepare">,
   activeGeneration: RealtimeShardGeneration,
   input: {
     readonly now: number;
@@ -367,9 +363,7 @@ async function createRealtimeShardGeneration(
     ),
   ];
 
-  for (const statement of statements) {
-    await statement.run();
-  }
+  await database.batch(statements);
   emitRealtimeMetric(REALTIME_AUTOSCALING_METRIC, input.shardCount, {
     result: input.result,
   });
