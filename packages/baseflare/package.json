@@ -35,6 +35,7 @@
     "build": "tsdown --config tsdown.config.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --config vitest.unit.config.ts && vitest run --config vitest.runtime.config.ts",
+    "test:perf": "vitest run --config vitest.perf.config.ts",
     "clean": "rimraf dist"
   },
   "dependencies": {

@@ -36,6 +36,9 @@ import {
   configureRealtimeRuntime,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
+  REALTIME_CATCH_UP_EVENT_LIMIT,
+  REALTIME_DELIVERY_BATCH_SIZE,
+  REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   RealtimeConnectionDO,
   RealtimeSubscriptionDO,
   resetRealtimeRuntimeStateForTest,
@@ -1021,6 +1024,7 @@ describe("worker runtime", () => {
     rowConflictAttempts = 0;
     tableConflictAttempts = 0;
     vi.spyOn(console, "error").mockImplementation(() => undefined);
+    vi.spyOn(console, "info").mockImplementation(() => undefined);
     vi.spyOn(console, "warn").mockImplementation(() => undefined);
     await env.APP_DB.prepare("DELETE FROM labels").run();
     await env.APP_DB.prepare("DELETE FROM todos").run();
@@ -1690,6 +1694,137 @@ describe("worker runtime", () => {
       reconciled: true,
       type: "restored",
     });
+  });
+
+  it("restores the maximum allowed realtime subscription count", async () => {
+    const registerRequests: unknown[] = [];
+    const subscriptionDo = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/catch-up") {
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+
+        registerRequests.push(await request.json());
+        return Response.json({ ok: true });
+      }
+    );
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(JSON.parse(String(event.data)) as { type: string });
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptions: Array.from(
+          { length: REALTIME_MAX_RESTORE_SUBSCRIPTIONS },
+          (_value, index) => ({
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: `sub-${index}`,
+          })
+        ),
+        type: "restore",
+      })
+    );
+    for (
+      let attempt = 0;
+      attempt < 40 && messages.length < REALTIME_MAX_RESTORE_SUBSCRIPTIONS + 1;
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(registerRequests).toHaveLength(REALTIME_MAX_RESTORE_SUBSCRIPTIONS);
+    expect(
+      messages.filter((message) => message.type === "subscribed")
+    ).toHaveLength(REALTIME_MAX_RESTORE_SUBSCRIPTIONS);
+    expect(messages.at(-1)).toMatchObject({ type: "restored" });
+  });
+
+  it("rejects oversized realtime restore payloads", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const subscriptionDo = new FakeDurableObjectNamespace();
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ error?: string; type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as { error?: string; type: string }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        subscriptions: Array.from(
+          { length: REALTIME_MAX_RESTORE_SUBSCRIPTIONS + 1 },
+          (_value, index) => ({
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: `sub-${index}`,
+          })
+        ),
+        type: "restore",
+      })
+    );
+    for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(subscriptionDo.requests).toHaveLength(0);
+    expect(messages).toEqual([
+      {
+        error: `Realtime restore can include at most ${REALTIME_MAX_RESTORE_SUBSCRIPTIONS} subscriptions`,
+        type: "error",
+      },
+    ]);
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.restore_subscriptions",
+        tags: { result: "rejected" },
+        value: REALTIME_MAX_RESTORE_SUBSCRIPTIONS + 1,
+      })
+    );
   });
 
   it("reports partial realtime restore failures after successful registrations", async () => {
@@ -3015,6 +3150,88 @@ describe("worker runtime", () => {
     expect(realtimeDependencyProbeCalls).toBe(2);
   });
 
+  it("emits realtime catch-up re-evaluation and outbox lag metrics", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyProbe",
+          runtimeId,
+          subscriptionId: "sub-catch-up-metric",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createRealtimeOutboxEvent(
+      "catch-up-metric-prime",
+      Date.now() - 1000,
+      {
+        partitions: [todoOwnerPartition("owner-a")],
+        tables: ["todos"],
+      }
+    );
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "catch-up-metric-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const afterSequence = await getRealtimeOutboxSequence(
+      "catch-up-metric-prime"
+    );
+    await createRealtimeOutboxEvent(
+      "catch-up-metric-unrelated",
+      Date.now() - 1000,
+      {
+        partitions: [todoOwnerPartition("owner-b")],
+        tables: ["todos"],
+      }
+    );
+    info.mockClear();
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.re_evaluations",
+        tags: { result: "skipped", source: "catch_up" },
+        value: 1,
+      })
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.outbox_lag_ms",
+        tags: { source: "catch_up" },
+      })
+    );
+  });
+
   it("uses realtime outbox sequence instead of event id for catch-up", async () => {
     const now = Date.now();
     await env.APP_DB.batch([
@@ -3066,6 +3283,44 @@ describe("worker runtime", () => {
         tables: ["labels"],
       },
     ]);
+  });
+
+  it("bounds realtime catch-up event reads", async () => {
+    await env.APP_DB.prepare(`
+      WITH RECURSIVE events(index_value) AS (
+        SELECT 0
+        UNION ALL
+        SELECT index_value + 1 FROM events WHERE index_value < ${REALTIME_CATCH_UP_EVENT_LIMIT}
+      )
+      INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions)
+      SELECT 'catch-up-limit-' || index_value, ?, ?, ? FROM events
+    `)
+      .bind(Date.now() - 1000, JSON.stringify(["todos"]), JSON.stringify([]))
+      .run();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 10_000 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      events: Array<{ eventId: string; sequence: number }>;
+      ok: boolean;
+    };
+
+    expect(body.ok).toBe(true);
+    expect(body.events).toHaveLength(REALTIME_CATCH_UP_EVENT_LIMIT);
+    expect(body.events.at(0)?.eventId).toBe("catch-up-limit-0");
+    expect(body.events.at(-1)?.eventId).toBe(
+      `catch-up-limit-${REALTIME_CATCH_UP_EVENT_LIMIT - 1}`
+    );
   });
 
   it("advances realtime notify cursors by outbox sequence", async () => {
@@ -3471,6 +3726,81 @@ describe("worker runtime", () => {
     expect(delivery.result.map((todo) => todo.text)).toEqual(["delivered"]);
   });
 
+  it("emits realtime notify re-evaluation and delivery metrics", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "metric-delivered");
+    await createRealtimeOutboxEvent("metric-notify-event", Date.now() - 1000);
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "metric-notify-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.re_evaluations",
+        tags: { result: "evaluated", source: "notify" },
+        value: 1,
+      })
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.delivery_batches",
+        tags: { result: "delivered" },
+        value: 1,
+      })
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.outbox_lag_ms",
+        tags: { source: "notify" },
+      })
+    );
+  });
+
   it("deduplicates concurrent realtime re-evaluation for the same registration", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveryGate = createDeferred();
@@ -3690,6 +4020,77 @@ describe("worker runtime", () => {
         (delivery) => (delivery as { connectionKey: string }).connectionKey
       )
     ).toEqual(["client-a", "client-b"]);
+  });
+
+  it("splits large realtime delivery groups into bounded batches", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        deliveries.push(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "todos:list",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    for (let index = 0; index < REALTIME_DELIVERY_BATCH_SIZE + 1; index += 1) {
+      await register(`sub-${index}`);
+    }
+    await createTodoViaRpc("owner-a", "bounded-delivery-batches");
+    await createRealtimeOutboxEvent("bounded-delivery-batches-event");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "bounded-delivery-batches-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({
+      evaluated: REALTIME_DELIVERY_BATCH_SIZE + 1,
+      failed: 0,
+      ok: true,
+    });
+    expect(
+      deliveries.map((delivery) => getRealtimeDeliveryItems(delivery))
+    ).toHaveLength(2);
+    expect(getRealtimeDeliveryItems(deliveries[0])).toHaveLength(
+      REALTIME_DELIVERY_BATCH_SIZE
+    );
+    expect(getRealtimeDeliveryItems(deliveries[1])).toHaveLength(1);
   });
 
   it("retries undelivered items from a partially acknowledged realtime batch", async () => {

@@ -865,7 +865,7 @@ after sustained low load.
 6. Subscription DOs re-run affected queries against D1 with tracking enabled and compare monotonic table/partition versions before re-querying when possible.
 7. Changed results are batched per `RealtimeConnectionDO`; connection DOs deliver to clients via WebSocket.
 
-The foundation slice re-evaluates active registrations on notify/catch-up, the dependency-aware invalidation slice narrows that work to registrations whose tracked table/partition dependencies match the outbox event, reconnect restore uses the client's last delivered outbox sequence to trigger catch-up before reporting restore completion, and fanout batching now groups changed results per connection target with item-level delivery acknowledgement while bounding query re-evaluation concurrency. Sharded subscription routing, advanced backpressure queues, periodic reconciliation, and client-side sequence persistence remain later Phase 3 work.
+The foundation slice re-evaluates active registrations on notify/catch-up, the dependency-aware invalidation slice narrows that work to registrations whose tracked table/partition dependencies match the outbox event, reconnect restore uses the client's last delivered outbox sequence to trigger catch-up before reporting restore completion, and fanout batching now groups changed results per connection target with item-level delivery acknowledgement while bounding query re-evaluation concurrency. Realtime work budgets cap restore payloads, delivery batch size, and catch-up reads; always-on metrics expose re-evaluation, delivery, restore, and outbox-lag pressure. Sharded subscription routing, advanced backpressure queues, periodic reconciliation, and client-side sequence persistence remain later Phase 3 work.
 
 **Recovery model:** Worker-to-subscription notification is recovered by D1 outbox catch-up. Reconnect-triggered recovery is implemented by carrying the last delivered outbox sequence in delivery messages and running subscription DO catch-up during restore. Live periodic reconciliation, connection hibernation behavior, and client SDK sequence persistence remain later Phase 3 work. **Open Phase 3 decision:** live periodic reconciliation interval, balancing worst-case staleness against idle DO hibernation.
 
@@ -873,7 +873,7 @@ The foundation slice re-evaluates active registrations on notify/catch-up, the d
 
 **Result comparison:** Result hashes may still be used to avoid duplicate pushes after re-evaluation, but reconciliation must compare monotonic table/partition versions first. Hash-only reconciliation would stampede D1 during reconnect storms.
 
-**Fanout limits:** Subscription DOs dedupe in-flight subscription keys, bound D1 re-evaluation concurrency, and batch subscription-to-connection delivery per connection target. Batch acknowledgements are item-level, so undelivered subscription results stay retryable. Table/global subscription paths use stronger debounce and observability because broad realtime queries are correct but expensive. Full backpressure queues remain later Phase 3 work.
+**Fanout limits:** Subscription DOs dedupe in-flight subscription keys, bound D1 re-evaluation concurrency, cap delivery batches, and batch subscription-to-connection delivery per connection target. Batch acknowledgements are item-level, so undelivered subscription results stay retryable. Table/global subscription paths use stronger debounce and observability because broad realtime queries are correct but expensive. Full backpressure queues remain later Phase 3 work.
 
 **Deliverables:**
 1. `RealtimeConnectionDO` Durable Object class:
@@ -893,7 +893,7 @@ The foundation slice re-evaluates active registrations on notify/catch-up, the d
 4. WebSocket endpoint on environment Worker (`GET /api/subscribe`)
 5. Client reconnection with subscription restore through connection DO reconciliation
 6. Release performance suite:
-   - `pnpm test:perf` for deterministic local/simulated realtime scale tests
+   - `pnpm test:perf` for deterministic local workerd-backed realtime scale tests
    - optional `pnpm test:perf:cloudflare` for staging WebSocket/platform stress tests
    - tracks fanout latency, D1 re-evaluations, queue depth, outbox lag, delivery batching, recovery time, and idle DO hibernation
 

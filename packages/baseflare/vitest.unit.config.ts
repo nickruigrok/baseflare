@@ -13,6 +13,6 @@ export default defineConfig({
     },
   },
   test: {
-    exclude: ["src/**/*.runtime.test.ts"],
+    exclude: ["src/**/*.perf.test.ts", "src/**/*.runtime.test.ts"],
   },
 });

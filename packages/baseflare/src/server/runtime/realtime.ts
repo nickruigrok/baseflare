@@ -8,7 +8,7 @@ import { bindStatement, type RuntimeReadObserver } from "./d1";
 import { InternalRuntimeError, ValidationRuntimeError } from "./errors";
 import { executeQueryDefinition } from "./execution";
 import type { FunctionIndex } from "./function-index";
-import { logRuntimeEvent } from "./logging";
+import { emitRuntimeMetric, logRuntimeEvent } from "./logging";
 import { partitionTargetId } from "./partitioning";
 import type {
   BaseflareExecutionContext,
@@ -39,6 +39,7 @@ export interface RealtimeOutboxEvent {
 }
 
 interface RealtimeSequencedOutboxEvent extends RealtimeOutboxEvent {
+  readonly createdAt: number;
   readonly sequence: number;
 }
 
@@ -124,17 +125,37 @@ interface RealtimeDeliveryGroup {
 }
 
 const DEFAULT_REALTIME_SHARD_COUNT = 1;
-const REALTIME_REEVALUATION_CONCURRENCY = 8;
+export const REALTIME_CATCH_UP_EVENT_LIMIT = 1000;
+export const REALTIME_DELIVERY_BATCH_SIZE = 100;
+export const REALTIME_MAX_RESTORE_SUBSCRIPTIONS = 100;
+export const REALTIME_REEVALUATION_CONCURRENCY = 8;
 const REALTIME_LEASE_MS = 60_000;
 const REALTIME_OUTBOX_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 const REALTIME_OUTBOX_CLEANUP_LIMIT = 1000;
 const REALTIME_OUTBOX_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const REALTIME_DELIVERY_BATCHES_METRIC =
+  "baseflare.runtime.realtime.delivery_batches";
+const REALTIME_OUTBOX_LAG_METRIC = "baseflare.runtime.realtime.outbox_lag_ms";
+const REALTIME_RE_EVALUATIONS_METRIC =
+  "baseflare.runtime.realtime.re_evaluations";
+const REALTIME_RESTORE_SUBSCRIPTIONS_METRIC =
+  "baseflare.runtime.realtime.restore_subscriptions";
 const JSON_HEADERS = { "content-type": "application/json" } as const;
 const REALTIME_CONNECTION_KEY_HEADER = "x-baseflare-realtime-connection-key";
 const REALTIME_RUNTIME_ID_HEADER = "x-baseflare-realtime-runtime-id";
 const UINT32_MODULUS = 4_294_967_296;
 let nextRealtimeRuntimeId = 0;
 const configuredRealtimeRuntimes = new Map<string, RealtimeRuntime>();
+
+type RealtimeMetricSource = "catch_up" | "notify";
+type RealtimeMetricResult =
+  | "accepted"
+  | "delivered"
+  | "evaluated"
+  | "failed"
+  | "rejected"
+  | "skipped"
+  | "undelivered";
 
 export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
   nextRealtimeRuntimeId += 1;
@@ -278,6 +299,67 @@ function createRealtimeAffectedTargets(
   }
 
   return { broadTables, partitions, sequence, tables };
+}
+
+function emitRealtimeMetric(
+  name: string,
+  value: number,
+  tags: {
+    readonly result?: RealtimeMetricResult;
+    readonly source?: RealtimeMetricSource;
+  }
+): void {
+  if (value <= 0) {
+    return;
+  }
+
+  const metricTags: Record<string, string> = {};
+  if (tags.result) {
+    metricTags.result = tags.result;
+  }
+  if (tags.source) {
+    metricTags.source = tags.source;
+  }
+
+  emitRuntimeMetric(name, value, metricTags);
+}
+
+function emitOutboxLagMetric(
+  source: RealtimeMetricSource,
+  events: readonly RealtimeSequencedOutboxEvent[]
+): void {
+  const now = Date.now();
+  const lagMs = events.reduce(
+    (maxLagMs, event) => Math.max(maxLagMs, now - event.createdAt),
+    0
+  );
+  emitRealtimeMetric(REALTIME_OUTBOX_LAG_METRIC, lagMs, { source });
+}
+
+function chunkRealtimeDeliveries(
+  deliveries: readonly PendingRealtimeDelivery[]
+): PendingRealtimeDelivery[][] {
+  const chunks: PendingRealtimeDelivery[][] = [];
+  for (
+    let index = 0;
+    index < deliveries.length;
+    index += REALTIME_DELIVERY_BATCH_SIZE
+  ) {
+    chunks.push(deliveries.slice(index, index + REALTIME_DELIVERY_BATCH_SIZE));
+  }
+
+  return chunks;
+}
+
+function createRealtimeOutboxResponseEvents(
+  events: readonly RealtimeSequencedOutboxEvent[]
+): Array<RealtimeOutboxEvent & { readonly sequence: number }> {
+  return events.map((event) => ({
+    eventId: event.eventId,
+    partitions: event.partitions,
+    sequence: event.sequence,
+    tables: event.tables,
+  }));
 }
 
 function getPartitionDependencyTable(partitionId: string): string | undefined {
@@ -432,20 +514,25 @@ export async function fetchRealtimeOutboxEvents(
   limit: number
 ): Promise<
   Array<{
+    readonly createdAt: number;
     readonly eventId: string;
     readonly partitions: readonly RealtimePartitionTarget[];
     readonly sequence: number;
     readonly tables: readonly string[];
   }>
 > {
-  const boundedLimit = Math.min(Math.max(limit, 1), 1000);
+  const boundedLimit = Math.min(
+    Math.max(limit, 1),
+    REALTIME_CATCH_UP_EVENT_LIMIT
+  );
   const sql =
     afterSequence === null
-      ? `SELECT sequence, event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} ORDER BY sequence ASC LIMIT ?`
-      : `SELECT sequence, event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE sequence > ? ORDER BY sequence ASC LIMIT ?`;
+      ? `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} ORDER BY sequence ASC LIMIT ?`
+      : `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE sequence > ? ORDER BY sequence ASC LIMIT ?`;
   const params =
     afterSequence === null ? [boundedLimit] : [afterSequence, boundedLimit];
   const result = await bindStatement(database, sql, params).all<{
+    created_at: number;
     event_id: string;
     partitions: string;
     sequence: number;
@@ -453,6 +540,7 @@ export async function fetchRealtimeOutboxEvents(
   }>();
 
   return (result.results ?? []).map((row) => ({
+    createdAt: row.created_at,
     eventId: row.event_id,
     partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
     sequence: row.sequence,
@@ -464,6 +552,7 @@ async function fetchRealtimeOutboxEventById(
   database: Pick<RuntimeDatabase, "prepare">,
   eventId: string
 ): Promise<{
+  readonly createdAt: number;
   readonly eventId: string;
   readonly partitions: readonly RealtimePartitionTarget[];
   readonly sequence: number;
@@ -471,9 +560,10 @@ async function fetchRealtimeOutboxEventById(
 } | null> {
   const row = await bindStatement(
     database,
-    `SELECT sequence, event_id, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
+    `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
     [eventId]
   ).first<{
+    created_at: number;
     event_id: string;
     partitions: string;
     sequence: number;
@@ -484,6 +574,7 @@ async function fetchRealtimeOutboxEventById(
   }
 
   return {
+    createdAt: row.created_at,
     eventId: row.event_id,
     partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
     sequence: row.sequence,
@@ -728,6 +819,16 @@ export class RealtimeConnectionDO {
         'Realtime field "subscriptions" must be an array'
       );
     }
+    if (subscriptions.length > REALTIME_MAX_RESTORE_SUBSCRIPTIONS) {
+      emitRealtimeMetric(
+        REALTIME_RESTORE_SUBSCRIPTIONS_METRIC,
+        subscriptions.length,
+        { result: "rejected" }
+      );
+      throw new ValidationRuntimeError(
+        `Realtime restore can include at most ${REALTIME_MAX_RESTORE_SUBSCRIPTIONS} subscriptions`
+      );
+    }
 
     const results = await Promise.allSettled(
       subscriptions.map(async (subscription, index) => {
@@ -801,6 +902,11 @@ export class RealtimeConnectionDO {
       });
     }
 
+    emitRealtimeMetric(
+      REALTIME_RESTORE_SUBSCRIPTIONS_METRIC,
+      subscriptions.length,
+      { result: "accepted" }
+    );
     socket.send(JSON.stringify({ failed, reconciled, type: "restored" }));
   }
 
@@ -1010,8 +1116,10 @@ export class RealtimeSubscriptionDO {
       }
 
       this.advanceLastSeenSequence(event.sequence);
+      emitOutboxLagMetric("notify", [event]);
       const result = await this.reEvaluateActiveRegistrations(
-        createRealtimeAffectedTargets([event])
+        createRealtimeAffectedTargets([event]),
+        "notify"
       );
       await this.cleanupRealtimeOutbox();
       return jsonResponse({ ...result, ok: true });
@@ -1026,19 +1134,32 @@ export class RealtimeSubscriptionDO {
       const events = await fetchRealtimeOutboxEvents(
         this.database,
         afterSequence,
-        typeof body.limit === "number" ? body.limit : 100
+        typeof body.limit === "number"
+          ? body.limit
+          : REALTIME_CATCH_UP_EVENT_LIMIT
       );
       if (events.length === 0) {
         await this.cleanupRealtimeOutbox();
-        return jsonResponse({ evaluated: 0, events, failed: 0, ok: true });
+        return jsonResponse({
+          evaluated: 0,
+          events: createRealtimeOutboxResponseEvents(events),
+          failed: 0,
+          ok: true,
+        });
       }
 
       this.advanceLastSeenSequence(events.at(-1)?.sequence);
+      emitOutboxLagMetric("catch_up", events);
       const result = await this.reEvaluateActiveRegistrations(
-        createRealtimeAffectedTargets(events)
+        createRealtimeAffectedTargets(events),
+        "catch_up"
       );
       await this.cleanupRealtimeOutbox();
-      return jsonResponse({ ...result, events, ok: true });
+      return jsonResponse({
+        ...result,
+        events: createRealtimeOutboxResponseEvents(events),
+        ok: true,
+      });
     }
 
     if (url.pathname === "/registrations") {
@@ -1086,17 +1207,21 @@ export class RealtimeSubscriptionDO {
   }
 
   private async reEvaluateActiveRegistrations(
-    targets: RealtimeAffectedTargets
+    targets: RealtimeAffectedTargets,
+    source: RealtimeMetricSource
   ): Promise<{
     readonly evaluated: number;
     readonly failed: number;
   }> {
     let evaluated = 0;
     let failed = 0;
+    let skipped = 0;
     const pendingDeliveries: PendingRealtimeDelivery[] = [];
-    const registrations = this.getStoredRegistrations().filter((registration) =>
+    const storedRegistrations = this.getStoredRegistrations();
+    const registrations = storedRegistrations.filter((registration) =>
       isRealtimeEventRelevant(registration, targets)
     );
+    skipped += storedRegistrations.length - registrations.length;
     let nextRegistrationIndex = 0;
     const evaluateNextRegistration = async (): Promise<void> => {
       while (nextRegistrationIndex < registrations.length) {
@@ -1111,6 +1236,7 @@ export class RealtimeSubscriptionDO {
           registration.subscriptionId
         );
         if (this.reEvaluatingRegistrations.has(registrationKey)) {
+          skipped += 1;
           continue;
         }
 
@@ -1153,6 +1279,18 @@ export class RealtimeSubscriptionDO {
     const deliveryResult = await this.flushPendingDeliveries(pendingDeliveries);
     evaluated += deliveryResult.evaluated;
     failed += deliveryResult.failed;
+    emitRealtimeMetric(REALTIME_RE_EVALUATIONS_METRIC, evaluated, {
+      result: "evaluated",
+      source,
+    });
+    emitRealtimeMetric(REALTIME_RE_EVALUATIONS_METRIC, failed, {
+      result: "failed",
+      source,
+    });
+    emitRealtimeMetric(REALTIME_RE_EVALUATIONS_METRIC, skipped, {
+      result: "skipped",
+      source,
+    });
 
     return { evaluated, failed };
   }
@@ -1166,9 +1304,14 @@ export class RealtimeSubscriptionDO {
     let evaluated = 0;
     let failed = 0;
     for (const group of this.createPendingDeliveryGroups(pendingDeliveries)) {
-      const result = await this.flushPendingDeliveryGroup(group);
-      evaluated += result.evaluated;
-      failed += result.failed;
+      for (const deliveries of chunkRealtimeDeliveries(group.deliveries)) {
+        const result = await this.flushPendingDeliveryGroup({
+          ...group,
+          deliveries,
+        });
+        evaluated += result.evaluated;
+        failed += result.failed;
+      }
     }
 
     return { evaluated, failed };
@@ -1205,6 +1348,8 @@ export class RealtimeSubscriptionDO {
       const result = await this.deliverPendingGroup(group);
       const deliveredSubscriptions = new Set(result.deliveredSubscriptions);
       const leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
+      const deliveredAll =
+        deliveredSubscriptions.size === group.deliveries.length;
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
           this.deleteExpiredRegistration(delivery.registration);
@@ -1215,12 +1360,18 @@ export class RealtimeSubscriptionDO {
         delivery.registration.lastResultJson = delivery.resultJson;
         delivery.registration.leaseExpiresAt = leaseExpiresAt;
       }
+      emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
+        result: deliveredAll ? "delivered" : "undelivered",
+      });
       return { evaluated: group.deliveries.length, failed: 0 };
     } catch (error) {
       for (const delivery of group.deliveries) {
         this.deleteExpiredRegistration(delivery.registration);
         this.logReEvaluationFailure(delivery.registration, error);
       }
+      emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
+        result: "undelivered",
+      });
       return { evaluated: 0, failed: group.deliveries.length };
     } finally {
       for (const delivery of group.deliveries) {

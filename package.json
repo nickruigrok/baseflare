@@ -13,6 +13,7 @@
     "lint": "ultracite check .",
     "format": "ultracite fix .",
     "test": "turbo run test",
+    "test:perf": "pnpm --filter baseflare test:perf",
     "clean": "turbo run clean && rimraf .turbo coverage",
     "changeset": "changeset",
     "version-packages": "changeset version",
