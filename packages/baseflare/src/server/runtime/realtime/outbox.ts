@@ -30,6 +30,20 @@ import {
   REALTIME_OUTBOX_CLEANUP_LIMIT,
 } from "./types";
 
+interface RealtimeOutboxRow {
+  readonly created_at: number;
+  readonly event_id: string;
+  readonly partitions: string;
+  readonly sequence: number;
+  readonly tables: string;
+}
+
+export interface RealtimeOutboxFetchResult {
+  readonly events: RealtimeSequencedOutboxEvent[];
+  readonly hasMalformedEvents: boolean;
+  readonly latestReadSequence: number | null;
+}
+
 export function createRealtimeOutboxResponseEvents(
   events: readonly RealtimeSequencedOutboxEvent[]
 ): Array<RealtimeOutboxEvent & { readonly sequence: number }> {
@@ -179,15 +193,7 @@ export async function fetchRealtimeOutboxEvents(
   database: Pick<RuntimeDatabase, "prepare">,
   afterSequence: number | null,
   limit: number
-): Promise<
-  Array<{
-    readonly createdAt: number;
-    readonly eventId: string;
-    readonly partitions: readonly RealtimePartitionTarget[];
-    readonly sequence: number;
-    readonly tables: readonly string[];
-  }>
-> {
+): Promise<RealtimeOutboxFetchResult> {
   const boundedLimit = Math.min(
     Math.max(limit, 1),
     REALTIME_CATCH_UP_EVENT_LIMIT
@@ -198,21 +204,26 @@ export async function fetchRealtimeOutboxEvents(
       : `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE sequence > ? ORDER BY sequence ASC LIMIT ?`;
   const params =
     afterSequence === null ? [boundedLimit] : [afterSequence, boundedLimit];
-  const result = await bindStatement(database, sql, params).all<{
-    created_at: number;
-    event_id: string;
-    partitions: string;
-    sequence: number;
-    tables: string;
-  }>();
+  const result = await bindStatement(
+    database,
+    sql,
+    params
+  ).all<RealtimeOutboxRow>();
+  const events: RealtimeSequencedOutboxEvent[] = [];
+  let hasMalformedEvents = false;
+  let latestReadSequence: number | null = null;
+  for (const row of result.results ?? []) {
+    latestReadSequence = Math.max(latestReadSequence ?? 0, row.sequence);
+    const event = parseRealtimeOutboxRow(row);
+    if (!event) {
+      hasMalformedEvents = true;
+      continue;
+    }
 
-  return (result.results ?? []).map((row) => ({
-    createdAt: row.created_at,
-    eventId: row.event_id,
-    partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
-    sequence: row.sequence,
-    tables: JSON.parse(row.tables) as string[],
-  }));
+    events.push(event);
+  }
+
+  return { events, hasMalformedEvents, latestReadSequence };
 }
 
 export async function fetchRealtimeOutboxEventById(
@@ -229,24 +240,61 @@ export async function fetchRealtimeOutboxEventById(
     database,
     `SELECT sequence, event_id, created_at, tables, partitions FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
     [eventId]
-  ).first<{
-    created_at: number;
-    event_id: string;
-    partitions: string;
-    sequence: number;
-    tables: string;
-  }>();
+  ).first<RealtimeOutboxRow>();
   if (!row) {
     return null;
   }
 
-  return {
-    createdAt: row.created_at,
-    eventId: row.event_id,
-    partitions: JSON.parse(row.partitions) as RealtimePartitionTarget[],
-    sequence: row.sequence,
-    tables: JSON.parse(row.tables) as string[],
-  };
+  return parseRealtimeOutboxRow(row);
+}
+
+function parseRealtimeOutboxRow(
+  row: RealtimeOutboxRow
+): RealtimeSequencedOutboxEvent | null {
+  try {
+    const tables = JSON.parse(row.tables) as unknown;
+    const partitions = JSON.parse(row.partitions) as unknown;
+    const hasValidTables =
+      Array.isArray(tables) &&
+      tables.every((tableName): tableName is string => {
+        return typeof tableName === "string";
+      });
+    const hasValidPartitions =
+      Array.isArray(partitions) && partitions.every(isRealtimePartitionTarget);
+    if (!(hasValidTables && hasValidPartitions)) {
+      throw new Error("Malformed realtime outbox event");
+    }
+
+    return {
+      createdAt: row.created_at,
+      eventId: row.event_id,
+      partitions,
+      sequence: row.sequence,
+      tables,
+    };
+  } catch (error) {
+    logRuntimeEvent("error", "runtime.realtime_outbox_event_parse_failed", {
+      errorName: error instanceof Error ? error.name : typeof error,
+      eventId: row.event_id,
+      sequence: row.sequence,
+    });
+    return null;
+  }
+}
+
+function isRealtimePartitionTarget(
+  value: unknown
+): value is RealtimePartitionTarget {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const partition = value as Record<string, unknown>;
+  return (
+    typeof partition.tableName === "string" &&
+    typeof partition.partitionKey === "string" &&
+    typeof partition.partitionValue === "string"
+  );
 }
 
 export async function fetchOldestRealtimeOutboxSequence(

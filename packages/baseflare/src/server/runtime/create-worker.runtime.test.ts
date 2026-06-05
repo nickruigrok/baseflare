@@ -44,7 +44,10 @@ import {
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
 } from "./realtime/routing";
-import { evaluateRealtimeAutoscalingForTest } from "./realtime/shards";
+import {
+  evaluateRealtimeAutoscalingForTest,
+  fetchRealtimeVersionSnapshot,
+} from "./realtime/shards";
 import {
   configureRealtimeRuntime,
   resetRealtimeRuntimeStateForTest,
@@ -1323,6 +1326,36 @@ describe("worker runtime", () => {
     });
     expect(cursorTable?.sql).toContain("last_processed_outbox_sequence");
     expect(autoscaleState?.id).toBe(1);
+  });
+
+  it("batches realtime partition version snapshot reads", async () => {
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_partition_versions (table_name, partition_key, partition_value, version) VALUES (?, ?, ?, ?)"
+    )
+      .bind("todos", "by_owner", JSON.stringify(["owner-a"]), 7)
+      .run();
+    const preparedSql: string[] = [];
+    const database: Pick<D1Database, "prepare"> = {
+      prepare(sql) {
+        preparedSql.push(sql);
+        return env.APP_DB.prepare(sql);
+      },
+    };
+
+    const snapshot = await fetchRealtimeVersionSnapshot(database, {
+      partitions: new Set([
+        todoOwnerPartitionId("owner-a"),
+        todoOwnerPartitionId("owner-b"),
+      ]),
+      tables: new Set(["labels"]),
+    });
+
+    expect(snapshot.tables.get("labels")).toBe(0);
+    expect(snapshot.partitions.get(todoOwnerPartitionId("owner-a"))).toBe(7);
+    expect(snapshot.partitions.get(todoOwnerPartitionId("owner-b"))).toBe(0);
+    expect(
+      preparedSql.filter((sql) => sql.includes("_bf_partition_versions"))
+    ).toHaveLength(1);
   });
 
   it("scales realtime subscription generations geometrically", async () => {
@@ -5555,6 +5588,136 @@ describe("worker runtime", () => {
     expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
     expect(deliveries).toHaveLength(0);
     expect(registrationsBody.lastProcessedOutboxSequence).toBeNull();
+  });
+
+  it("logs and skips malformed realtime outbox rows during notify", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+    )
+      .bind("malformed-notify", Date.now(), "not-json", JSON.stringify([]))
+      .run();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "malformed-notify" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "SyntaxError",
+        event: "runtime.realtime_outbox_event_parse_failed",
+        eventId: "malformed-notify",
+      })
+    );
+  });
+
+  it("fully recovers and advances realtime cursors after malformed catch-up rows", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "malformed-catch-up-recovered");
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
+    )
+      .bind("malformed-catch-up", Date.now(), JSON.stringify(["todos"]), "{")
+      .run();
+    const malformedSequence =
+      await getRealtimeOutboxSequence("malformed-catch-up");
+    const deliveries: unknown[] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          deliveries.push(await request.json());
+          return Response.json({
+            delivered: 1,
+            deliveredSubscriptions: ["sub-malformed-catch-up"],
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-malformed-catch-up",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      recoveredByFullReevaluation: boolean;
+    };
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      lastProcessedOutboxSequence: number | null;
+    };
+
+    expect(body).toEqual(
+      expect.objectContaining({
+        evaluated: 1,
+        failed: 0,
+        recoveredByFullReevaluation: true,
+      })
+    );
+    expect(getFirstRealtimeDelivery(deliveries[0]).sequence).toBe(
+      malformedSequence
+    );
+    expect(registrationsBody.lastProcessedOutboxSequence).toBe(
+      malformedSequence
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "SyntaxError",
+        event: "runtime.realtime_outbox_event_parse_failed",
+        eventId: "malformed-catch-up",
+      })
+    );
   });
 
   it("keeps realtime notify cursors monotonic for out-of-order events", async () => {

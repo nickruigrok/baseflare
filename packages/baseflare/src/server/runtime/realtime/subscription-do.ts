@@ -265,13 +265,30 @@ export class RealtimeSubscriptionDO {
       });
     }
 
-    const events = await fetchRealtimeOutboxEvents(
+    const catchUp = await fetchRealtimeOutboxEvents(
       this.database,
       afterSequence,
       typeof body.limit === "number"
         ? body.limit
         : REALTIME_CATCH_UP_EVENT_LIMIT
     );
+    if (catchUp.hasMalformedEvents) {
+      const result = await this.reEvaluateActiveRegistrations(
+        createFullRealtimeAffectedTargets(catchUp.latestReadSequence),
+        "catch_up"
+      );
+      await this.advanceLastProcessedOutboxSequence(catchUp.latestReadSequence);
+      await this.cleanupRealtimeOutbox();
+      await this.maybeEvaluateAutoscaling();
+      return jsonResponse({
+        ...result,
+        events: createRealtimeOutboxResponseEvents(catchUp.events),
+        ok: true,
+        recoveredByFullReevaluation: true,
+      });
+    }
+
+    const { events } = catchUp;
     if (events.length === 0) {
       await this.advanceLastProcessedOutboxSequence(afterSequence);
       await this.cleanupRealtimeOutbox();

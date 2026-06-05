@@ -145,20 +145,50 @@ export async function fetchRealtimeVersionSnapshot(
     }
   }
 
+  const partitionRequests: Array<{
+    readonly partitionId: string;
+    readonly partitionKey: string;
+    readonly partitionValue: string;
+    readonly tableName: string;
+  }> = [];
   for (const partitionId of dependencies.partitions) {
     const partition = parseRealtimePartitionId(partitionId);
     if (!partition) {
       continue;
     }
 
-    const row = await bindStatement(
+    partitionRequests.push({
+      partitionId,
+      partitionKey: partition.partitionKey,
+      partitionValue: partition.partitionValue,
+      tableName: partition.tableName,
+    });
+  }
+
+  if (partitionRequests.length > 0) {
+    const placeholders = partitionRequests.map(() => "(?, ?, ?, ?)").join(", ");
+    const params = partitionRequests.flatMap((partition) => [
+      partition.partitionId,
+      partition.tableName,
+      partition.partitionKey,
+      partition.partitionValue,
+    ]);
+    const result = await bindStatement(
       database,
-      `SELECT version FROM ${PARTITION_VERSION_TABLE_NAME}
-       WHERE table_name = ? AND partition_key = ? AND partition_value = ?
-       LIMIT 1`,
-      [partition.tableName, partition.partitionKey, partition.partitionValue]
-    ).first<{ version: number }>();
-    partitions.set(partitionId, row?.version ?? 0);
+      `WITH requested(partition_id, table_name, partition_key, partition_value) AS (
+         VALUES ${placeholders}
+       )
+       SELECT requested.partition_id, COALESCE(${PARTITION_VERSION_TABLE_NAME}.version, 0) AS version
+       FROM requested
+       LEFT JOIN ${PARTITION_VERSION_TABLE_NAME}
+         ON ${PARTITION_VERSION_TABLE_NAME}.table_name = requested.table_name
+        AND ${PARTITION_VERSION_TABLE_NAME}.partition_key = requested.partition_key
+        AND ${PARTITION_VERSION_TABLE_NAME}.partition_value = requested.partition_value`,
+      params
+    ).all<{ partition_id: string; version: number }>();
+    for (const row of result.results ?? []) {
+      partitions.set(row.partition_id, row.version);
+    }
   }
 
   return { partitions, tables };
