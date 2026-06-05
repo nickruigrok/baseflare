@@ -228,10 +228,15 @@ export class RealtimeConnectionDO {
     options: {
       readonly scheduleReconciliation?: boolean;
       readonly sendAcknowledgement?: boolean;
+      readonly subscriptionGeneration?: RealtimeShardGeneration;
     } = {}
   ): Promise<void> {
     const registration = this.createRegistration(message, socket);
-    const subscriptionTarget = await this.subscriptionTarget();
+    const subscriptionTarget = await this.subscriptionTarget(
+      undefined,
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      options.subscriptionGeneration
+    );
     const response = await subscriptionTarget.stub.fetch(
       "https://baseflare.internal/register",
       {
@@ -314,10 +319,13 @@ export class RealtimeConnectionDO {
         { result: "rejected" }
       );
       throw new ValidationRuntimeError(
-        `Realtime restore can include at most ${REALTIME_MAX_RESTORE_SUBSCRIPTIONS} subscriptions`
+        `Realtime restore can include at most ${REALTIME_MAX_RESTORE_SUBSCRIPTIONS} subscriptions to bound D1 concurrency and connection memory`
       );
     }
 
+    const subscriptionGeneration = await fetchActiveRealtimeShardGeneration(
+      this.env.APP_DB
+    );
     const results = await Promise.allSettled(
       subscriptions.map(async (subscription, index) => {
         const subscriptionMessage = parseObject(
@@ -327,6 +335,7 @@ export class RealtimeConnectionDO {
         await this.registerSubscription(subscriptionMessage, socket, {
           scheduleReconciliation: false,
           sendAcknowledgement: false,
+          subscriptionGeneration,
         });
         return {
           index,
@@ -426,23 +435,19 @@ export class RealtimeConnectionDO {
     socket?: RuntimeWebSocket
   ): RealtimeRegistration {
     const subscriptionId = getStringField(message, "subscriptionId");
+    const attachment = socket ? this.getSocketAttachment(socket) : undefined;
+    const connectionKey = attachment?.connectionKey ?? "default";
     return {
       args: message.args ?? {},
-      authorizationHeader: socket
-        ? this.getSocketAttachment(socket)?.authorizationHeader
-        : undefined,
-      connectionKey: socket
-        ? (this.getSocketAttachment(socket)?.connectionKey ?? "default")
-        : "default",
-      connectionName: socket
-        ? (this.getSocketAttachment(socket)?.connectionName ?? "connection:0")
-        : "connection:0",
+      authorizationHeader: attachment?.authorizationHeader,
+      connectionKey,
+      connectionName:
+        attachment?.connectionName ??
+        getRealtimeConnectionShardName(connectionKey),
       epoch: getEpoch(message.epoch),
       leaseExpiresAt: Date.now() + REALTIME_LEASE_MS,
       queryName: getStringField(message, "queryName"),
-      runtimeId: socket
-        ? (this.getSocketAttachment(socket)?.runtimeId ?? "")
-        : "",
+      runtimeId: attachment?.runtimeId ?? "",
       subscriptionId,
     };
   }
@@ -928,15 +933,16 @@ export class RealtimeConnectionDO {
 
   private async subscriptionTarget(
     shardName?: string,
-    route: RealtimeSubscriptionRouteTarget = createRealtimeGlobalSubscriptionRouteTarget()
+    route: RealtimeSubscriptionRouteTarget = createRealtimeGlobalSubscriptionRouteTarget(),
+    generationOverride?: RealtimeShardGeneration
   ): Promise<{
     readonly generation: RealtimeShardGeneration;
     readonly shardName: string;
     readonly stub: DurableObjectStub;
   }> {
-    const generation = await fetchActiveRealtimeShardGeneration(
-      this.env.APP_DB
-    );
+    const generation =
+      generationOverride ??
+      (await fetchActiveRealtimeShardGeneration(this.env.APP_DB));
     const resolvedShardName =
       shardName ?? getRealtimeSubscriptionShardName(route, generation);
     return {
@@ -950,7 +956,6 @@ export class RealtimeConnectionDO {
 
   private async subscriptionCatchUpTargets(socket?: RuntimeWebSocket): Promise<
     Array<{
-      readonly generation: RealtimeShardGeneration;
       readonly shardName: string;
       readonly stub: DurableObjectStub;
     }>
@@ -975,11 +980,7 @@ export class RealtimeConnectionDO {
       return [target];
     }
 
-    const generation = await fetchActiveRealtimeShardGeneration(
-      this.env.APP_DB
-    );
     return [...shardNames].map((shardName) => ({
-      generation,
       shardName,
       stub: this.env.REALTIME_SUBSCRIPTIONS.get(
         this.env.REALTIME_SUBSCRIPTIONS.idFromName(shardName)

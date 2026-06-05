@@ -829,7 +829,8 @@ Two internal Durable Object roles split the work:
 
 - `RealtimeConnectionDO` holds WebSockets, hibernated socket attachments,
   client/session delivery state, reconnect restore state, live reconciliation
-  alarms, and delivery to clients. Connection DOs shard by client/session key.
+  alarms, and delivery to clients. Connection DOs use a fixed internal shard
+  count by client/session key.
 - `RealtimeSubscriptionDO` owns subscription registration, dependency indexes,
   version-first reconciliation, query re-evaluation, outbox catch-up, and
   fanout planning.
@@ -851,11 +852,11 @@ registrations until leases expire and outbox catch-up closes the gap. Live
 WebSockets are not moved between connection DOs; reconnect, hibernation restore,
 and lease drain make generation changes safe.
 
-Managed autoscaling is conservative and internal. Baseflare observes realtime
-pressure, scales subscription shards geometrically (`1 -> 2 -> 4 -> 8 -> 16 ->
-32`), caps v1 at 32 shards, scales up only after sustained pressure, and scales
-down only after sustained low load and safe drain. It never increments by `+1`
-and never downscales below one shard.
+Managed autoscaling is conservative and internal for subscription DOs.
+Baseflare observes realtime pressure, scales subscription shards geometrically
+(`1 -> 2 -> 4 -> 8 -> 16 -> 32`), caps v1 at 32 shards, scales up only after
+sustained pressure, and scales down only after sustained low load and safe
+drain. It never increments by `+1` and never downscales below one shard.
 
 **Subscription tracking:**
 

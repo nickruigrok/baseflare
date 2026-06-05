@@ -14,6 +14,7 @@ import {
   fetchLatestRealtimeOutboxSequence,
   fetchOldestRealtimeOutboxSequence,
   fetchRealtimeOutboxEventById,
+  fetchRealtimeOutboxEventRowExists,
   fetchRealtimeOutboxEvents,
 } from "./outbox";
 import {
@@ -62,6 +63,7 @@ import type {
   RealtimePartitionTarget,
   RealtimePressureSnapshot,
   RealtimeRegistration,
+  RealtimeSequencedOutboxEvent,
   RealtimeVersionSnapshot,
   StoredRealtimeRegistration,
 } from "./types";
@@ -72,6 +74,8 @@ import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
   REALTIME_DELIVERY_BATCHES_METRIC,
   REALTIME_LEASE_MS,
+  REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS,
+  REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS,
   REALTIME_OUTBOX_CLEANUP_INTERVAL_MS,
   REALTIME_OUTBOX_CLEANUP_LIMIT,
   REALTIME_OUTBOX_RETENTION_MS,
@@ -218,11 +222,27 @@ export class RealtimeSubscriptionDO {
     }
 
     try {
-      const event = await fetchRealtimeOutboxEventById(this.database, eventId);
-      if (!event) {
+      const eventLookup = await this.fetchNotifyOutboxEvent(eventId);
+      if (eventLookup.status === "malformed") {
         return jsonResponse({ evaluated: 0, failed: 0, ok: true });
       }
 
+      if (eventLookup.status !== "found") {
+        logRuntimeEvent(
+          "error",
+          "runtime.realtime_notify_outbox_event_missing",
+          {
+            eventId,
+            shardName: this.shardName,
+          }
+        );
+        return jsonResponse(
+          { evaluated: 0, failed: 0, ok: false },
+          { status: 503 }
+        );
+      }
+
+      const { event } = eventLookup;
       await this.advanceLastProcessedOutboxSequence(event.sequence);
       this.lastOutboxLagMs = emitOutboxLagMetric("notify", [event]);
       const result = await this.reEvaluateActiveRegistrations(
@@ -235,6 +255,35 @@ export class RealtimeSubscriptionDO {
     } finally {
       this.pendingNotifyEventIds.delete(eventId);
     }
+  }
+
+  private async fetchNotifyOutboxEvent(eventId: string): Promise<
+    | {
+        readonly event: RealtimeSequencedOutboxEvent;
+        readonly status: "found";
+      }
+    | { readonly status: "malformed" | "missing" }
+  > {
+    for (
+      let attempt = 1;
+      attempt <= REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS;
+      attempt += 1
+    ) {
+      const event = await fetchRealtimeOutboxEventById(this.database, eventId);
+      if (event) {
+        return { event, status: "found" };
+      }
+
+      if (await fetchRealtimeOutboxEventRowExists(this.database, eventId)) {
+        return { status: "malformed" };
+      }
+
+      if (attempt < REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS) {
+        await waitForRealtimeNotifyEventLookupRetry();
+      }
+    }
+
+    return { status: "missing" };
   }
 
   private async handleCatchUp(request: Request): Promise<Response> {
@@ -1211,4 +1260,10 @@ export class RealtimeSubscriptionDO {
       index.delete(indexKey);
     }
   }
+}
+
+function waitForRealtimeNotifyEventLookupRetry(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS);
+  });
 }

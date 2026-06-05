@@ -14,6 +14,7 @@ import type {
 import {
   DEFAULT_REALTIME_SHARD_COUNT,
   DEFAULT_REALTIME_SHARD_GENERATION,
+  REALTIME_CONNECTION_SHARD_COUNT,
 } from "./types";
 
 const UINT32_MODULUS = 4_294_967_296;
@@ -284,7 +285,7 @@ export function getRealtimeShardGenerationIdFromName(
 
 export function getRealtimeConnectionShardName(
   key: string,
-  shardCount = DEFAULT_REALTIME_SHARD_COUNT
+  shardCount = REALTIME_CONNECTION_SHARD_COUNT
 ): string {
   return getRealtimeShardName("connection", key, shardCount);
 }

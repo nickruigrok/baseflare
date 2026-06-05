@@ -248,6 +248,18 @@ export async function fetchRealtimeOutboxEventById(
   return parseRealtimeOutboxRow(row);
 }
 
+export async function fetchRealtimeOutboxEventRowExists(
+  database: Pick<RuntimeDatabase, "prepare">,
+  eventId: string
+): Promise<boolean> {
+  const row = await bindStatement(
+    database,
+    `SELECT 1 AS exists_flag FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
+    [eventId]
+  ).first<{ exists_flag: number }>();
+  return row != null;
+}
+
 function parseRealtimeOutboxRow(
   row: RealtimeOutboxRow
 ): RealtimeSequencedOutboxEvent | null {

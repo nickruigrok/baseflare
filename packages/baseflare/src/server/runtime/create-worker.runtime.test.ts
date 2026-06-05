@@ -55,6 +55,7 @@ import {
 import { RealtimeSubscriptionDO } from "./realtime/subscription-do";
 import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
+  REALTIME_CONNECTION_SHARD_COUNT,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   REALTIME_MAX_SUBSCRIPTION_SHARDS,
@@ -1768,16 +1769,21 @@ describe("worker runtime", () => {
     ]);
   });
 
-  it("keeps future realtime connection shard routing deterministic and bounded", () => {
-    const shardCount = 32;
-    const first = getRealtimeConnectionShardName("client-a", shardCount);
-    const second = getRealtimeConnectionShardName("client-a", shardCount);
+  it("keeps realtime connection shard routing deterministic and bounded", () => {
+    const first = getRealtimeConnectionShardName("client-a");
+    const second = getRealtimeConnectionShardName("client-a");
     const shardNumber = Number(first.split(":").at(1));
+    const seenShardNames = new Set(
+      Array.from({ length: 5000 }, (_value, index) =>
+        getRealtimeConnectionShardName(`client-${index}`)
+      )
+    );
 
     expect(first).toBe(second);
     expect(first).toMatch(/^connection:\d+$/);
     expect(shardNumber).toBeGreaterThanOrEqual(0);
-    expect(shardNumber).toBeLessThan(shardCount);
+    expect(shardNumber).toBeLessThan(REALTIME_CONNECTION_SHARD_COUNT);
+    expect(seenShardNames.size).toBe(REALTIME_CONNECTION_SHARD_COUNT);
   });
 
   it("keeps N=1 realtime subscription routes on the default generation shard", () => {
@@ -3149,6 +3155,14 @@ describe("worker runtime", () => {
 
   it("restores the maximum allowed realtime subscription count", async () => {
     const registerRequests: unknown[] = [];
+    let generationLookupCount = 0;
+    const database = Object.create(env.APP_DB) as D1Database;
+    database.prepare = (sql: string) => {
+      if (sql.includes("_bf_realtime_shard_generations")) {
+        generationLookupCount += 1;
+      }
+      return env.APP_DB.prepare(sql);
+    };
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
         if (new URL(request.url).pathname === "/catch-up") {
@@ -3165,7 +3179,7 @@ describe("worker runtime", () => {
       }
     );
     const connectionDo = new RealtimeConnectionDO(null, {
-      APP_DB: env.APP_DB,
+      APP_DB: database,
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
       REALTIME_SUBSCRIPTIONS: subscriptionDo,
     });
@@ -3205,6 +3219,7 @@ describe("worker runtime", () => {
     }
 
     expect(registerRequests).toHaveLength(REALTIME_MAX_RESTORE_SUBSCRIPTIONS);
+    expect(generationLookupCount).toBe(1);
     expect(messages.at(-1)).toMatchObject({ type: "restored" });
   });
 
@@ -3256,7 +3271,7 @@ describe("worker runtime", () => {
     expect(subscriptionDo.requests).toHaveLength(0);
     expect(messages).toEqual([
       {
-        error: `Realtime restore can include at most ${REALTIME_MAX_RESTORE_SUBSCRIPTIONS} subscriptions`,
+        error: `Realtime restore can include at most ${REALTIME_MAX_RESTORE_SUBSCRIPTIONS} subscriptions to bound D1 concurrency and connection memory`,
         type: "error",
       },
     ]);
@@ -5532,7 +5547,10 @@ describe("worker runtime", () => {
     expect(body.lastProcessedOutboxSequence).toBe(row?.sequence);
   });
 
-  it("skips realtime re-evaluation when notify references an unknown event", async () => {
+  it("logs and fails realtime notify when the outbox row is missing", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -5585,9 +5603,17 @@ describe("worker runtime", () => {
       lastProcessedOutboxSequence: number | null;
     };
 
-    expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(response.status).toBe(503);
+    expect(body).toEqual({ evaluated: 0, failed: 0, ok: false });
     expect(deliveries).toHaveLength(0);
     expect(registrationsBody.lastProcessedOutboxSequence).toBeNull();
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_notify_outbox_event_missing",
+        eventId: "missing-event",
+      })
+    );
   });
 
   it("logs and skips malformed realtime outbox rows during notify", async () => {
