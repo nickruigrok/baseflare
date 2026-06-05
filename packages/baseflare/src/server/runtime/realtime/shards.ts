@@ -236,11 +236,18 @@ export async function evaluateRealtimeAutoscaling(
         activeGeneration.subscriptionShardCount * 2,
         REALTIME_MAX_SUBSCRIPTION_SHARDS
       );
-      await createRealtimeShardGeneration(database, activeGeneration, {
-        now,
-        result: "scaled_up",
-        shardCount: nextShardCount,
-      });
+      const scaled = await createRealtimeShardGeneration(
+        database,
+        activeGeneration,
+        {
+          now,
+          result: "scaled_up",
+          shardCount: nextShardCount,
+        }
+      );
+      if (!scaled) {
+        return null;
+      }
       return "scaled_up";
     }
 
@@ -259,11 +266,18 @@ export async function evaluateRealtimeAutoscaling(
         Math.floor(activeGeneration.subscriptionShardCount / 2),
         1
       );
-      await createRealtimeShardGeneration(database, activeGeneration, {
-        now,
-        result: "scaled_down",
-        shardCount: nextShardCount,
-      });
+      const scaled = await createRealtimeShardGeneration(
+        database,
+        activeGeneration,
+        {
+          now,
+          result: "scaled_down",
+          shardCount: nextShardCount,
+        }
+      );
+      if (!scaled) {
+        return null;
+      }
       return "scaled_down";
     }
 
@@ -367,19 +381,27 @@ async function createRealtimeShardGeneration(
     readonly result: "scaled_down" | "scaled_up";
     readonly shardCount: number;
   }
-): Promise<void> {
+): Promise<boolean> {
   const nextGenerationId = activeGeneration.generationId + 1;
   const statements = [
     bindStatement(
       database,
       `UPDATE ${REALTIME_SHARD_GENERATIONS_TABLE_NAME}
        SET status = 'draining', drain_after = ?
-       WHERE generation_id = ? AND status = 'active'`,
-      [input.now + REALTIME_LEASE_MS, activeGeneration.generationId]
+       WHERE generation_id = ? AND status = 'active'
+         AND NOT EXISTS (
+           SELECT 1 FROM ${REALTIME_SHARD_GENERATIONS_TABLE_NAME}
+           WHERE generation_id = ?
+         )`,
+      [
+        input.now + REALTIME_LEASE_MS,
+        activeGeneration.generationId,
+        nextGenerationId,
+      ]
     ),
     bindStatement(
       database,
-      `INSERT INTO ${REALTIME_SHARD_GENERATIONS_TABLE_NAME}
+      `INSERT OR IGNORE INTO ${REALTIME_SHARD_GENERATIONS_TABLE_NAME}
          (generation_id, subscription_shard_count, status, created_at, drain_after)
        VALUES (?, ?, 'active', ?, NULL)`,
       [nextGenerationId, input.shardCount, input.now]
@@ -393,10 +415,16 @@ async function createRealtimeShardGeneration(
     ),
   ];
 
-  await database.batch(statements);
+  const results = await database.batch(statements);
+  const inserted = (results[1]?.meta?.changes ?? 0) > 0;
+  if (!inserted) {
+    return false;
+  }
+
   emitRealtimeMetric(REALTIME_AUTOSCALING_METRIC, input.shardCount, {
     result: input.result,
   });
+  return true;
 }
 
 async function updateRealtimeAutoscaleState(

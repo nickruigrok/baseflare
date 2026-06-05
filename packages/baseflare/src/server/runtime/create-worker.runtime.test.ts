@@ -43,6 +43,7 @@ import {
   getRealtimeAffectedSubscriptionRouteTargets,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
+  isZeroRealtimeVersionSnapshot,
 } from "./realtime/routing";
 import {
   evaluateRealtimeAutoscalingForTest,
@@ -1378,6 +1379,27 @@ describe("worker runtime", () => {
     ).toHaveLength(1);
   });
 
+  it("classifies empty realtime version snapshots as unknown, not zero", () => {
+    expect(
+      isZeroRealtimeVersionSnapshot({
+        partitions: new Map(),
+        tables: new Map(),
+      })
+    ).toBe(false);
+    expect(
+      isZeroRealtimeVersionSnapshot({
+        partitions: new Map([[todoOwnerPartitionId("owner-a"), 0]]),
+        tables: new Map(),
+      })
+    ).toBe(true);
+    expect(
+      isZeroRealtimeVersionSnapshot({
+        partitions: new Map(),
+        tables: new Map([["todos", 1]]),
+      })
+    ).toBe(false);
+  });
+
   it("scales realtime subscription generations geometrically", async () => {
     const startedAt = 1_000_000;
     await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
@@ -1448,7 +1470,8 @@ describe("worker runtime", () => {
     ).run();
   });
 
-  it("keeps the active realtime shard generation when scale transition fails", async () => {
+  it("treats concurrent realtime scale transitions as benign races", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const startedAt = 1_500_000;
     await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
       activeRegistrationCount: 1000,
@@ -1458,12 +1481,10 @@ describe("worker runtime", () => {
       "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 1, 'retired', 0, NULL)"
     ).run();
 
-    await expect(
-      evaluateRealtimeAutoscalingForTest(env.APP_DB, {
-        activeRegistrationCount: 1000,
-        now: startedAt + 10 * 60 * 1000,
-      })
-    ).rejects.toThrow();
+    const result = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: startedAt + 10 * 60 * 1000,
+    });
 
     const activeGeneration = await env.APP_DB.prepare(
       "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
@@ -1478,6 +1499,14 @@ describe("worker runtime", () => {
       status: "active",
       subscription_shard_count: 1,
     });
+    expect(result).toBeNull();
+    expect(
+      info.mock.calls.some(
+        ([, payload]) =>
+          (payload as { metric?: string })?.metric ===
+          "baseflare.runtime.realtime.autoscaling"
+      )
+    ).toBe(false);
   });
 
   it("never scales realtime subscription shards beyond the cap", async () => {

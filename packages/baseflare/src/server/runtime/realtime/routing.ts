@@ -237,6 +237,10 @@ export function getRealtimeRegistrationHomeRouteTarget(
 export function isZeroRealtimeVersionSnapshot(
   snapshot: RealtimeVersionSnapshot
 ): boolean {
+  if (snapshot.tables.size === 0 && snapshot.partitions.size === 0) {
+    return false;
+  }
+
   for (const version of snapshot.tables.values()) {
     if (version > 0) {
       return false;
