@@ -922,6 +922,11 @@ export class RealtimeConnectionDO {
       return;
     }
 
+    const pendingAlarm = await this.state.storage?.getAlarm?.();
+    if (pendingAlarm != null) {
+      return;
+    }
+
     await this.state.storage?.setAlarm?.(
       Date.now() + REALTIME_RECONCILIATION_INTERVAL_MS
     );

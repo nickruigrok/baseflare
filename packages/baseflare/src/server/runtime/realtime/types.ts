@@ -14,6 +14,7 @@ export interface RealtimeDurableObjectState {
   getWebSockets?(): RuntimeWebSocket[];
   storage?: {
     deleteAlarm?(): Promise<void>;
+    getAlarm?(): Promise<number | null>;
     setAlarm?(scheduledTime: number): Promise<void>;
   };
 }

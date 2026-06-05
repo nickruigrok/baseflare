@@ -141,6 +141,7 @@ class FakeRealtimeDurableObjectState {
       this.alarmTime = null;
       return Promise.resolve();
     },
+    getAlarm: () => Promise.resolve(this.alarmTime),
     setAlarm: (scheduledTime: number) => {
       this.alarmTime = scheduledTime;
       return Promise.resolve();
@@ -2918,6 +2919,75 @@ describe("worker runtime", () => {
         ],
       })
     );
+  });
+
+  it("preserves a pending realtime reconciliation alarm during subscription activity", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ ok: true }))
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as AttachedTestWebSocket;
+    client.accept?.();
+    const [socket] = state.acceptedSockets;
+    if (!socket) {
+      throw new Error("Expected accepted realtime socket");
+    }
+
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        type: "subscribe",
+      })
+    );
+    expect(state.alarmTime).toBeTypeOf("number");
+
+    const pendingAlarm = 1_234_567;
+    state.alarmTime = pendingAlarm;
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-b",
+        type: "subscribe",
+      })
+    );
+    expect(state.alarmTime).toBe(pendingAlarm);
+
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({ subscriptionId: "sub-b", type: "unsubscribe" })
+    );
+    expect(state.alarmTime).toBe(pendingAlarm);
+
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({ subscriptionId: "sub-a", type: "unsubscribe" })
+    );
+    expect(state.alarmTime).toBeNull();
   });
 
   it("restores hibernated realtime subscriptions and catches up from attachments", async () => {
