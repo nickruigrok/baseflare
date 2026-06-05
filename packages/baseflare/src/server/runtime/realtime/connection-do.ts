@@ -583,10 +583,15 @@ export class RealtimeConnectionDO {
       return { accepted: 0, rejected: 0 };
     }
 
+    const subscriptionGeneration = await fetchActiveRealtimeShardGeneration(
+      this.env.APP_DB
+    );
     const results = await Promise.allSettled(
       subscriptions.map(async ({ attachment, subscription }) => {
         const subscriptionTarget = await this.subscriptionTarget(
-          subscription.subscriptionShardName
+          subscription.subscriptionShardName,
+          createRealtimeGlobalSubscriptionRouteTarget(),
+          subscriptionGeneration
         );
         const response = await subscriptionTarget.stub.fetch(
           "https://baseflare.internal/register",

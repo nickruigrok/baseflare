@@ -78,6 +78,7 @@ import {
   REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS,
   REALTIME_OUTBOX_CLEANUP_INTERVAL_MS,
   REALTIME_OUTBOX_CLEANUP_LIMIT,
+  REALTIME_OUTBOX_CLEANUPS_METRIC,
   REALTIME_OUTBOX_RETENTION_MS,
   REALTIME_PENDING_WORK_LIMIT,
   REALTIME_RE_EVALUATIONS_METRIC,
@@ -697,7 +698,14 @@ export class RealtimeSubscriptionDO {
     this.deliveryBatchAttemptsSinceAutoscale += 1;
     try {
       const result = await this.deliverPendingGroup(group);
-      const deliveredSubscriptions = new Set(result.deliveredSubscriptions);
+      const groupSubscriptionIds = new Set(
+        group.deliveries.map((delivery) => delivery.registration.subscriptionId)
+      );
+      const deliveredSubscriptions = new Set(
+        result.deliveredSubscriptions.filter((subscriptionId) =>
+          groupSubscriptionIds.has(subscriptionId)
+        )
+      );
       const leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
       const deliveredAll =
         deliveredSubscriptions.size === group.deliveries.length;
@@ -719,7 +727,10 @@ export class RealtimeSubscriptionDO {
         result: deliveredAll ? "delivered" : "undelivered",
       });
       this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
-      return { evaluated: group.deliveries.length, failed: 0 };
+      return {
+        evaluated: deliveredSubscriptions.size,
+        failed: group.deliveries.length - deliveredSubscriptions.size,
+      };
     } catch (error) {
       this.deliveryBatchFailuresSinceAutoscale += 1;
       for (const delivery of group.deliveries) {
@@ -834,12 +845,16 @@ export class RealtimeSubscriptionDO {
       const protectedSequence = await fetchOldestRealtimeShardCursor(
         this.database
       );
-      await deleteRealtimeOutboxEventsBefore(
+      const deleted = await deleteRealtimeOutboxEventsBefore(
         this.database,
         now - REALTIME_OUTBOX_RETENTION_MS,
         REALTIME_OUTBOX_CLEANUP_LIMIT,
         protectedSequence
       );
+      emitRealtimeMetric(REALTIME_OUTBOX_CLEANUPS_METRIC, deleted, {
+        result:
+          deleted >= REALTIME_OUTBOX_CLEANUP_LIMIT ? "limited" : "cleaned",
+      });
     } catch (error) {
       logRuntimeEvent("error", "runtime.realtime_outbox_cleanup_failed", {
         errorName: error instanceof Error ? error.name : typeof error,

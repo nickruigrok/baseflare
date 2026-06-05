@@ -252,6 +252,9 @@ export const REALTIME_DELIVERY_BATCHES_METRIC =
 export const REALTIME_OUTBOX_LAG_METRIC =
   "baseflare.runtime.realtime.outbox_lag_ms";
 
+export const REALTIME_OUTBOX_CLEANUPS_METRIC =
+  "baseflare.runtime.realtime.outbox_cleanups";
+
 export const REALTIME_RE_EVALUATIONS_METRIC =
   "baseflare.runtime.realtime.re_evaluations";
 
@@ -272,10 +275,12 @@ export type RealtimeMetricSource = "catch_up" | "notify";
 
 export type RealtimeMetricResult =
   | "accepted"
+  | "cleaned"
   | "coalesced"
   | "delivered"
   | "evaluated"
   | "failed"
+  | "limited"
   | "reconciled"
   | "rejected"
   | "retired"

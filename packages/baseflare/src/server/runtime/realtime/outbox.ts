@@ -362,7 +362,7 @@ export async function deleteRealtimeOutboxEventsBefore(
   createdBefore: number,
   limit: number,
   protectedSequence: number | null = null
-): Promise<void> {
+): Promise<number> {
   const boundedLimit = Math.min(
     Math.max(limit, 1),
     REALTIME_OUTBOX_CLEANUP_LIMIT
@@ -372,7 +372,7 @@ export async function deleteRealtimeOutboxEventsBefore(
     protectedSequence == null
       ? [createdBefore, boundedLimit]
       : [createdBefore, protectedSequence, boundedLimit];
-  await bindStatement(
+  const result = await bindStatement(
     database,
     `DELETE FROM ${REALTIME_OUTBOX_TABLE_NAME}
      WHERE sequence IN (
@@ -384,4 +384,5 @@ export async function deleteRealtimeOutboxEventsBefore(
      )`,
     params
   ).run();
+  return result.meta?.changes ?? 0;
 }
