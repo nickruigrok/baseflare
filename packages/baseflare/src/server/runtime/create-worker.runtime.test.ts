@@ -2720,6 +2720,37 @@ describe("worker runtime", () => {
     expect(sentPayloads).toHaveLength(1);
   });
 
+  it("keeps realtime socket error reporting best-effort for closed sockets", () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const sentPayloads: string[] = [];
+    const throwingSocket = {
+      send() {
+        throw new Error("Socket closed");
+      },
+    } as unknown as WebSocket;
+    const activeSocket = {
+      send(payload: string) {
+        sentPayloads.push(payload);
+      },
+    } as unknown as WebSocket;
+    const internals = connectionDo as unknown as {
+      sendSocketError(socket: WebSocket, error: unknown): void;
+    };
+
+    expect(() =>
+      internals.sendSocketError(throwingSocket, new Error("bad message"))
+    ).not.toThrow();
+    internals.sendSocketError(activeSocket, new Error("bad message"));
+
+    expect(
+      sentPayloads.map((payload) => JSON.parse(payload) as unknown)
+    ).toEqual([{ error: "bad message", type: "error" }]);
+  });
+
   it("does not expose placeholder realtime reconcile behavior", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -6549,6 +6580,10 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
+        if (new URL(request.url).pathname === "/subscription-moved") {
+          return Response.json({ ok: true });
+        }
+
         const delivery = await request.json();
         const items = getRealtimeDeliveryItems(delivery);
         return Response.json({
@@ -6760,6 +6795,96 @@ describe("worker runtime", () => {
     expect(deliveries).toHaveLength(1);
   });
 
+  it("runs realtime delivered registration bookkeeping concurrently", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const adoptionGates: ReturnType<typeof createDeferred<void>>[] = [];
+    const subscriptions = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/adopt-registration") {
+          const gate = createDeferred<void>();
+          adoptionGates.push(gate);
+          await gate.promise;
+        }
+
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    const register = (subscriptionId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { mode: "partition-todos", ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "realtime:dependencyTracking",
+            runtimeId,
+            shardName: globalShardName,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await register("sub-a");
+    await register("sub-b");
+    await createTodoViaRpc("owner-a", "parallel-bookkeeping");
+    await createRealtimeOutboxEvent("parallel-bookkeeping-event", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    const responsePromise = subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "parallel-bookkeeping-event",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await waitFor(() => adoptionGates.length >= 2);
+    expect(adoptionGates).toHaveLength(2);
+    for (const gate of adoptionGates) {
+      gate.resolve(undefined);
+    }
+    const response = await responsePromise;
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 2, failed: 0, ok: true });
+  });
+
   it("deduplicates concurrent realtime re-evaluation for the same registration", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveryGate = createDeferred();
@@ -6936,10 +7061,19 @@ describe("worker runtime", () => {
   it("sends separate realtime delivery batches for different connection keys", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
+    const deliveryGates = new Map<
+      string,
+      ReturnType<typeof createDeferred<void>>
+    >();
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
         const delivery = await request.json();
         deliveries.push(delivery);
+        const connectionKey = (delivery as { connectionKey: string })
+          .connectionKey;
+        const gate = createDeferred<void>();
+        deliveryGates.set(connectionKey, gate);
+        await gate.promise;
         const items = getRealtimeDeliveryItems(delivery);
         return Response.json({
           delivered: items.length,
@@ -6976,13 +7110,19 @@ describe("worker runtime", () => {
     await createTodoViaRpc("owner-a", "separate-batches");
     await createRealtimeOutboxEvent("separate-batch-event");
 
-    const response = await subscriptionDo.fetch(
+    const responsePromise = subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {
         body: JSON.stringify({ eventId: "separate-batch-event" }),
         headers: { "content-type": "application/json" },
         method: "POST",
       })
     );
+    await waitFor(() => deliveries.length >= 2);
+    expect(deliveries).toHaveLength(2);
+    for (const gate of deliveryGates.values()) {
+      gate.resolve(undefined);
+    }
+    const response = await responsePromise;
     const body = (await response.json()) as {
       evaluated: number;
       failed: number;

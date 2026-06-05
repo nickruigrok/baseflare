@@ -651,17 +651,28 @@ export class RealtimeSubscriptionDO {
     readonly evaluated: number;
     readonly failed: number;
   }> {
+    const groupResults = await Promise.all(
+      this.createPendingDeliveryGroups(pendingDeliveries).map(async (group) => {
+        let evaluated = 0;
+        let failed = 0;
+        for (const deliveries of chunkRealtimeDeliveries(group.deliveries)) {
+          const result = await this.flushPendingDeliveryGroup({
+            ...group,
+            deliveries,
+          });
+          evaluated += result.evaluated;
+          failed += result.failed;
+        }
+
+        return { evaluated, failed };
+      })
+    );
+
     let evaluated = 0;
     let failed = 0;
-    for (const group of this.createPendingDeliveryGroups(pendingDeliveries)) {
-      for (const deliveries of chunkRealtimeDeliveries(group.deliveries)) {
-        const result = await this.flushPendingDeliveryGroup({
-          ...group,
-          deliveries,
-        });
-        evaluated += result.evaluated;
-        failed += result.failed;
-      }
+    for (const result of groupResults) {
+      evaluated += result.evaluated;
+      failed += result.failed;
     }
 
     return { evaluated, failed };
@@ -712,6 +723,7 @@ export class RealtimeSubscriptionDO {
       if (!deliveredAll) {
         this.deliveryBatchFailuresSinceAutoscale += 1;
       }
+      const stateUpdates: Promise<void>[] = [];
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
           this.deleteExpiredRegistration(delivery.registration);
@@ -721,8 +733,9 @@ export class RealtimeSubscriptionDO {
         delivery.registration.lastResultJson = delivery.resultJson;
         delivery.registration.leaseExpiresAt = leaseExpiresAt;
         this.clearRegistrationReEvaluationBackoff(delivery.registration);
-        await this.updateDeliveredRegistrationState(delivery);
+        stateUpdates.push(this.updateDeliveredRegistrationState(delivery));
       }
+      await Promise.allSettled(stateUpdates);
       emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
         result: deliveredAll ? "delivered" : "undelivered",
       });

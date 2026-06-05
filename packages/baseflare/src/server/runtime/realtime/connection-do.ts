@@ -815,13 +815,17 @@ export class RealtimeConnectionDO {
   }
 
   private sendSocketError(socket: RuntimeWebSocket, error: unknown): void {
-    socket.send(
-      JSON.stringify({
-        error:
-          error instanceof Error ? error.message : "Realtime message failed",
-        type: "error",
-      })
-    );
+    try {
+      socket.send(
+        JSON.stringify({
+          error:
+            error instanceof Error ? error.message : "Realtime message failed",
+          type: "error",
+        })
+      );
+    } catch {
+      // Best-effort error reporting: the socket may already be closing.
+    }
   }
 
   private sendSubscriptionAcknowledgement(
