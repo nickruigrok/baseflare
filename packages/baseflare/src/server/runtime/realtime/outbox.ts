@@ -261,6 +261,18 @@ export async function fetchOldestRealtimeOutboxSequence(
   return typeof row?.sequence === "number" ? row.sequence : null;
 }
 
+export async function fetchLatestRealtimeOutboxSequence(
+  database: Pick<RuntimeDatabase, "prepare">
+): Promise<number | null> {
+  const row = await bindStatement(
+    database,
+    `SELECT MAX(sequence) AS sequence FROM ${REALTIME_OUTBOX_TABLE_NAME}`,
+    []
+  ).first<{ sequence: number | null }>();
+
+  return typeof row?.sequence === "number" ? row.sequence : null;
+}
+
 export async function deleteRealtimeOutboxEventsBefore(
   database: Pick<RuntimeDatabase, "prepare">,
   createdBefore: number,

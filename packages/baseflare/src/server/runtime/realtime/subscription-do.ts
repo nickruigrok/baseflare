@@ -11,6 +11,7 @@ import type { D1Database, DurableObjectStub } from "../types";
 import {
   createRealtimeOutboxResponseEvents,
   deleteRealtimeOutboxEventsBefore,
+  fetchLatestRealtimeOutboxSequence,
   fetchOldestRealtimeOutboxSequence,
   fetchRealtimeOutboxEventById,
   fetchRealtimeOutboxEvents,
@@ -246,10 +247,14 @@ export class RealtimeSubscriptionDO {
     const recoveredByFullReevaluation =
       await this.hasRealtimeOutboxHistoryGap(afterSequence);
     if (recoveredByFullReevaluation) {
+      const latestSequence = await fetchLatestRealtimeOutboxSequence(
+        this.database
+      );
       const result = await this.reEvaluateActiveRegistrations(
-        createFullRealtimeAffectedTargets(this.lastProcessedOutboxSequence),
+        createFullRealtimeAffectedTargets(latestSequence),
         "catch_up"
       );
+      await this.advanceLastProcessedOutboxSequence(latestSequence);
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({
@@ -597,11 +602,7 @@ export class RealtimeSubscriptionDO {
 
         delivery.registration.lastResultJson = delivery.resultJson;
         delivery.registration.leaseExpiresAt = leaseExpiresAt;
-        await this.updateRegistrationDependencies(
-          delivery.registration,
-          delivery.dependencies,
-          delivery.versionSnapshot
-        );
+        await this.updateDeliveredRegistrationState(delivery);
       }
       emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
         result: deliveredAll ? "delivered" : "undelivered",
@@ -628,6 +629,29 @@ export class RealtimeSubscriptionDO {
           )
         );
       }
+    }
+  }
+
+  private async updateDeliveredRegistrationState(
+    delivery: PendingRealtimeDelivery
+  ): Promise<void> {
+    try {
+      await this.updateRegistrationDependencies(
+        delivery.registration,
+        delivery.dependencies,
+        delivery.versionSnapshot
+      );
+    } catch (error) {
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_registration_state_update_failed",
+        {
+          connectionKey: delivery.registration.connectionKey,
+          errorName: error instanceof Error ? error.name : typeof error,
+          queryName: delivery.registration.queryName,
+          subscriptionId: delivery.registration.subscriptionId,
+        }
+      );
     }
   }
 
