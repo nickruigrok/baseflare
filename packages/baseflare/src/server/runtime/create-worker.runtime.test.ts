@@ -2277,12 +2277,12 @@ describe("worker runtime", () => {
     );
   });
 
-  it("removes source realtime registrations when shard move rollback returns non-ok", async () => {
+  it("keeps source realtime registrations active when shard move rollback returns non-ok", async () => {
     const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
       () => Promise.resolve(Response.json({ ok: false }, { status: 503 }))
     );
 
-    expect(registrations).toHaveLength(0);
+    expect(registrations).toHaveLength(1);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -2297,18 +2297,18 @@ describe("worker runtime", () => {
       "baseflare-runtime",
       expect.objectContaining({
         event: "runtime.realtime_registration_move_failed",
-        sourceRemoved: true,
+        sourceRemoved: false,
         subscriptionId: "sub-a",
       })
     );
   });
 
-  it("removes source realtime registrations when shard move rollback throws", async () => {
+  it("keeps source realtime registrations active when shard move rollback throws", async () => {
     const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
       () => Promise.reject(new Error("rollback unavailable"))
     );
 
-    expect(registrations).toHaveLength(0);
+    expect(registrations).toHaveLength(1);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -2323,7 +2323,7 @@ describe("worker runtime", () => {
       "baseflare-runtime",
       expect.objectContaining({
         event: "runtime.realtime_registration_move_failed",
-        sourceRemoved: true,
+        sourceRemoved: false,
         subscriptionId: "sub-a",
       })
     );

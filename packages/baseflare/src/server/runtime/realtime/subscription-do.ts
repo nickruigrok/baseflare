@@ -586,16 +586,17 @@ export class RealtimeSubscriptionDO {
       return { evaluated: 0, failed: 0, skipped: 1 };
     }
 
-    if (
-      this.reEvaluatingRegistrations.has(registrationKey) ||
-      !(await this.hasRelevantVersionGap(registration, targets))
-    ) {
+    if (this.reEvaluatingRegistrations.has(registrationKey)) {
       return { evaluated: 0, failed: 0, skipped: 1 };
     }
 
     this.reEvaluatingRegistrations.add(registrationKey);
     let shouldRelease = true;
     try {
+      if (!(await this.hasRelevantVersionGap(registration, targets))) {
+        return { evaluated: 0, failed: 0, skipped: 1 };
+      }
+
       const delivery = await this.evaluateRegistration(
         registration,
         targets.sequence
@@ -1178,18 +1179,15 @@ export class RealtimeSubscriptionDO {
       method: "POST",
     });
     if (!connectionUpdateResponse.ok) {
-      const rollbackSucceeded = await this.rollbackAdoptedRegistration(
+      await this.rollbackAdoptedRegistration(
         targetStub,
         targetShardName,
         registration
       );
-      if (!rollbackSucceeded) {
-        this.deleteRegistrationByKey(registrationKey);
-      }
       logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
         connectionKey: registration.connectionKey,
         shardName: targetShardName,
-        sourceRemoved: !rollbackSucceeded,
+        sourceRemoved: false,
         status: connectionUpdateResponse.status,
         subscriptionId: registration.subscriptionId,
       });
