@@ -59,6 +59,9 @@ import {
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   REALTIME_MAX_SUBSCRIPTION_SHARDS,
+  REALTIME_PENDING_WORK_LIMIT,
+  REALTIME_SCALE_DOWN_WINDOW_MS,
+  REALTIME_SCALE_UP_WINDOW_MS,
 } from "./realtime/types";
 import { applyRuntimeSchema } from "./schema-apply";
 import type {
@@ -1068,6 +1071,18 @@ function getFirstRealtimeDelivery(delivery: unknown): {
   return item;
 }
 
+async function acknowledgeRealtimeDeliveryRequest(
+  request: Request
+): Promise<Response> {
+  const delivery = await request.json();
+  const items = getRealtimeDeliveryItems(delivery);
+  return Response.json({
+    delivered: items.length,
+    deliveredSubscriptions: items.map((item) => item.subscriptionId),
+    ok: true,
+  });
+}
+
 interface RealtimeClientMessage {
   message?: {
     result: Array<{ text: string }>;
@@ -1523,6 +1538,95 @@ describe("worker runtime", () => {
     }>();
 
     expect(scaleUpResult).toBe("scaled_up");
+    expect(activeGeneration).toEqual({
+      generation_id: 2,
+      status: "active",
+      subscription_shard_count: 2,
+    });
+  });
+
+  it("starts realtime scale-down evaluation during empty catch-up", async () => {
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_realtime_shard_generations"
+    ).run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (1, 2, 'active', 0, NULL)"
+    ).run();
+    const startedAt = 3_000_000;
+    const now = vi.spyOn(Date, "now");
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const catchUp = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/catch-up", {
+          body: JSON.stringify({
+            afterSequence: null,
+            shardName: "subscription:g1:0",
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    now.mockReturnValue(startedAt);
+    await catchUp();
+    now.mockReturnValue(startedAt + REALTIME_SCALE_DOWN_WINDOW_MS);
+    await catchUp();
+
+    const activeGeneration = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
+    ).first<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+
+    expect(activeGeneration).toEqual({
+      generation_id: 2,
+      status: "active",
+      subscription_shard_count: 1,
+    });
+  });
+
+  it("evaluates realtime autoscaling when notify backpressure rejects work", async () => {
+    const startedAt = 4_000_000;
+    const now = vi.spyOn(Date, "now");
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const internals = subscriptionDo as unknown as {
+      pendingNotifyEventIds: Set<string>;
+    };
+    for (let index = 0; index < REALTIME_PENDING_WORK_LIMIT; index += 1) {
+      internals.pendingNotifyEventIds.add(`pending-${index}`);
+    }
+    const notify = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId: "backpressure-rejected" }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    now.mockReturnValue(startedAt);
+    await notify();
+    now.mockReturnValue(startedAt + REALTIME_SCALE_UP_WINDOW_MS);
+    await notify();
+
+    const activeGeneration = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
+    ).first<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+
     expect(activeGeneration).toEqual({
       generation_id: 2,
       status: "active",
@@ -4169,8 +4273,14 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -4406,6 +4516,46 @@ describe("worker runtime", () => {
         (request) => new URL(request.request.url).pathname
       )
     ).toEqual(["/notify", "/notify"]);
+  });
+
+  it("retries transient realtime shard notification failures", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let notifyAttempts = 0;
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname === "/notify") {
+        notifyAttempts += 1;
+        return Promise.resolve(
+          notifyAttempts === 1
+            ? Response.json({ ok: false }, { status: 503 })
+            : Response.json({ ok: true })
+        );
+      }
+
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+
+    await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken: "owner-a", text: "retry-notify" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      },
+      worker,
+      { ...env, REALTIME_SUBSCRIPTIONS: subscriptions }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(notifyAttempts).toBe(2);
+    expect(
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_notify_failed"
+      )
+    ).toBe(false);
   });
 
   it("lets subscription Durable Objects catch up from the realtime outbox", async () => {
@@ -4673,8 +4823,14 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -4749,10 +4905,18 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) => {
-        deliveries.push(request.json());
-        return Promise.resolve(Response.json({ delivered: 1, ok: true }));
-      }),
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          deliveries.push(delivery);
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
     await subscriptionDo.fetch(
@@ -4895,8 +5059,14 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -4968,8 +5138,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5024,8 +5194,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5083,8 +5253,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5153,8 +5323,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5215,8 +5385,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5362,8 +5532,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5425,8 +5595,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5479,8 +5649,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -5562,8 +5732,8 @@ describe("worker runtime", () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
-        Promise.resolve(Response.json({ delivered: 1, ok: true }))
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace((_name, request) =>
+        acknowledgeRealtimeDeliveryRequest(request)
       ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
@@ -6225,8 +6395,14 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -6496,9 +6672,15 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        deliveries.push(await request.json());
+        const delivery = await request.json();
+        deliveries.push(delivery);
         await deliveryGate.promise;
-        return Response.json({ delivered: 1, ok: true });
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -6578,7 +6760,12 @@ describe("worker runtime", () => {
         ) {
           await deliveryGate.promise;
         }
-        return Response.json({ delivered: 1, ok: true });
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -6657,8 +6844,14 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -6856,10 +7049,75 @@ describe("worker runtime", () => {
     ).toEqual([["sub-a", "sub-b"], ["sub-b"]]);
   });
 
+  it("keeps realtime deliveries retryable when item acknowledgements are malformed", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    let deliveryAttempt = 0;
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveryAttempt += 1;
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        if (deliveryAttempt === 1) {
+          return Response.json({ delivered: 1, ok: true });
+        }
+
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "malformed-ack");
+    await createRealtimeOutboxEvent("malformed-ack-first");
+    await createRealtimeOutboxEvent("malformed-ack-second");
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await notify("malformed-ack-first");
+    await notify("malformed-ack-second");
+
+    expect(
+      deliveries.map((delivery) =>
+        getRealtimeDeliveryItems(delivery).map((item) => item.subscriptionId)
+      )
+    ).toEqual([["sub-a"], ["sub-a"]]);
+  });
+
   it("bounds realtime re-evaluation concurrency", async () => {
     const runtimeId = createRealtimeRuntimeId();
-    const connections = new FakeDurableObjectNamespace(() =>
-      Promise.resolve(Response.json({ delivered: 1, ok: true }))
+    const connections = new FakeDurableObjectNamespace((_name, request) =>
+      acknowledgeRealtimeDeliveryRequest(request)
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
@@ -6910,8 +7168,8 @@ describe("worker runtime", () => {
 
   it("renews expired realtime leases after successful delivery", async () => {
     const runtimeId = createRealtimeRuntimeId();
-    const connections = new FakeDurableObjectNamespace(() =>
-      Promise.resolve(Response.json({ delivered: 1, ok: true }))
+    const connections = new FakeDurableObjectNamespace((_name, request) =>
+      acknowledgeRealtimeDeliveryRequest(request)
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
@@ -7094,8 +7352,14 @@ describe("worker runtime", () => {
           throw new Error("Transient delivery failure");
         }
 
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -7177,8 +7441,14 @@ describe("worker runtime", () => {
           return Response.json({ ok: false }, { status: 500 });
         }
 
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -7426,8 +7696,14 @@ describe("worker runtime", () => {
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        deliveries.push(await request.json());
-        return Response.json({ delivered: 1, ok: true });
+        const delivery = await request.json();
+        deliveries.push(delivery);
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
       }
     );
     const subscriptionDo = new RealtimeSubscriptionDO(null, {

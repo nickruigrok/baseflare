@@ -219,7 +219,10 @@ export class RealtimeSubscriptionDO {
     const eventId = getStringField(body, "eventId");
     const backpressureResponse = this.tryReserveNotifyEvent(eventId);
     if (backpressureResponse) {
-      return backpressureResponse;
+      if (backpressureResponse.rejected) {
+        await this.maybeEvaluateAutoscaling();
+      }
+      return backpressureResponse.response;
     }
 
     try {
@@ -342,6 +345,7 @@ export class RealtimeSubscriptionDO {
     if (events.length === 0) {
       await this.advanceLastProcessedOutboxSequence(afterSequence);
       await this.cleanupRealtimeOutbox();
+      await this.maybeEvaluateAutoscaling();
       return jsonResponse({
         evaluated: 0,
         events: createRealtimeOutboxResponseEvents(events),
@@ -366,19 +370,27 @@ export class RealtimeSubscriptionDO {
     });
   }
 
-  private tryReserveNotifyEvent(eventId: string): Response | null {
+  private tryReserveNotifyEvent(
+    eventId: string
+  ): { readonly rejected: boolean; readonly response: Response } | null {
     if (this.pendingNotifyEventIds.has(eventId)) {
       emitRealtimeMetric(REALTIME_BACKPRESSURE_METRIC, 1, {
         result: "coalesced",
       });
-      return jsonResponse({ evaluated: 0, failed: 0, ok: true });
+      return {
+        rejected: false,
+        response: jsonResponse({ evaluated: 0, failed: 0, ok: true }),
+      };
     }
 
     if (this.pendingNotifyEventIds.size >= REALTIME_PENDING_WORK_LIMIT) {
       emitRealtimeMetric(REALTIME_BACKPRESSURE_METRIC, 1, {
         result: "rejected",
       });
-      return jsonResponse({ evaluated: 0, failed: 0, ok: true });
+      return {
+        rejected: true,
+        response: jsonResponse({ evaluated: 0, failed: 0, ok: true }),
+      };
     }
 
     this.pendingNotifyEventIds.add(eventId);
@@ -787,9 +799,7 @@ export class RealtimeSubscriptionDO {
           (subscriptionId): subscriptionId is string =>
             typeof subscriptionId === "string"
         )
-      : group.deliveries.map(
-          (delivery) => delivery.registration.subscriptionId
-        );
+      : [];
     return {
       delivered,
       deliveredSubscriptions: delivered > 0 ? deliveredSubscriptions : [],

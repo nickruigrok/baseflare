@@ -27,6 +27,7 @@ import type {
 import {
   JSON_HEADERS,
   REALTIME_CATCH_UP_EVENT_LIMIT,
+  REALTIME_NOTIFY_SHARD_RETRY_DELAY_MS,
   REALTIME_OUTBOX_CLEANUP_LIMIT,
 } from "./types";
 
@@ -133,29 +134,52 @@ async function notifyRealtimeSubscriptionShards(
   );
   await Promise.all(
     stubs.map(({ generation, shardName, stub }) =>
-      stub
-        .fetch("https://baseflare.internal/notify", {
-          body: JSON.stringify({ eventId: event.eventId, shardName }),
-          headers: JSON_HEADERS,
-          method: "POST",
-        })
-        .then((response) => {
-          if (!response.ok) {
-            throw new InternalRuntimeError(
-              `Realtime notify failed for ${shardName} with status ${response.status}`
-            );
-          }
-        })
-        .catch((error: unknown) => {
+      notifyRealtimeSubscriptionShard(stub, event.eventId, shardName).catch(
+        (error: unknown) => {
           logRuntimeEvent("error", "runtime.realtime_notify_failed", {
             errorName: error instanceof Error ? error.name : typeof error,
             eventId: event.eventId,
             generationId: generation.generationId,
             shardName,
           });
-        })
+        }
+      )
     )
   );
+}
+
+async function notifyRealtimeSubscriptionShard(
+  stub: DurableObjectStub,
+  eventId: string,
+  shardName: string
+): Promise<void> {
+  for (let attempt = 1; attempt <= 2; attempt += 1) {
+    try {
+      const response = await stub.fetch("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId, shardName }),
+        headers: JSON_HEADERS,
+        method: "POST",
+      });
+      if (response.ok) {
+        return;
+      }
+
+      throw new InternalRuntimeError(
+        `Realtime notify failed for ${shardName} with status ${response.status}`
+      );
+    } catch (error) {
+      if (attempt >= 2) {
+        throw error;
+      }
+      await waitForRealtimeNotifyShardRetry();
+    }
+  }
+}
+
+function waitForRealtimeNotifyShardRetry(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, REALTIME_NOTIFY_SHARD_RETRY_DELAY_MS);
+  });
 }
 
 function getRealtimeSubscriptionStubs(
