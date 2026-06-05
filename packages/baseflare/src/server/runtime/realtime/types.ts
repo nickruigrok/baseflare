@@ -78,6 +78,7 @@ export type StoredRealtimeRegistration = Omit<
   dependencies?: RealtimeDependencySet;
   leaseExpiresAt: number;
   lastResultJson?: string;
+  reEvaluationRetryAt?: number;
   versionSnapshot?: RealtimeVersionSnapshot;
 };
 
@@ -201,6 +202,8 @@ export const REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS = 3;
 export const REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS = 10;
 
 export const REALTIME_REEVALUATION_CONCURRENCY = 8;
+
+export const REALTIME_REEVALUATION_FAILURE_RETRY_MS = 10_000;
 
 export const REALTIME_RECONCILIATION_INTERVAL_MS = 120_000;
 

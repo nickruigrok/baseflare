@@ -82,6 +82,7 @@ import {
   REALTIME_PENDING_WORK_LIMIT,
   REALTIME_RE_EVALUATIONS_METRIC,
   REALTIME_REEVALUATION_CONCURRENCY,
+  REALTIME_REEVALUATION_FAILURE_RETRY_MS,
 } from "./types";
 
 export class RealtimeSubscriptionDO {
@@ -569,6 +570,10 @@ export class RealtimeSubscriptionDO {
       return { evaluated: 0, failed: 0, skipped: 0 };
     }
 
+    if (this.isRegistrationReEvaluationBackedOff(registration)) {
+      return { evaluated: 0, failed: 0, skipped: 1 };
+    }
+
     if (
       this.reEvaluatingRegistrations.has(registrationKey) ||
       !(await this.hasRelevantVersionGap(registration, targets))
@@ -584,13 +589,16 @@ export class RealtimeSubscriptionDO {
         targets.sequence
       );
       if (!delivery) {
+        this.clearRegistrationReEvaluationBackoff(registration);
         return { evaluated: 1, failed: 0, skipped: 0 };
       }
 
       shouldRelease = false;
       return { delivery, evaluated: 0, failed: 0, skipped: 0 };
     } catch (error) {
-      this.deleteExpiredRegistration(registration);
+      if (!this.deleteExpiredRegistration(registration)) {
+        this.backOffRegistrationReEvaluation(registration);
+      }
       this.logReEvaluationFailure(registration, error);
       return { evaluated: 0, failed: 1, skipped: 0 };
     } finally {
@@ -598,6 +606,28 @@ export class RealtimeSubscriptionDO {
         this.reEvaluatingRegistrations.delete(registrationKey);
       }
     }
+  }
+
+  private isRegistrationReEvaluationBackedOff(
+    registration: StoredRealtimeRegistration
+  ): boolean {
+    return (
+      typeof registration.reEvaluationRetryAt === "number" &&
+      registration.reEvaluationRetryAt > Date.now()
+    );
+  }
+
+  private backOffRegistrationReEvaluation(
+    registration: StoredRealtimeRegistration
+  ): void {
+    registration.reEvaluationRetryAt =
+      Date.now() + REALTIME_REEVALUATION_FAILURE_RETRY_MS;
+  }
+
+  private clearRegistrationReEvaluationBackoff(
+    registration: StoredRealtimeRegistration
+  ): void {
+    registration.reEvaluationRetryAt = undefined;
   }
 
   private async flushPendingDeliveries(
@@ -668,6 +698,7 @@ export class RealtimeSubscriptionDO {
 
         delivery.registration.lastResultJson = delivery.resultJson;
         delivery.registration.leaseExpiresAt = leaseExpiresAt;
+        this.clearRegistrationReEvaluationBackoff(delivery.registration);
         await this.updateDeliveredRegistrationState(delivery);
       }
       emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
@@ -958,9 +989,9 @@ export class RealtimeSubscriptionDO {
 
   private deleteExpiredRegistration(
     registration: StoredRealtimeRegistration
-  ): void {
+  ): boolean {
     if (registration.leaseExpiresAt > Date.now()) {
-      return;
+      return false;
     }
 
     this.deleteRegistrationByKey(
@@ -969,6 +1000,7 @@ export class RealtimeSubscriptionDO {
         registration.subscriptionId
       )
     );
+    return true;
   }
 
   private getRelevantRegistrationKeys(
@@ -1135,14 +1167,18 @@ export class RealtimeSubscriptionDO {
       method: "POST",
     });
     if (!connectionUpdateResponse.ok) {
-      await this.rollbackAdoptedRegistration(
+      const rollbackSucceeded = await this.rollbackAdoptedRegistration(
         targetStub,
         targetShardName,
         registration
       );
+      if (!rollbackSucceeded) {
+        this.deleteRegistrationByKey(registrationKey);
+      }
       logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
         connectionKey: registration.connectionKey,
         shardName: targetShardName,
+        sourceRemoved: !rollbackSucceeded,
         status: connectionUpdateResponse.status,
         subscriptionId: registration.subscriptionId,
       });
@@ -1156,7 +1192,7 @@ export class RealtimeSubscriptionDO {
     targetStub: DurableObjectStub,
     targetShardName: string,
     registration: StoredRealtimeRegistration
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const response = await targetStub.fetch(
         "https://baseflare.internal/unregister",
@@ -1171,20 +1207,29 @@ export class RealtimeSubscriptionDO {
       );
       if (!response.ok) {
         this.logRegistrationMoveCleanupFailure(registration, targetShardName, {
+          sourceRemoved: true,
           status: response.status,
         });
+        return false;
       }
+      return true;
     } catch (error) {
       this.logRegistrationMoveCleanupFailure(registration, targetShardName, {
         errorName: error instanceof Error ? error.name : typeof error,
+        sourceRemoved: true,
       });
+      return false;
     }
   }
 
   private logRegistrationMoveCleanupFailure(
     registration: StoredRealtimeRegistration,
     targetShardName: string,
-    detail: { readonly errorName?: string; readonly status?: number }
+    detail: {
+      readonly errorName?: string;
+      readonly sourceRemoved?: boolean;
+      readonly status?: number;
+    }
   ): void {
     logRuntimeEvent(
       "error",
@@ -1193,6 +1238,7 @@ export class RealtimeSubscriptionDO {
         connectionKey: registration.connectionKey,
         errorName: detail.errorName,
         shardName: targetShardName,
+        sourceRemoved: detail.sourceRemoved,
         status: detail.status,
         subscriptionId: registration.subscriptionId,
       }

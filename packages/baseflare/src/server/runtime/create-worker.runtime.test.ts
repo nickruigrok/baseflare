@@ -995,7 +995,10 @@ interface RealtimeIndexTestState {
   readonly registrationKeysByPartition: Map<string, Set<string>>;
   readonly registrationKeysByTable: Map<string, Set<string>>;
   readonly registrationKeysWithoutDependencies: Set<string>;
-  readonly registrations: Map<string, { leaseExpiresAt: number }>;
+  readonly registrations: Map<
+    string,
+    { leaseExpiresAt: number; reEvaluationRetryAt?: number }
+  >;
 }
 
 function getRealtimeIndexTestState(
@@ -2140,35 +2143,37 @@ describe("worker runtime", () => {
     );
   });
 
-  it("logs realtime shard move cleanup failures when rollback returns non-ok", async () => {
+  it("removes source realtime registrations when shard move rollback returns non-ok", async () => {
     const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
       () => Promise.resolve(Response.json({ ok: false }, { status: 503 }))
     );
 
-    expect(registrations).toHaveLength(1);
+    expect(registrations).toHaveLength(0);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
         event: "runtime.realtime_registration_move_cleanup_failed",
         connectionKey: "client-a",
+        sourceRemoved: true,
         status: 503,
         subscriptionId: "sub-a",
       })
     );
   });
 
-  it("logs realtime shard move cleanup failures when rollback throws", async () => {
+  it("removes source realtime registrations when shard move rollback throws", async () => {
     const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
       () => Promise.reject(new Error("rollback unavailable"))
     );
 
-    expect(registrations).toHaveLength(1);
+    expect(registrations).toHaveLength(0);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
         errorName: "Error",
         event: "runtime.realtime_registration_move_cleanup_failed",
         connectionKey: "client-a",
+        sourceRemoved: true,
         subscriptionId: "sub-a",
       })
     );
@@ -4101,6 +4106,100 @@ describe("worker runtime", () => {
         subscriptionId: "sub-bad",
       })
     );
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-bad");
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const failedRegistration = indexState.registrations.get(registrationKey);
+    expect(failedRegistration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+
+    await createTodoViaRpc("owner-a", "skips-backed-off-registration");
+    await createRealtimeOutboxEvent("event-2");
+    const skippedResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "event-2" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const skippedBody = (await skippedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    expect(skippedBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(errorSpy).toHaveBeenCalledTimes(1);
+
+    if (failedRegistration) {
+      failedRegistration.reEvaluationRetryAt = Date.now() - 1;
+    }
+    await createTodoViaRpc("owner-a", "retries-after-backoff");
+    await createRealtimeOutboxEvent("event-3");
+    const retriedResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "event-3" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const retriedBody = (await retriedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    expect(retriedBody).toEqual({ evaluated: 1, failed: 1, ok: true });
+    expect(errorSpy).toHaveBeenCalledTimes(2);
+  });
+
+  it("removes expired realtime registrations after query evaluation failures", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() - 1,
+          queryName: "todos:renamed",
+          runtimeId,
+          subscriptionId: "sub-expired",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "expired-query-failure");
+    await createRealtimeOutboxEvent("expired-query-failure");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "expired-query-failure" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: unknown[];
+    };
+
+    expect(body).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(registrationsBody.registrations).toEqual([]);
   });
 
   it("writes realtime outbox events and notifies subscription DOs after mutations", async () => {
