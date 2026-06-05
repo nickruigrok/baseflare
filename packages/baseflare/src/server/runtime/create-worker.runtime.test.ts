@@ -2154,8 +2154,16 @@ describe("worker runtime", () => {
       expect.objectContaining({
         event: "runtime.realtime_registration_move_cleanup_failed",
         connectionKey: "client-a",
-        sourceRemoved: true,
+        sourceRemoved: false,
         status: 503,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_move_failed",
+        sourceRemoved: true,
         subscriptionId: "sub-a",
       })
     );
@@ -2173,6 +2181,14 @@ describe("worker runtime", () => {
         errorName: "Error",
         event: "runtime.realtime_registration_move_cleanup_failed",
         connectionKey: "client-a",
+        sourceRemoved: false,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_move_failed",
         sourceRemoved: true,
         subscriptionId: "sub-a",
       })
@@ -2231,6 +2247,23 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() - 1,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-expired",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
     const notify = (eventId: string) =>
       subscriptionDo.fetch(
         new Request("https://baseflare.internal/notify", {
@@ -2246,6 +2279,14 @@ describe("worker runtime", () => {
     });
     await notify("ev1");
     expect(deliveredIds.filter((id) => id === "sub-a")).toHaveLength(1);
+    expect(deliveredIds.filter((id) => id === "sub-expired")).toHaveLength(1);
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const expiredRegistration = indexState.registrations.get(
+      realtimeRegistrationKey("client-a", "sub-expired")
+    );
+    if (expiredRegistration) {
+      expiredRegistration.leaseExpiresAt = Date.now() - 1;
+    }
 
     // A later event bumps the version (forcing re-evaluation) but the query
     // result is unchanged — it must not be delivered a second time.
@@ -2255,6 +2296,22 @@ describe("worker runtime", () => {
     });
     await notify("ev2");
     expect(deliveredIds.filter((id) => id === "sub-a")).toHaveLength(1);
+    expect(deliveredIds.filter((id) => id === "sub-expired")).toHaveLength(1);
+
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: Array<{ subscriptionId: string }>;
+    };
+    expect(
+      registrationsBody.registrations.map(
+        (registration) => registration.subscriptionId
+      )
+    ).toEqual(["sub-a"]);
   });
 
   it("preserves lastResultJson when adopting a migrated registration", async () => {

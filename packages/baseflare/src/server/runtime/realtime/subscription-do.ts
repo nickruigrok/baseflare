@@ -590,6 +590,7 @@ export class RealtimeSubscriptionDO {
       );
       if (!delivery) {
         this.clearRegistrationReEvaluationBackoff(registration);
+        this.deleteExpiredRegistration(registration);
         return { evaluated: 1, failed: 0, skipped: 0 };
       }
 
@@ -1207,7 +1208,7 @@ export class RealtimeSubscriptionDO {
       );
       if (!response.ok) {
         this.logRegistrationMoveCleanupFailure(registration, targetShardName, {
-          sourceRemoved: true,
+          sourceRemoved: false,
           status: response.status,
         });
         return false;
@@ -1216,7 +1217,7 @@ export class RealtimeSubscriptionDO {
     } catch (error) {
       this.logRegistrationMoveCleanupFailure(registration, targetShardName, {
         errorName: error instanceof Error ? error.name : typeof error,
-        sourceRemoved: true,
+        sourceRemoved: false,
       });
       return false;
     }
