@@ -49,6 +49,7 @@ import {
 import {
   evaluateRealtimeAutoscalingForTest,
   fetchRealtimeVersionSnapshot,
+  REALTIME_PARTITION_VERSION_SNAPSHOT_BATCH_SIZE,
 } from "./realtime/shards";
 import {
   configuredRealtimeRuntimes,
@@ -1455,6 +1456,45 @@ describe("worker runtime", () => {
     expect(
       preparedSql.filter((sql) => sql.includes("_bf_partition_versions"))
     ).toHaveLength(1);
+  });
+
+  it("chunks large realtime partition version snapshots under the D1 bind limit", async () => {
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_partition_versions (table_name, partition_key, partition_value, version) VALUES (?, ?, ?, ?)"
+    )
+      .bind("todos", "by_owner", JSON.stringify(["owner-250"]), 11)
+      .run();
+    const preparedSql: string[] = [];
+    const database: Pick<D1Database, "prepare"> = {
+      prepare(sql) {
+        preparedSql.push(sql);
+        return env.APP_DB.prepare(sql);
+      },
+    };
+    const partitionIds = Array.from({ length: 251 }, (_value, index) =>
+      todoOwnerPartitionId(`owner-${index}`)
+    );
+
+    const snapshot = await fetchRealtimeVersionSnapshot(database, {
+      partitions: new Set(partitionIds),
+      tables: new Set(),
+    });
+
+    const partitionQueries = preparedSql.filter((sql) =>
+      sql.includes("_bf_partition_versions")
+    );
+    expect(partitionQueries).toHaveLength(
+      Math.ceil(
+        partitionIds.length / REALTIME_PARTITION_VERSION_SNAPSHOT_BATCH_SIZE
+      )
+    );
+    for (const sql of partitionQueries) {
+      expect(sql.match(/\(\?, \?, \?, \?\)/g)?.length ?? 0).toBeLessThanOrEqual(
+        REALTIME_PARTITION_VERSION_SNAPSHOT_BATCH_SIZE
+      );
+    }
+    expect(snapshot.partitions.get(todoOwnerPartitionId("owner-0"))).toBe(0);
+    expect(snapshot.partitions.get(todoOwnerPartitionId("owner-250"))).toBe(11);
   });
 
   it("classifies empty realtime version snapshots as unknown, not zero", () => {
@@ -3906,6 +3946,99 @@ describe("worker runtime", () => {
         tags: { result: "accepted" },
         value: 1,
       })
+    );
+  });
+
+  it("retries hibernation restore when generation lookup fails at wakeup", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionRequests: Array<{ path: string }> = [];
+    let connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ ok: true }))
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const [socket] = state.acceptedSockets;
+    if (!socket) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    (
+      response as Response & { readonly webSocket?: AttachedTestWebSocket }
+    ).webSocket?.accept?.();
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        type: "subscribe",
+      })
+    );
+
+    let rejectGenerationLookup = true;
+    const database = {
+      prepare(sql: string) {
+        if (
+          rejectGenerationLookup &&
+          sql.includes("_bf_realtime_shard_generations")
+        ) {
+          rejectGenerationLookup = false;
+          throw new Error("generation lookup unavailable");
+        }
+
+        return env.APP_DB.prepare(sql);
+      },
+    } as D1Database;
+    state.alarmTime = null;
+    connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: database,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        (_name, request) => {
+          subscriptionRequests.push({ path: new URL(request.url).pathname });
+          return Promise.resolve(
+            Response.json({ evaluated: 0, events: [], failed: 0, ok: true })
+          );
+        }
+      ),
+    });
+
+    await waitFor(() =>
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_hibernation_restore_failed"
+      )
+    );
+
+    expect(state.alarmTime).toBeTypeOf("number");
+    expect(subscriptionRequests).toHaveLength(0);
+
+    await connectionDo.alarm();
+
+    expect(
+      subscriptionRequests.filter(({ path }) => path === "/register")
+    ).toHaveLength(1);
+    expect(subscriptionRequests.some(({ path }) => path === "/catch-up")).toBe(
+      true
     );
   });
 

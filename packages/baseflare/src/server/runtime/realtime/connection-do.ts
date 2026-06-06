@@ -603,7 +603,7 @@ export class RealtimeConnectionDO {
 
     if (sockets.length > 0) {
       this.restoreAttachedSubscriptions({ reconcileAfterRestore: true }).catch(
-        (error: unknown) => {
+        async (error: unknown) => {
           logRuntimeEvent(
             "error",
             "runtime.realtime_hibernation_restore_failed",
@@ -611,6 +611,20 @@ export class RealtimeConnectionDO {
               errorName: error instanceof Error ? error.name : typeof error,
             }
           );
+          this.hasPendingHibernationRestoreRetry = true;
+          try {
+            await this.scheduleReconciliation();
+          } catch (scheduleError) {
+            logRuntimeEvent("error", "runtime.realtime_reconciliation_failed", {
+              errorName:
+                scheduleError instanceof Error
+                  ? scheduleError.name
+                  : typeof scheduleError,
+            });
+            emitRealtimeMetric(REALTIME_RECONCILIATIONS_METRIC, 1, {
+              result: "failed",
+            });
+          }
         }
       );
     }

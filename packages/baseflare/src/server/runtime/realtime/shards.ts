@@ -34,6 +34,9 @@ import {
   REALTIME_SCALE_UP_WINDOW_MS,
 } from "./types";
 
+// Four bind params per partition; keep chunks below D1's conservative limit.
+export const REALTIME_PARTITION_VERSION_SNAPSHOT_BATCH_SIZE = 24;
+
 async function fetchRealtimeShardGenerations(
   database: Pick<RuntimeDatabase, "prepare">,
   statuses: readonly RealtimeShardGenerationStatus[]
@@ -165,9 +168,17 @@ export async function fetchRealtimeVersionSnapshot(
     });
   }
 
-  if (partitionRequests.length > 0) {
-    const placeholders = partitionRequests.map(() => "(?, ?, ?, ?)").join(", ");
-    const params = partitionRequests.flatMap((partition) => [
+  for (
+    let start = 0;
+    start < partitionRequests.length;
+    start += REALTIME_PARTITION_VERSION_SNAPSHOT_BATCH_SIZE
+  ) {
+    const chunk = partitionRequests.slice(
+      start,
+      start + REALTIME_PARTITION_VERSION_SNAPSHOT_BATCH_SIZE
+    );
+    const placeholders = chunk.map(() => "(?, ?, ?, ?)").join(", ");
+    const params = chunk.flatMap((partition) => [
       partition.partitionId,
       partition.tableName,
       partition.partitionKey,
