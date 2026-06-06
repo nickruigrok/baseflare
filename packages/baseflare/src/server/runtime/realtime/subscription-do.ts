@@ -368,12 +368,14 @@ export class RealtimeSubscriptionDO {
       });
     }
 
-    await this.advanceLastProcessedOutboxSequence(events.at(-1)?.sequence);
     this.lastOutboxLagMs = emitOutboxLagMetric("catch_up", events);
     const result = await this.reEvaluateActiveRegistrations(
       createRealtimeAffectedTargets(events),
       "catch_up"
     );
+    // Advance after evaluation so an unexpected evaluation failure cannot
+    // make this shard permanently skip events.
+    await this.advanceLastProcessedOutboxSequence(events.at(-1)?.sequence);
     await this.cleanupRealtimeOutbox();
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({
@@ -736,7 +738,8 @@ export class RealtimeSubscriptionDO {
       const leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
       const deliveredAll =
         deliveredSubscriptions.size === group.deliveries.length;
-      if (!deliveredAll) {
+      const noTargetSockets = result.delivered === 0;
+      if (!(deliveredAll || noTargetSockets)) {
         this.deliveryBatchFailuresSinceAutoscale += 1;
       }
       const stateUpdates: Promise<void>[] = [];

@@ -5280,6 +5280,86 @@ describe("worker runtime", () => {
     ]);
   });
 
+  it("advances realtime catch-up cursor only after delivery evaluation", async () => {
+    await createTodoViaRpc("owner-a", "catch-up-cursor-order");
+    await createRealtimeOutboxEvent("catch-up-cursor-order");
+    const row = await env.APP_DB.prepare(
+      "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("catch-up-cursor-order")
+      .first<{ sequence: number }>();
+    const runtimeId = createRealtimeRuntimeId();
+    let cursorDuringDelivery: number | null | undefined;
+    let subscriptionDo: RealtimeSubscriptionDO;
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/deliver") {
+          const registrationsResponse = await subscriptionDo.fetch(
+            new Request("https://baseflare.internal/registrations", {
+              body: "{}",
+              method: "POST",
+            })
+          );
+          const registrationsBody = (await registrationsResponse.json()) as {
+            lastProcessedOutboxSequence: number | null;
+          };
+          cursorDuringDelivery = registrationsBody.lastProcessedOutboxSequence;
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+        return Response.json({ ok: true });
+      }
+    );
+    subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      lastProcessedOutboxSequence: number | null;
+    };
+
+    expect(response.status).toBe(200);
+    expect(cursorDuringDelivery).toBeNull();
+    expect(registrationsBody.lastProcessedOutboxSequence).toBe(row?.sequence);
+  });
+
   it("skips the D1 re-query when subscription versions are unchanged", async () => {
     const runtimeId = createRealtimeRuntimeId();
     // Seed a todo so the table version is non-zero and captured in the snapshot.
@@ -8093,6 +8173,79 @@ describe("worker runtime", () => {
 
     expect(retriedBody).toEqual({ evaluated: 0, failed: 2, ok: true });
     expect(deliveries).toHaveLength(2);
+  });
+
+  it("does not scale up from no-target realtime delivery batches", async () => {
+    const now = vi.spyOn(Date, "now");
+    const startedAt = 5_000_000;
+    now.mockReturnValue(startedAt);
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(
+        Response.json({ delivered: 0, deliveredSubscriptions: [], ok: true })
+      )
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: startedAt + REALTIME_SCALE_UP_WINDOW_MS * 2,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "no-target-autoscale");
+    await createRealtimeOutboxEvent("no-target-autoscale-first");
+    await createRealtimeOutboxEvent("no-target-autoscale-second");
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await notify("no-target-autoscale-first");
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-1");
+    const registration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+    if (registration) {
+      registration.reEvaluationRetryAt =
+        startedAt + REALTIME_SCALE_UP_WINDOW_MS;
+    }
+    now.mockReturnValue(startedAt + REALTIME_SCALE_UP_WINDOW_MS + 1);
+    await notify("no-target-autoscale-second");
+
+    const activeGeneration = await env.APP_DB.prepare(
+      "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
+    ).first<{
+      generation_id: number;
+      status: string;
+      subscription_shard_count: number;
+    }>();
+
+    expect(activeGeneration).toEqual({
+      generation_id: 1,
+      status: "active",
+      subscription_shard_count: 1,
+    });
+    expect(connections.requests).toHaveLength(2);
   });
 
   it("keeps realtime deliveries retryable when item acknowledgements are malformed", async () => {
