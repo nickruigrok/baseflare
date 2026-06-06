@@ -65,13 +65,13 @@ export function createRealtimeOutboxOperation(
     expectedChanges: 1,
     params: [
       event.eventId,
-      Date.now(),
       JSON.stringify(event.tables),
       JSON.stringify(event.partitions),
       expectedPreviousChanges,
     ],
     sql: `INSERT INTO ${REALTIME_OUTBOX_TABLE_NAME} (event_id, created_at, tables, partitions)
-          SELECT ?, ?, ?, ? WHERE changes() = ?`,
+          SELECT ?, CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER), ?, ?
+          WHERE changes() = ?`,
     type: "insert-realtime-outbox",
   };
 }

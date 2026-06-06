@@ -1,5 +1,5 @@
 import { ValidationRuntimeError } from "../errors";
-import { emitRuntimeMetric } from "../logging";
+import { emitRuntimeMetric, logRuntimeEvent } from "../logging";
 import { getRealtimeConnectionShardName } from "./routing";
 import type {
   PendingRealtimeDelivery,
@@ -43,6 +43,10 @@ function trimConfiguredRealtimeRuntimes(): void {
       return;
     }
 
+    logRuntimeEvent("warn", "runtime.realtime_runtime_evicted", {
+      limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
+      runtimeId: oldestRuntimeId,
+    });
     configuredRealtimeRuntimes.delete(oldestRuntimeId);
   }
 }

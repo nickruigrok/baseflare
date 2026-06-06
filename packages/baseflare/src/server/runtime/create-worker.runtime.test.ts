@@ -36,6 +36,7 @@ import { createWorker } from "./create-worker";
 import { createFunctionIndex } from "./function-index";
 import { buildBaseflareManifest } from "./manifest";
 import { RealtimeConnectionDO } from "./realtime/connection-do";
+import { createRealtimeOutboxOperation } from "./realtime/outbox";
 import {
   createRealtimeGlobalSubscriptionRouteTarget,
   createRealtimePartitionSubscriptionRouteTarget,
@@ -1327,6 +1328,9 @@ describe("worker runtime", () => {
   });
 
   it("bounds configured realtime runtime state", () => {
+    const warnLog = vi.spyOn(console, "warn").mockImplementation(() => {
+      // Runtime eviction is an operator diagnostic.
+    });
     resetRealtimeRuntimeStateForTest();
     let latestRuntimeId = "";
     for (
@@ -1342,6 +1346,14 @@ describe("worker runtime", () => {
     );
     expect(configuredRealtimeRuntimes.has("runtime:1")).toBe(false);
     expect(configuredRealtimeRuntimes.has(latestRuntimeId)).toBe(true);
+    expect(warnLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_runtime_evicted",
+        limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
+        runtimeId: "runtime:1",
+      })
+    );
   });
 
   it("applies realtime outbox metadata", async () => {
@@ -1356,6 +1368,25 @@ describe("worker runtime", () => {
     expect(outbox?.sql).toContain("event_id TEXT NOT NULL UNIQUE");
     expect(outbox?.sql).toContain("partitions TEXT NOT NULL");
     expect(createdAtIndex?.name).toBe("_bf_realtime_outbox_created_at");
+  });
+
+  it("uses database time for realtime outbox timestamps", () => {
+    const operation = createRealtimeOutboxOperation(
+      {
+        eventId: "db-time-event",
+        partitions: [],
+        tables: ["todos"],
+      },
+      1
+    );
+
+    expect(operation.params).toEqual([
+      "db-time-event",
+      JSON.stringify(["todos"]),
+      JSON.stringify([]),
+      1,
+    ]);
+    expect(operation.sql).toContain("julianday('now')");
   });
 
   it("applies realtime shard metadata", async () => {
@@ -6750,6 +6781,117 @@ describe("worker runtime", () => {
 
     expect(response.status).toBe(200);
     expect(sessionConstraints).toEqual(["commit-bookmark"]);
+  });
+
+  it("uses realtime notify bookmarks for version checks and query execution", async () => {
+    realtimeDependencyTrackingQueryCalls = 0;
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const sessionPreparedSql: string[] = [];
+    let useStaleBaseTableVersion = false;
+    const staleTableVersionStatement = {
+      all: async () => ({ results: [{ table_name: "labels", version: 0 }] }),
+      bind() {
+        return this;
+      },
+      first: async () => ({ version: 0 }),
+      run: async () => ({ meta: {}, success: true }),
+    } as unknown as ReturnType<D1Database["prepare"]>;
+    const session: D1DatabaseSession = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      getBookmark: () => "session-bookmark",
+      prepare: (sql) => {
+        sessionPreparedSql.push(sql);
+        return env.APP_DB.prepare(sql);
+      },
+    };
+    const database: D1Database = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      prepare: (sql) => {
+        if (
+          useStaleBaseTableVersion &&
+          sql.includes("FROM _bf_table_versions")
+        ) {
+          return staleTableVersionStatement;
+        }
+
+        return env.APP_DB.prepare(sql);
+      },
+      withSession: () => session,
+    };
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: database,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          deliveries.push(delivery);
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "broad-labels", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createRealtimeOutboxEvent("bookmark-version-prime", Date.now(), {
+      tables: ["labels"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "bookmark-version-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    useStaleBaseTableVersion = true;
+    await createRealtimeOutboxEvent("bookmark-version-check", Date.now(), {
+      tables: ["labels"],
+    });
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "bookmark-version-check",
+          outboxBookmark: "commit-bookmark",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      evaluated: 1,
+      failed: 0,
+      ok: true,
+    });
+    expect(realtimeDependencyTrackingQueryCalls).toBe(2);
+    expect(deliveries).toHaveLength(1);
+    expect(
+      sessionPreparedSql.some((sql) => sql.includes("FROM _bf_table_versions"))
+    ).toBe(true);
+    expect(sessionPreparedSql.some((sql) => sql.includes("FROM labels"))).toBe(
+      true
+    );
   });
 
   it("logs and fails realtime notify when the outbox row is missing", async () => {

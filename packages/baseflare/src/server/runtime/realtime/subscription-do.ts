@@ -7,7 +7,7 @@ import { bindStatement } from "../d1";
 import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
 import { executeQueryDefinition } from "../execution";
 import { logRuntimeEvent } from "../logging";
-import type { D1Database, DurableObjectStub } from "../types";
+import type { D1Database, DurableObjectStub, RuntimeDatabase } from "../types";
 import {
   createRealtimeOutboxResponseEvents,
   deleteRealtimeOutboxEventsBefore,
@@ -251,11 +251,12 @@ export class RealtimeSubscriptionDO {
         );
       }
 
-      const { event } = eventLookup;
+      const { database, event } = eventLookup;
       this.lastOutboxLagMs = emitOutboxLagMetric("notify", [event]);
       const result = await this.reEvaluateActiveRegistrations(
         createRealtimeAffectedTargets([event]),
-        "notify"
+        "notify",
+        database
       );
       // Advance after evaluation so an unexpected evaluation failure cannot
       // make this shard permanently skip the event.
@@ -273,6 +274,7 @@ export class RealtimeSubscriptionDO {
     outboxBookmark?: string
   ): Promise<
     | {
+        readonly database: RuntimeDatabase;
         readonly event: RealtimeSequencedOutboxEvent;
         readonly status: "found";
       }
@@ -289,7 +291,7 @@ export class RealtimeSubscriptionDO {
     ) {
       const event = await fetchRealtimeOutboxEventById(database, eventId);
       if (event) {
-        return { event, status: "found" };
+        return { database, event, status: "found" };
       }
 
       if (await fetchRealtimeOutboxEventRowExists(database, eventId)) {
@@ -519,7 +521,8 @@ export class RealtimeSubscriptionDO {
 
   private async reEvaluateActiveRegistrations(
     targets: RealtimeAffectedTargets,
-    source: RealtimeMetricSource
+    source: RealtimeMetricSource,
+    database: RuntimeDatabase = this.database
   ): Promise<{
     readonly evaluated: number;
     readonly failed: number;
@@ -538,7 +541,8 @@ export class RealtimeSubscriptionDO {
         nextRegistrationIndex += 1;
         const result = await this.tryEvaluateRegistration(
           registrationKey,
-          targets
+          targets,
+          database
         );
         evaluated += result.evaluated;
         failed += result.failed;
@@ -582,7 +586,8 @@ export class RealtimeSubscriptionDO {
 
   private async tryEvaluateRegistration(
     registrationKey: string | undefined,
-    targets: RealtimeAffectedTargets
+    targets: RealtimeAffectedTargets,
+    database: RuntimeDatabase
   ): Promise<{
     readonly delivery?: PendingRealtimeDelivery;
     readonly evaluated: number;
@@ -609,13 +614,16 @@ export class RealtimeSubscriptionDO {
     this.reEvaluatingRegistrations.add(registrationKey);
     let shouldRelease = true;
     try {
-      if (!(await this.hasRelevantVersionGap(registration, targets))) {
+      if (
+        !(await this.hasRelevantVersionGap(registration, targets, database))
+      ) {
         return { evaluated: 0, failed: 0, skipped: 1 };
       }
 
       const delivery = await this.evaluateRegistration(
         registration,
-        targets.sequence
+        targets.sequence,
+        database
       );
       if (!delivery) {
         this.clearRegistrationReEvaluationBackoff(registration);
@@ -897,7 +905,8 @@ export class RealtimeSubscriptionDO {
 
   private async evaluateRegistration(
     registration: StoredRealtimeRegistration,
-    sequence: number | null
+    sequence: number | null,
+    database: RuntimeDatabase
   ): Promise<PendingRealtimeDelivery | null> {
     const runtime = configuredRealtimeRuntimes.get(registration.runtimeId);
     if (!runtime) {
@@ -926,7 +935,7 @@ export class RealtimeSubscriptionDO {
     const result = await executeQueryDefinition(
       entry.definition as QueryDefinition,
       {
-        database: this.database,
+        database,
         executionContext: {
           waitUntil() {
             // Realtime DO query execution does not schedule nested background work.
@@ -942,7 +951,7 @@ export class RealtimeSubscriptionDO {
     );
     const resultJson = JSON.stringify(result);
     const versionSnapshot = await fetchRealtimeVersionSnapshot(
-      this.database,
+      database,
       dependencies
     );
     if (resultJson === registration.lastResultJson) {
@@ -969,7 +978,8 @@ export class RealtimeSubscriptionDO {
 
   private async hasRelevantVersionGap(
     registration: StoredRealtimeRegistration,
-    targets: RealtimeAffectedTargets
+    targets: RealtimeAffectedTargets,
+    database: RuntimeDatabase
   ): Promise<boolean> {
     if (
       targets.all ||
@@ -993,7 +1003,7 @@ export class RealtimeSubscriptionDO {
         continue;
       }
 
-      const currentVersion = await this.fetchTableVersion(tableName);
+      const currentVersion = await this.fetchTableVersion(database, tableName);
       if (
         currentVersion !== registration.versionSnapshot.tables.get(tableName)
       ) {
@@ -1015,7 +1025,10 @@ export class RealtimeSubscriptionDO {
         continue;
       }
 
-      const currentVersion = await this.fetchPartitionVersion(partition);
+      const currentVersion = await this.fetchPartitionVersion(
+        database,
+        partition
+      );
       if (
         currentVersion !==
         registration.versionSnapshot.partitions.get(partitionId)
@@ -1027,9 +1040,12 @@ export class RealtimeSubscriptionDO {
     return false;
   }
 
-  private async fetchTableVersion(tableName: string): Promise<number | null> {
+  private async fetchTableVersion(
+    database: RuntimeDatabase,
+    tableName: string
+  ): Promise<number | null> {
     const row = await bindStatement(
-      this.database,
+      database,
       `SELECT version FROM ${TABLE_VERSION_TABLE_NAME}
        WHERE table_name = ?
        LIMIT 1`,
@@ -1040,10 +1056,11 @@ export class RealtimeSubscriptionDO {
   }
 
   private async fetchPartitionVersion(
+    database: RuntimeDatabase,
     partition: RealtimePartitionTarget
   ): Promise<number> {
     const row = await bindStatement(
-      this.database,
+      database,
       `SELECT version FROM ${PARTITION_VERSION_TABLE_NAME}
        WHERE table_name = ? AND partition_key = ? AND partition_value = ?
        LIMIT 1`,
