@@ -407,7 +407,10 @@ export class RealtimeSubscriptionDO {
       });
       return {
         rejected: true,
-        response: jsonResponse({ evaluated: 0, failed: 0, ok: true }),
+        response: jsonResponse(
+          { evaluated: 0, failed: 0, ok: false },
+          { status: 503 }
+        ),
       };
     }
 

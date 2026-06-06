@@ -1708,9 +1708,19 @@ describe("worker runtime", () => {
       );
 
     now.mockReturnValue(startedAt);
-    await notify();
+    const firstResponse = await notify();
+    const firstBody = (await firstResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
     now.mockReturnValue(startedAt + REALTIME_SCALE_UP_WINDOW_MS);
-    await notify();
+    const secondResponse = await notify();
+    const secondBody = (await secondResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
 
     const activeGeneration = await env.APP_DB.prepare(
       "SELECT generation_id, subscription_shard_count, status FROM _bf_realtime_shard_generations WHERE status = 'active'"
@@ -1725,6 +1735,38 @@ describe("worker runtime", () => {
       status: "active",
       subscription_shard_count: 2,
     });
+    expect(firstResponse.status).toBe(503);
+    expect(firstBody).toEqual({ evaluated: 0, failed: 0, ok: false });
+    expect(secondResponse.status).toBe(503);
+    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: false });
+  });
+
+  it("keeps duplicate realtime notify coalescing successful", async () => {
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const internals = subscriptionDo as unknown as {
+      pendingNotifyEventIds: Set<string>;
+    };
+    internals.pendingNotifyEventIds.add("coalesced-event");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "coalesced-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
   });
 
   it("routes realtime subscribe requests to the connection Durable Object", async () => {
@@ -4929,6 +4971,58 @@ describe("worker runtime", () => {
       "/api/mutation/todos:create",
       {
         body: rpcBody({ ownerToken: "owner-a", text: "retry-notify" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      },
+      worker,
+      { ...env, REALTIME_SUBSCRIPTIONS: subscriptions }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(notifyAttempts).toBe(2);
+    expect(
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_notify_failed"
+      )
+    ).toBe(false);
+  });
+
+  it("retries realtime shard notification backpressure rejection", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const internals = subscriptionDo as unknown as {
+      pendingNotifyEventIds: Set<string>;
+    };
+    let notifyAttempts = 0;
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname !== "/notify") {
+        return Promise.resolve(Response.json({ ok: true }));
+      }
+
+      notifyAttempts += 1;
+      if (notifyAttempts === 1) {
+        for (let index = 0; index < REALTIME_PENDING_WORK_LIMIT; index += 1) {
+          internals.pendingNotifyEventIds.add(`pending-${index}`);
+        }
+      } else {
+        internals.pendingNotifyEventIds.clear();
+      }
+
+      return subscriptionDo.fetch(request);
+    });
+
+    await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken: "owner-a", text: "retry-backpressure" }),
         headers: { authorization: "Bearer owner-a" },
         method: "POST",
       },
