@@ -985,26 +985,51 @@ export class RealtimeConnectionDO {
   private async catchUpActiveSubscriptions(): Promise<void> {
     const afterSequence = this.getReconciliationAfterSequence();
     const targets = await this.subscriptionCatchUpTargets();
-    await Promise.all(
+    const results = await Promise.allSettled(
       targets.map(async (target) => {
-        const response = await target.stub.fetch(
-          "https://baseflare.internal/catch-up",
-          {
-            body: JSON.stringify({
-              afterSequence,
-              shardName: target.shardName,
-            }),
-            headers: JSON_HEADERS,
-            method: "POST",
+        try {
+          const response = await target.stub.fetch(
+            "https://baseflare.internal/catch-up",
+            {
+              body: JSON.stringify({
+                afterSequence,
+                shardName: target.shardName,
+              }),
+              headers: JSON_HEADERS,
+              method: "POST",
+            }
+          );
+          if (!response.ok) {
+            throw new InternalRuntimeError(
+              `Realtime reconciliation failed for shard ${target.shardName} with status ${response.status}`
+            );
           }
-        );
-        if (!response.ok) {
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            error.message.includes(target.shardName)
+          ) {
+            throw error;
+          }
+
           throw new InternalRuntimeError(
-            `Realtime reconciliation failed with status ${response.status}`
+            `Realtime reconciliation failed for shard ${target.shardName}: ${
+              error instanceof Error ? error.message : "unknown error"
+            }`
           );
         }
       })
     );
+    const failedCount = results.filter(
+      (result) => result.status === "rejected"
+    ).length;
+    if (failedCount > 0) {
+      throw new InternalRuntimeError(
+        `Realtime reconciliation failed for ${failedCount} shard${
+          failedCount === 1 ? "" : "s"
+        }`
+      );
+    }
   }
 
   private async scheduleReconciliation(): Promise<void> {

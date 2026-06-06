@@ -3377,6 +3377,92 @@ describe("worker runtime", () => {
     ]);
   });
 
+  it("drops malformed hibernated realtime socket subscriptions without closing the socket", async () => {
+    const warnLog = vi.spyOn(console, "warn").mockImplementation(() => {
+      // Malformed hibernated subscription entries are operator diagnostics.
+    });
+    const registerBodies: Array<{
+      queryName: string;
+      subscriptionId: string;
+    }> = [];
+    const closeCalls: Array<{ code: number; reason: string }> = [];
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      close(code: number, reason: string) {
+        closeCalls.push({ code, reason });
+      },
+      deserializeAttachment() {
+        return {
+          connectionKey: "client-a",
+          connectionName: getRealtimeConnectionShardName("client-a"),
+          latestDeliveredOutboxSequence: null,
+          runtimeId: "runtime:1",
+          subscriptions: [
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-good",
+            },
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              subscriptionId: "sub-bad",
+            },
+          ],
+        };
+      },
+      send() {
+        // No client messages are expected for hibernation restore.
+      },
+    } as unknown as AttachedTestWebSocket;
+
+    new RealtimeConnectionDO(new FakeRealtimeDurableObjectState([socket]), {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          if (new URL(request.url).pathname === "/register") {
+            registerBodies.push(
+              (await request.json()) as {
+                queryName: string;
+                subscriptionId: string;
+              }
+            );
+          }
+
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+      ),
+    });
+
+    await waitFor(() => registerBodies.length === 1);
+
+    expect(closeCalls).toEqual([]);
+    expect(registerBodies).toEqual([
+      expect.objectContaining({
+        queryName: "todos:list",
+        subscriptionId: "sub-good",
+      }),
+    ]);
+    expect(warnLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        connectionKey: "client-a",
+        event: "runtime.realtime_socket_subscription_attachment_dropped",
+        runtimeId: "runtime:1",
+        subscriptionIndex: 1,
+      })
+    );
+  });
+
   it("keeps explicit realtime client ids grouped for delivery", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -4040,6 +4126,99 @@ describe("worker runtime", () => {
     expect(subscriptionRequests.some(({ path }) => path === "/catch-up")).toBe(
       true
     );
+  });
+
+  it("attempts realtime reconciliation catch-up on every shard after partial failures", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const catchUpShardNames: string[] = [];
+    let failSecondShard = false;
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      deserializeAttachment() {
+        return {
+          connectionKey: "client-a",
+          connectionName: getRealtimeConnectionShardName("client-a"),
+          latestDeliveredOutboxSequence: 10,
+          runtimeId: "runtime:1",
+          subscriptions: [
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-a",
+              subscriptionShardName: "subscription:g2:0",
+            },
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-b",
+              subscriptionShardName: "subscription:g2:1",
+            },
+          ],
+        };
+      },
+      send() {
+        // Reconciliation does not send direct client messages in this test.
+      },
+    } as unknown as AttachedTestWebSocket;
+    const state = new FakeRealtimeDurableObjectState([socket]);
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const pathname = new URL(request.url).pathname;
+          if (pathname === "/catch-up") {
+            const body = (await request.json()) as { shardName: string };
+            catchUpShardNames.push(body.shardName);
+            if (failSecondShard && body.shardName === "subscription:g2:1") {
+              return Response.json({ ok: false }, { status: 503 });
+            }
+          }
+
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+      ),
+    });
+
+    await waitFor(() => catchUpShardNames.length >= 2);
+    catchUpShardNames.length = 0;
+    failSecondShard = true;
+    state.alarmTime = null;
+
+    await connectionDo.alarm();
+
+    expect(catchUpShardNames).toEqual([
+      "subscription:g2:0",
+      "subscription:g2:1",
+    ]);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_reconciliation_failed",
+      })
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.reconciliations",
+        tags: { result: "failed" },
+        value: 1,
+      })
+    );
+    expect(state.alarmTime).toBeTypeOf("number");
   });
 
   it("restores realtime subscriptions without serial register round trips", async () => {

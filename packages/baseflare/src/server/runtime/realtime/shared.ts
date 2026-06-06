@@ -222,11 +222,28 @@ export function parseRealtimeSocketAttachment(
     return null;
   }
 
-  const subscriptions = Array.isArray(attachment.subscriptions)
-    ? attachment.subscriptions.map(parseRealtimeSocketSubscription)
-    : [];
-  if (subscriptions.some((subscription) => subscription === null)) {
-    return null;
+  const subscriptions: RealtimeSocketSubscription[] = [];
+  if (Array.isArray(attachment.subscriptions)) {
+    for (const [
+      subscriptionIndex,
+      subscription,
+    ] of attachment.subscriptions.entries()) {
+      const parsedSubscription = parseRealtimeSocketSubscription(subscription);
+      if (parsedSubscription) {
+        subscriptions.push(parsedSubscription);
+        continue;
+      }
+
+      logRuntimeEvent(
+        "warn",
+        "runtime.realtime_socket_subscription_attachment_dropped",
+        {
+          connectionKey: attachment.connectionKey,
+          runtimeId: attachment.runtimeId,
+          subscriptionIndex,
+        }
+      );
+    }
   }
 
   return {
@@ -241,7 +258,7 @@ export function parseRealtimeSocketAttachment(
         ? latestDeliveredOutboxSequence
         : null,
     runtimeId: attachment.runtimeId,
-    subscriptions: subscriptions as RealtimeSocketSubscription[],
+    subscriptions,
   };
 }
 
