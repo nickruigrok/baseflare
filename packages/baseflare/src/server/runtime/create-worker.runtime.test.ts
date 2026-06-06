@@ -2555,7 +2555,11 @@ describe("worker runtime", () => {
     const deliveredIds: string[] = [];
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
-        if (new URL(request.url).pathname === "/deliver") {
+        const path = new URL(request.url).pathname;
+        if (path === "/has-sockets") {
+          return Response.json({ connected: true, ok: true });
+        }
+        if (path === "/deliver") {
           const body = (await request.json()) as {
             deliveries: Array<{ subscriptionId: string }>;
           };
@@ -2675,6 +2679,176 @@ describe("worker runtime", () => {
       subscriptionDo
     ).registrations.get(realtimeRegistrationKey("client-a", "sub-expired"));
     expect(renewedRegistration?.leaseExpiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it("removes expired unchanged realtime registrations with no active sockets", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "stable-disconnected");
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/deliver") {
+          const body = (await request.json()) as {
+            deliveries: Array<{ subscriptionId: string }>;
+          };
+          return Response.json({
+            delivered: body.deliveries.length,
+            deliveredSubscriptions: body.deliveries.map(
+              (item) => item.subscriptionId
+            ),
+            ok: true,
+          });
+        }
+        if (path === "/has-sockets") {
+          return Response.json({ connected: false, ok: true });
+        }
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await createRealtimeOutboxEvent("stable-disconnected-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("stable-disconnected-prime");
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    const registration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+    if (registration) {
+      registration.leaseExpiresAt = Date.now() - 1;
+    }
+
+    await createRealtimeOutboxEvent("stable-disconnected-cleanup", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    const cleanupResponse = await notify("stable-disconnected-cleanup");
+    const cleanupBody = (await cleanupResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(cleanupBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(
+      getRealtimeIndexTestState(subscriptionDo).registrations.has(
+        registrationKey
+      )
+    ).toBe(false);
+  });
+
+  it("backs off expired unchanged realtime registrations when liveness check fails", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "stable-liveness-failure");
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/deliver") {
+          const body = (await request.json()) as {
+            deliveries: Array<{ subscriptionId: string }>;
+          };
+          return Response.json({
+            delivered: body.deliveries.length,
+            deliveredSubscriptions: body.deliveries.map(
+              (item) => item.subscriptionId
+            ),
+            ok: true,
+          });
+        }
+        if (path === "/has-sockets") {
+          return Response.json({ ok: false }, { status: 503 });
+        }
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await createRealtimeOutboxEvent("stable-liveness-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("stable-liveness-prime");
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+    if (registration) {
+      registration.leaseExpiresAt = Date.now() - 1;
+    }
+
+    await createRealtimeOutboxEvent("stable-liveness-failure", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    const failedResponse = await notify("stable-liveness-failure");
+    const failedBody = (await failedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
   });
 
   it("preserves lastResultJson when adopting a migrated registration", async () => {
@@ -8586,24 +8760,19 @@ describe("worker runtime", () => {
       ok: boolean;
     };
     const indexState = getRealtimeIndexTestState(subscriptionDo);
-    const backedOffRegistrations = ["sub-a", "sub-b"].map((subscriptionId) =>
+    const registrations = ["sub-a", "sub-b"].map((subscriptionId) =>
       indexState.registrations.get(
         realtimeRegistrationKey("client-a", subscriptionId)
       )
     );
 
     expect(firstBody).toEqual({ evaluated: 0, failed: 2, ok: true });
-    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: true });
-    for (const registration of backedOffRegistrations) {
-      expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(secondBody).toEqual({ evaluated: 0, failed: 2, ok: true });
+    for (const registration of registrations) {
+      expect(registration?.reEvaluationRetryAt).toBeUndefined();
     }
-    expect(deliveries).toHaveLength(1);
+    expect(deliveries).toHaveLength(2);
 
-    for (const registration of backedOffRegistrations) {
-      if (registration) {
-        registration.reEvaluationRetryAt = Date.now() - 1;
-      }
-    }
     const retriedResponse = await notify();
     const retriedBody = (await retriedResponse.json()) as {
       evaluated: number;
@@ -8612,7 +8781,7 @@ describe("worker runtime", () => {
     };
 
     expect(retriedBody).toEqual({ evaluated: 0, failed: 2, ok: true });
-    expect(deliveries).toHaveLength(2);
+    expect(deliveries).toHaveLength(3);
   });
 
   it("does not scale up from no-target realtime delivery batches", async () => {
@@ -8876,7 +9045,7 @@ describe("worker runtime", () => {
     );
   });
 
-  it("retries realtime delivery when no socket receives the result", async () => {
+  it("retries realtime delivery when no socket receives the result without backoff", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const connections = new FakeDurableObjectNamespace(() =>
       Promise.resolve(Response.json({ delivered: 0, ok: true }))
@@ -8929,26 +9098,11 @@ describe("worker runtime", () => {
     };
     const registrationKey = realtimeRegistrationKey("client-a", "sub-1");
     const indexState = getRealtimeIndexTestState(subscriptionDo);
-    const backedOffRegistration = indexState.registrations.get(registrationKey);
+    const registration = indexState.registrations.get(registrationKey);
 
     expect(firstBody).toEqual({ evaluated: 0, failed: 1, ok: true });
-    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: true });
-    expect(backedOffRegistration?.reEvaluationRetryAt).toBeGreaterThan(
-      Date.now()
-    );
-    expect(connections.requests).toHaveLength(1);
-
-    if (backedOffRegistration) {
-      backedOffRegistration.reEvaluationRetryAt = Date.now() - 1;
-    }
-    const retriedResponse = await notify();
-    const retriedBody = (await retriedResponse.json()) as {
-      evaluated: number;
-      failed: number;
-      ok: boolean;
-    };
-
-    expect(retriedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(secondBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(registration?.reEvaluationRetryAt).toBeUndefined();
     expect(connections.requests).toHaveLength(2);
   });
 

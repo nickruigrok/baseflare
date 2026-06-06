@@ -116,6 +116,14 @@ export class RealtimeConnectionDO {
       return jsonResponse({ ...delivered, ok: true });
     }
 
+    if (request.method === "POST" && url.pathname === "/has-sockets") {
+      const message = await readJsonObject(request);
+      const connectionKey = getStringField(message, "connectionKey");
+      const connected =
+        (this.socketsByConnectionKey.get(connectionKey)?.size ?? 0) > 0;
+      return jsonResponse({ connected, ok: true });
+    }
+
     if (request.method === "POST" && url.pathname === "/subscription-moved") {
       const message = await readJsonObject(request);
       this.updateSubscriptionShardName(message);

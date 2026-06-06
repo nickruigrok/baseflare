@@ -623,8 +623,7 @@ export class RealtimeSubscriptionDO {
         database
       );
       if (!delivery) {
-        this.clearRegistrationReEvaluationBackoff(registration);
-        return { evaluated: 1, failed: 0, skipped: 0 };
+        return await this.handleUnchangedRegistration(registration);
       }
 
       shouldRelease = false;
@@ -662,6 +661,54 @@ export class RealtimeSubscriptionDO {
     registration: StoredRealtimeRegistration
   ): void {
     registration.reEvaluationRetryAt = undefined;
+  }
+
+  private async handleUnchangedRegistration(
+    registration: StoredRealtimeRegistration
+  ): Promise<{
+    readonly evaluated: number;
+    readonly failed: number;
+    readonly skipped: number;
+  }> {
+    if (registration.leaseExpiresAt > Date.now()) {
+      this.clearRegistrationReEvaluationBackoff(registration);
+      return { evaluated: 1, failed: 0, skipped: 0 };
+    }
+
+    try {
+      if (await this.hasActiveConnectionSockets(registration)) {
+        registration.leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
+        this.clearRegistrationReEvaluationBackoff(registration);
+        return { evaluated: 1, failed: 0, skipped: 0 };
+      }
+
+      this.deleteExpiredRegistration(registration);
+      return { evaluated: 1, failed: 0, skipped: 0 };
+    } catch (error) {
+      this.backOffRegistrationReEvaluation(registration);
+      this.logReEvaluationFailure(registration, error);
+      return { evaluated: 0, failed: 1, skipped: 0 };
+    }
+  }
+
+  private async hasActiveConnectionSockets(
+    registration: StoredRealtimeRegistration
+  ): Promise<boolean> {
+    const response = await this.env.REALTIME_CONNECTIONS.get(
+      this.env.REALTIME_CONNECTIONS.idFromName(registration.connectionName)
+    ).fetch("https://baseflare.internal/has-sockets", {
+      body: JSON.stringify({ connectionKey: registration.connectionKey }),
+      headers: JSON_HEADERS,
+      method: "POST",
+    });
+    if (!response.ok) {
+      throw new InternalRuntimeError(
+        `Realtime socket liveness check failed with status ${response.status}`
+      );
+    }
+
+    const result = (await response.json()) as { connected?: unknown };
+    return result.connected === true;
   }
 
   private async flushPendingDeliveries(
@@ -749,7 +796,8 @@ export class RealtimeSubscriptionDO {
       const stateUpdates: Promise<void>[] = [];
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
-          if (!this.deleteExpiredRegistration(delivery.registration)) {
+          const deleted = this.deleteExpiredRegistration(delivery.registration);
+          if (!(deleted || noTargetSockets)) {
             this.backOffRegistrationReEvaluation(delivery.registration);
           }
           continue;
