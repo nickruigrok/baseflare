@@ -848,7 +848,7 @@ export class RealtimeConnectionDO {
       }
 
       if (attachment.latestDeliveredOutboxSequence == null) {
-        return null;
+        continue;
       }
 
       afterSequence =

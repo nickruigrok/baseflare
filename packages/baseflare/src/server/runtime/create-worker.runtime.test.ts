@@ -50,7 +50,9 @@ import {
   fetchRealtimeVersionSnapshot,
 } from "./realtime/shards";
 import {
+  configuredRealtimeRuntimes,
   configureRealtimeRuntime,
+  REALTIME_CONFIGURED_RUNTIME_LIMIT,
   resetRealtimeRuntimeStateForTest,
 } from "./realtime/shared";
 import { RealtimeSubscriptionDO } from "./realtime/subscription-do";
@@ -369,6 +371,13 @@ const realtimeDependencyTrackingQuery = query({
       .filter({ ownerToken })
       .order("text", "asc")
       .collect();
+  },
+});
+
+const realtimeNoReadQuery = query({
+  args: { label: v.string() },
+  handler(_ctx, args) {
+    return [{ text: args.label }];
   },
 });
 
@@ -725,6 +734,11 @@ function createManifest(
       {
         definition: realtimeDependencyTrackingQuery,
         exportName: "dependencyTracking",
+        modulePath: "realtime",
+      },
+      {
+        definition: realtimeNoReadQuery,
+        exportName: "noRead",
         modulePath: "realtime",
       },
       {
@@ -1309,6 +1323,24 @@ describe("worker runtime", () => {
     expect(table?.sql).toContain("_rev INTEGER");
     expect(version?.version).toBe(0);
     expect(index?.name).toBe("todos_by_owner");
+  });
+
+  it("bounds configured realtime runtime state", () => {
+    resetRealtimeRuntimeStateForTest();
+    let latestRuntimeId = "";
+    for (
+      let index = 0;
+      index < REALTIME_CONFIGURED_RUNTIME_LIMIT + 2;
+      index += 1
+    ) {
+      latestRuntimeId = createRealtimeRuntimeId();
+    }
+
+    expect(configuredRealtimeRuntimes.size).toBe(
+      REALTIME_CONFIGURED_RUNTIME_LIMIT
+    );
+    expect(configuredRealtimeRuntimes.has("runtime:1")).toBe(false);
+    expect(configuredRealtimeRuntimes.has(latestRuntimeId)).toBe(true);
   });
 
   it("applies realtime outbox metadata", async () => {
@@ -2177,6 +2209,9 @@ describe("worker runtime", () => {
   });
 
   it("keeps source realtime registrations active when shard adoption fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
     const runtimeId = createRealtimeRuntimeId();
     await env.APP_DB.prepare(
       "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
@@ -2247,10 +2282,30 @@ describe("worker runtime", () => {
       })
     );
     const registrationsBody = (await registrationsResponse.json()) as {
-      registrations: unknown[];
+      registrations: Array<{ reEvaluationRetryAt?: number }>;
     };
 
     expect(registrationsBody.registrations).toHaveLength(1);
+    expect(
+      registrationsBody.registrations[0]?.reEvaluationRetryAt
+    ).toBeGreaterThan(Date.now());
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_adoption_failed",
+        shardName: expect.any(String),
+        status: 500,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "InternalRuntimeError",
+        event: "runtime.realtime_registration_state_update_failed",
+        subscriptionId: "sub-a",
+      })
+    );
   });
 
   it("keeps source realtime registrations active when shard move rollback succeeds", async () => {
@@ -4943,6 +4998,76 @@ describe("worker runtime", () => {
     );
   });
 
+  it("retries realtime outbox cleanup after a cleanup failure", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const expiredAt = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    const recentAt = Date.now();
+    await createRealtimeOutboxEvent("retry-expired-outbox-event", expiredAt);
+    await createRealtimeOutboxEvent("retry-recent-outbox-event", recentAt);
+    const latest = await env.APP_DB.prepare(
+      "SELECT MAX(sequence) AS sequence FROM _bf_realtime_outbox"
+    ).first<{ sequence: number }>();
+    let failCursorRead = true;
+    let cursorReadAttempts = 0;
+    const flakyDatabase = {
+      batch: env.APP_DB.batch.bind(env.APP_DB),
+      prepare(sql: string) {
+        if (sql.includes("MIN(last_processed_outbox_sequence)")) {
+          cursorReadAttempts += 1;
+          if (failCursorRead) {
+            failCursorRead = false;
+            throw new Error("cursor read unavailable");
+          }
+        }
+
+        return env.APP_DB.prepare(sql);
+      },
+    } as unknown as D1Database;
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: flakyDatabase,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const catchUp = () =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/catch-up", {
+          body: JSON.stringify({ afterSequence: latest?.sequence, limit: 10 }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await catchUp();
+    await catchUp();
+
+    const remaining = await env.APP_DB.prepare(
+      "SELECT COUNT(*) AS count FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("retry-expired-outbox-event")
+      .first<{ count: number }>();
+
+    expect(cursorReadAttempts).toBe(2);
+    expect(remaining?.count).toBe(0);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "DatabaseRuntimeError",
+        event: "runtime.realtime_outbox_cleanup_failed",
+      })
+    );
+    expect(info).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: "baseflare.runtime.realtime.outbox_cleanups",
+        tags: { result: "cleaned" },
+      })
+    );
+  });
+
   it("re-evaluates active realtime registrations during catch-up", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
@@ -5179,6 +5304,121 @@ describe("worker runtime", () => {
     ]);
   });
 
+  it("uses the best available delivered sequence for live reconciliation", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const catchUpBodies: Array<{ afterSequence: number | null }> = [];
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          catchUpBodies.push(
+            (await request.json()) as { afterSequence: number | null }
+          );
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+      ),
+    });
+    const anchoredSocket = { send: () => undefined } as unknown as WebSocket;
+    const freshSocket = { send: () => undefined } as unknown as WebSocket;
+    const internals = connectionDo as unknown as {
+      socketStates: Map<WebSocket, { attachment: Record<string, unknown> }>;
+    };
+    const subscription = {
+      args: { ownerToken: "owner-a" },
+      epoch: 1,
+      queryName: "todos:list",
+      subscriptionId: "sub-a",
+      subscriptionShardName: getRealtimeSubscriptionShardName(),
+    };
+    internals.socketStates.set(anchoredSocket, {
+      attachment: {
+        authorizationHeader: "Bearer owner-a",
+        connectionKey: "client-a",
+        connectionName: getRealtimeConnectionShardName("client-a"),
+        latestDeliveredOutboxSequence: 42,
+        runtimeId,
+        subscriptions: [subscription],
+      },
+    });
+    internals.socketStates.set(freshSocket, {
+      attachment: {
+        authorizationHeader: "Bearer owner-b",
+        connectionKey: "client-b",
+        connectionName: getRealtimeConnectionShardName("client-b"),
+        latestDeliveredOutboxSequence: null,
+        runtimeId,
+        subscriptions: [
+          {
+            ...subscription,
+            subscriptionId: "sub-b",
+          },
+        ],
+      },
+    });
+
+    await connectionDo.alarm();
+
+    expect(catchUpBodies).toEqual([
+      expect.objectContaining({ afterSequence: 42 }),
+    ]);
+  });
+
+  it("uses conservative live reconciliation when no socket has a delivered sequence", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const catchUpBodies: Array<{ afterSequence: number | null }> = [];
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          catchUpBodies.push(
+            (await request.json()) as { afterSequence: number | null }
+          );
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+      ),
+    });
+    const socket = { send: () => undefined } as unknown as WebSocket;
+    const internals = connectionDo as unknown as {
+      socketStates: Map<WebSocket, { attachment: Record<string, unknown> }>;
+    };
+    internals.socketStates.set(socket, {
+      attachment: {
+        authorizationHeader: "Bearer owner-a",
+        connectionKey: "client-a",
+        connectionName: getRealtimeConnectionShardName("client-a"),
+        latestDeliveredOutboxSequence: null,
+        runtimeId,
+        subscriptions: [
+          {
+            args: { ownerToken: "owner-a" },
+            epoch: 1,
+            queryName: "todos:list",
+            subscriptionId: "sub-a",
+            subscriptionShardName: getRealtimeSubscriptionShardName(),
+          },
+        ],
+      },
+    });
+
+    await connectionDo.alarm();
+
+    expect(catchUpBodies).toEqual([
+      expect.objectContaining({ afterSequence: null }),
+    ]);
+  });
+
   it("skips realtime notify re-evaluation for unrelated partitions", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
@@ -5313,6 +5553,80 @@ describe("worker runtime", () => {
         .get(todoOwnerPartitionId("owner-a"))
         ?.has(registrationKey)
     ).toBe(true);
+  });
+
+  it("keeps empty realtime dependency snapshots conservatively indexed", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          deliveries.push(delivery);
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { label: "stable" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:noRead",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createRealtimeOutboxEvent("no-read-prime", Date.now(), {
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "no-read-prime" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    expect(
+      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+    ).toBe(true);
+    expect(indexState.registrationKeysByTable.size).toBe(0);
+    expect(indexState.registrationKeysByPartition.size).toBe(0);
+
+    await createRealtimeOutboxEvent("no-read-follow-up", Date.now(), {
+      tables: ["labels"],
+    });
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "no-read-follow-up" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(await response.json()).toEqual({
+      evaluated: 1,
+      failed: 0,
+      ok: true,
+    });
+    expect(deliveries).toHaveLength(1);
   });
 
   it("routes broad table events to partition-indexed realtime registrations", async () => {

@@ -777,6 +777,9 @@ export class RealtimeSubscriptionDO {
         delivery.versionSnapshot
       );
     } catch (error) {
+      if (!this.deleteExpiredRegistration(delivery.registration)) {
+        this.backOffRegistrationReEvaluation(delivery.registration);
+      }
       logRuntimeEvent(
         "error",
         "runtime.realtime_registration_state_update_failed",
@@ -853,7 +856,6 @@ export class RealtimeSubscriptionDO {
       return;
     }
 
-    this.lastOutboxCleanupAt = now;
     try {
       const protectedSequence = await fetchOldestRealtimeShardCursor(
         this.database
@@ -868,6 +870,7 @@ export class RealtimeSubscriptionDO {
         result:
           deleted >= REALTIME_OUTBOX_CLEANUP_LIMIT ? "limited" : "cleaned",
       });
+      this.lastOutboxCleanupAt = now;
     } catch (error) {
       logRuntimeEvent("error", "runtime.realtime_outbox_cleanup_failed", {
         errorName: error instanceof Error ? error.name : typeof error,
@@ -955,6 +958,12 @@ export class RealtimeSubscriptionDO {
       targets.all ||
       !registration.dependencies ||
       !registration.versionSnapshot
+    ) {
+      return true;
+    }
+    if (
+      registration.dependencies.tables.size === 0 &&
+      registration.dependencies.partitions.size === 0
     ) {
       return true;
     }
@@ -1118,7 +1127,11 @@ export class RealtimeSubscriptionDO {
     registrationKey: string,
     registration: StoredRealtimeRegistration
   ): void {
-    if (!registration.dependencies) {
+    if (
+      !registration.dependencies ||
+      (registration.dependencies.tables.size === 0 &&
+        registration.dependencies.partitions.size === 0)
+    ) {
       this.registrationKeysWithoutDependencies.add(registrationKey);
       return;
     }
@@ -1192,7 +1205,9 @@ export class RealtimeSubscriptionDO {
           subscriptionId: registration.subscriptionId,
         }
       );
-      return;
+      throw new InternalRuntimeError(
+        `Realtime registration adoption failed with status ${adoptionResponse.status}`
+      );
     }
 
     const connectionUpdateResponse = await this.env.REALTIME_CONNECTIONS.get(

@@ -19,18 +19,32 @@ import {
 
 let nextRealtimeRuntimeId = 0;
 
+export const REALTIME_CONFIGURED_RUNTIME_LIMIT = 1024;
+
 export const configuredRealtimeRuntimes = new Map<string, RealtimeRuntime>();
 
 export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
   nextRealtimeRuntimeId += 1;
   const runtimeId = `runtime:${nextRealtimeRuntimeId}`;
   configuredRealtimeRuntimes.set(runtimeId, runtime);
+  trimConfiguredRealtimeRuntimes();
   return runtimeId;
 }
 
 export function resetRealtimeRuntimeStateForTest(): void {
   configuredRealtimeRuntimes.clear();
   nextRealtimeRuntimeId = 0;
+}
+
+function trimConfiguredRealtimeRuntimes(): void {
+  while (configuredRealtimeRuntimes.size > REALTIME_CONFIGURED_RUNTIME_LIMIT) {
+    const oldestRuntimeId = configuredRealtimeRuntimes.keys().next().value;
+    if (typeof oldestRuntimeId !== "string") {
+      return;
+    }
+
+    configuredRealtimeRuntimes.delete(oldestRuntimeId);
+  }
 }
 
 export function jsonResponse(
