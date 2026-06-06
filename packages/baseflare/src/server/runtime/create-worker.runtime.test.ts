@@ -2883,6 +2883,129 @@ describe("worker runtime", () => {
     expect(clientBMessages).toEqual([]);
   });
 
+  it("repairs malformed hibernated realtime socket attachments with isolated keys", async () => {
+    const registerBodies: Array<{
+      connectionKey: string;
+      subscriptionId: string;
+    }> = [];
+    const unregisterBodies: Array<{
+      connectionKey: string;
+      subscriptionId: string;
+    }> = [];
+    const socketMessages = new Map<AttachedTestWebSocket, unknown[]>();
+    const serializedAttachments = new WeakMap<AttachedTestWebSocket, unknown>();
+    const createMalformedSocket = (): AttachedTestWebSocket => {
+      const messages: unknown[] = [];
+      const socket = {
+        accept() {
+          // Hibernated sockets are already accepted.
+        },
+        deserializeAttachment() {
+          return { malformed: true };
+        },
+        send(payload: string) {
+          messages.push(JSON.parse(payload) as unknown);
+        },
+        serializeAttachment(attachment: unknown) {
+          serializedAttachments.set(socket, attachment);
+        },
+      } as AttachedTestWebSocket;
+      socketMessages.set(socket, messages);
+      return socket;
+    };
+    const socketA = createMalformedSocket();
+    const socketB = createMalformedSocket();
+    const connectionDo = new RealtimeConnectionDO(
+      new FakeRealtimeDurableObjectState([socketA, socketB]),
+      {
+        APP_DB: env.APP_DB,
+        REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+        REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+          async (_name, request) => {
+            const path = new URL(request.url).pathname;
+            if (path === "/register") {
+              registerBodies.push(
+                (await request.json()) as {
+                  connectionKey: string;
+                  subscriptionId: string;
+                }
+              );
+            }
+            if (path === "/unregister") {
+              unregisterBodies.push(
+                (await request.json()) as {
+                  connectionKey: string;
+                  subscriptionId: string;
+                }
+              );
+            }
+            return Response.json({ ok: true });
+          }
+        ),
+      }
+    );
+    const subscribe = (socket: AttachedTestWebSocket, subscriptionId: string) =>
+      connectionDo.webSocketMessage(
+        socket,
+        JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId,
+          type: "subscribe",
+        })
+      );
+
+    await subscribe(socketA, "sub-a");
+    await subscribe(socketB, "sub-b");
+
+    const [connectionKeyA, connectionKeyB] = registerBodies.map(
+      ({ connectionKey }) => connectionKey
+    );
+    expect(connectionKeyA).toBeTypeOf("string");
+    expect(connectionKeyB).toBeTypeOf("string");
+    expect(connectionKeyA).not.toBe("default");
+    expect(connectionKeyB).not.toBe("default");
+    expect(connectionKeyA).not.toBe(connectionKeyB);
+    expect(serializedAttachments.get(socketA)).toEqual(
+      expect.objectContaining({ connectionKey: connectionKeyA })
+    );
+    expect(serializedAttachments.get(socketB)).toEqual(
+      expect.objectContaining({ connectionKey: connectionKeyB })
+    );
+
+    await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver", {
+        body: JSON.stringify({
+          connectionKey: connectionKeyA,
+          deliveries: [
+            { result: [{ text: "isolated" }], subscriptionId: "sub-a" },
+          ],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const socketADeliveries = socketMessages
+      .get(socketA)
+      ?.filter((message) => (message as { type?: string }).type === "delivery");
+    const socketBDeliveries = socketMessages
+      .get(socketB)
+      ?.filter((message) => (message as { type?: string }).type === "delivery");
+
+    expect(socketADeliveries).toHaveLength(1);
+    expect(socketBDeliveries).toEqual([]);
+
+    await connectionDo.webSocketMessage(
+      socketA,
+      JSON.stringify({ subscriptionId: "sub-a", type: "unsubscribe" })
+    );
+
+    expect(unregisterBodies).toEqual([
+      { connectionKey: connectionKeyA, subscriptionId: "sub-a" },
+    ]);
+  });
+
   it("keeps explicit realtime client ids grouped for delivery", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -3427,12 +3550,20 @@ describe("worker runtime", () => {
     );
     expect(state.alarmTime).toBeTypeOf("number");
 
+    state.alarmTime = null;
+    await connectionDo.alarm();
+
+    expect(state.alarmTime).toBeTypeOf("number");
+    expect(
+      subscriptionRequests.filter(({ path }) => path === "/register")
+    ).toHaveLength(2);
+
     rejectRegisters = false;
     await connectionDo.alarm();
 
     expect(
       subscriptionRequests.filter(({ path }) => path === "/register")
-    ).toHaveLength(2);
+    ).toHaveLength(3);
     expect(subscriptionRequests.some(({ path }) => path === "/catch-up")).toBe(
       true
     );
@@ -7453,6 +7584,7 @@ describe("worker runtime", () => {
   });
 
   it("splits large realtime delivery groups into bounded batches", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
     const connections = new FakeDurableObjectNamespace(
@@ -7521,6 +7653,102 @@ describe("worker runtime", () => {
       REALTIME_DELIVERY_BATCH_SIZE
     );
     expect(getRealtimeDeliveryItems(deliveries[1])).toHaveLength(1);
+    const deliveryBatchMetrics = info.mock.calls.filter(
+      ([, payload]) =>
+        (payload as { metric?: string }).metric ===
+        "baseflare.runtime.realtime.delivery_batches"
+    );
+    expect(deliveryBatchMetrics).toHaveLength(1);
+    expect(deliveryBatchMetrics[0]?.[1]).toEqual(
+      expect.objectContaining({
+        tags: { result: "delivered" },
+        value: 1,
+      })
+    );
+  });
+
+  it("emits one undelivered metric for a partially failed chunked realtime delivery group", async () => {
+    const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        deliveries.push(delivery);
+        if (items.length === REALTIME_DELIVERY_BATCH_SIZE) {
+          return Response.json({ ok: false }, { status: 500 });
+        }
+
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "todos:list",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    for (let index = 0; index < REALTIME_DELIVERY_BATCH_SIZE + 1; index += 1) {
+      await register(`sub-${index}`);
+    }
+    await createTodoViaRpc("owner-a", "partially-failed-chunked-delivery");
+    await createRealtimeOutboxEvent("partially-failed-chunked-delivery-event");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "partially-failed-chunked-delivery-event",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    const deliveryBatchMetrics = info.mock.calls.filter(
+      ([, payload]) =>
+        (payload as { metric?: string }).metric ===
+        "baseflare.runtime.realtime.delivery_batches"
+    );
+
+    expect(body).toEqual({
+      evaluated: 1,
+      failed: REALTIME_DELIVERY_BATCH_SIZE,
+      ok: true,
+    });
+    expect(deliveries).toHaveLength(2);
+    expect(deliveryBatchMetrics).toHaveLength(1);
+    expect(deliveryBatchMetrics[0]?.[1]).toEqual(
+      expect.objectContaining({
+        tags: { result: "undelivered" },
+        value: 1,
+      })
+    );
   });
 
   it("retries undelivered items from a partially acknowledged realtime batch", async () => {

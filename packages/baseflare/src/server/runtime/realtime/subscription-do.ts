@@ -663,6 +663,9 @@ export class RealtimeSubscriptionDO {
           evaluated += result.evaluated;
           failed += result.failed;
         }
+        emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
+          result: failed === 0 ? "delivered" : "undelivered",
+        });
 
         return { evaluated, failed };
       })
@@ -736,9 +739,6 @@ export class RealtimeSubscriptionDO {
         stateUpdates.push(this.updateDeliveredRegistrationState(delivery));
       }
       await Promise.allSettled(stateUpdates);
-      emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
-        result: deliveredAll ? "delivered" : "undelivered",
-      });
       this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
       return {
         evaluated: deliveredSubscriptions.size,
@@ -752,9 +752,6 @@ export class RealtimeSubscriptionDO {
         }
         this.logReEvaluationFailure(delivery.registration, error);
       }
-      emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
-        result: "undelivered",
-      });
       this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
       return { evaluated: 0, failed: group.deliveries.length };
     } finally {

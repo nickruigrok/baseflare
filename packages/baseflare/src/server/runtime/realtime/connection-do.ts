@@ -274,8 +274,7 @@ export class RealtimeConnectionDO {
     socket: RuntimeWebSocket
   ): Promise<void> {
     const subscriptionId = getStringField(message, "subscriptionId");
-    const connectionKey =
-      this.getSocketAttachment(socket)?.connectionKey ?? "default";
+    const connectionKey = this.ensureSocketAttachment(socket).connectionKey;
     const existingSubscription = this.getSocketSubscription(
       socket,
       subscriptionId
@@ -435,19 +434,23 @@ export class RealtimeConnectionDO {
     socket?: RuntimeWebSocket
   ): RealtimeRegistration {
     const subscriptionId = getStringField(message, "subscriptionId");
-    const attachment = socket ? this.getSocketAttachment(socket) : undefined;
-    const connectionKey = attachment?.connectionKey ?? "default";
+    const attachment = socket
+      ? this.ensureSocketAttachment(socket)
+      : createRealtimeSocketAttachment({
+          authorizationHeader: undefined,
+          connectionKey: crypto.randomUUID(),
+          runtimeId: "",
+        });
+    const connectionKey = attachment.connectionKey;
     return {
       args: message.args ?? {},
-      authorizationHeader: attachment?.authorizationHeader,
+      authorizationHeader: attachment.authorizationHeader,
       connectionKey,
-      connectionName:
-        attachment?.connectionName ??
-        getRealtimeConnectionShardName(connectionKey),
+      connectionName: attachment.connectionName,
       epoch: getEpoch(message.epoch),
       leaseExpiresAt: Date.now() + REALTIME_LEASE_MS,
       queryName: getStringField(message, "queryName"),
-      runtimeId: attachment?.runtimeId ?? "",
+      runtimeId: attachment.runtimeId,
       subscriptionId,
     };
   }
@@ -806,6 +809,24 @@ export class RealtimeConnectionDO {
     );
   }
 
+  private ensureSocketAttachment(
+    socket: RuntimeWebSocket
+  ): RealtimeSocketAttachment {
+    const attachment = this.getSocketAttachment(socket);
+    if (attachment) {
+      this.addSocket(socket, attachment);
+      return attachment;
+    }
+
+    const repairedAttachment = createRealtimeSocketAttachment({
+      authorizationHeader: undefined,
+      connectionKey: crypto.randomUUID(),
+      runtimeId: "",
+    });
+    this.addSocket(socket, repairedAttachment);
+    return repairedAttachment;
+  }
+
   private setSocketAttachment(
     socket: RuntimeWebSocket,
     attachment: RealtimeSocketAttachment
@@ -881,6 +902,7 @@ export class RealtimeConnectionDO {
           reconcileAfterRestore: false,
         });
         if (restoreResult.rejected > 0) {
+          await this.scheduleReconciliation();
           return;
         }
       }
