@@ -218,6 +218,7 @@ export class RealtimeSubscriptionDO {
     const body = await readJsonObject(request);
     this.setCurrentShardName(getOptionalStringField(body, "shardName"));
     const eventId = getStringField(body, "eventId");
+    const outboxBookmark = getOptionalStringField(body, "outboxBookmark");
     const backpressureResponse = this.tryReserveNotifyEvent(eventId);
     if (backpressureResponse) {
       if (backpressureResponse.rejected) {
@@ -227,7 +228,10 @@ export class RealtimeSubscriptionDO {
     }
 
     try {
-      const eventLookup = await this.fetchNotifyOutboxEvent(eventId);
+      const eventLookup = await this.fetchNotifyOutboxEvent(
+        eventId,
+        outboxBookmark
+      );
       if (eventLookup.status === "malformed") {
         return jsonResponse({ evaluated: 0, failed: 0, ok: true });
       }
@@ -248,12 +252,14 @@ export class RealtimeSubscriptionDO {
       }
 
       const { event } = eventLookup;
-      await this.advanceLastProcessedOutboxSequence(event.sequence);
       this.lastOutboxLagMs = emitOutboxLagMetric("notify", [event]);
       const result = await this.reEvaluateActiveRegistrations(
         createRealtimeAffectedTargets([event]),
         "notify"
       );
+      // Advance after evaluation so an unexpected evaluation failure cannot
+      // make this shard permanently skip the event.
+      await this.advanceLastProcessedOutboxSequence(event.sequence);
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({ ...result, ok: true });
@@ -262,24 +268,31 @@ export class RealtimeSubscriptionDO {
     }
   }
 
-  private async fetchNotifyOutboxEvent(eventId: string): Promise<
+  private async fetchNotifyOutboxEvent(
+    eventId: string,
+    outboxBookmark?: string
+  ): Promise<
     | {
         readonly event: RealtimeSequencedOutboxEvent;
         readonly status: "found";
       }
     | { readonly status: "malformed" | "missing" }
   > {
+    const database =
+      outboxBookmark && this.database.withSession
+        ? this.database.withSession(outboxBookmark)
+        : this.database;
     for (
       let attempt = 1;
       attempt <= REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS;
       attempt += 1
     ) {
-      const event = await fetchRealtimeOutboxEventById(this.database, eventId);
+      const event = await fetchRealtimeOutboxEventById(database, eventId);
       if (event) {
         return { event, status: "found" };
       }
 
-      if (await fetchRealtimeOutboxEventRowExists(this.database, eventId)) {
+      if (await fetchRealtimeOutboxEventRowExists(database, eventId)) {
         return { status: "malformed" };
       }
 

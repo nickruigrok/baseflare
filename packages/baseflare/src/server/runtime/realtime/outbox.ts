@@ -102,13 +102,14 @@ export function createRealtimeMutationNotifier(
 
   return {
     enabled: true,
-    notify(events) {
+    notify(events, options) {
       for (const event of events) {
         ctx.waitUntil(
           notifyRealtimeSubscriptionShards(
             env.APP_DB,
             subscriptionNamespace,
-            event
+            event,
+            options?.outboxBookmark ?? null
           ).catch((error: unknown) => {
             logRuntimeEvent("error", "runtime.realtime_notify_failed", {
               errorName: error instanceof Error ? error.name : typeof error,
@@ -124,7 +125,8 @@ export function createRealtimeMutationNotifier(
 async function notifyRealtimeSubscriptionShards(
   database: Pick<RuntimeDatabase, "prepare">,
   namespace: DurableObjectNamespace,
-  event: RealtimeOutboxEvent
+  event: RealtimeOutboxEvent,
+  outboxBookmark: string | null
 ): Promise<void> {
   const generations = await fetchRoutableRealtimeShardGenerations(database);
   const stubs = getRealtimeSubscriptionStubs(
@@ -134,16 +136,19 @@ async function notifyRealtimeSubscriptionShards(
   );
   await Promise.all(
     stubs.map(({ generation, shardName, stub }) =>
-      notifyRealtimeSubscriptionShard(stub, event.eventId, shardName).catch(
-        (error: unknown) => {
-          logRuntimeEvent("error", "runtime.realtime_notify_failed", {
-            errorName: error instanceof Error ? error.name : typeof error,
-            eventId: event.eventId,
-            generationId: generation.generationId,
-            shardName,
-          });
-        }
-      )
+      notifyRealtimeSubscriptionShard(
+        stub,
+        event.eventId,
+        shardName,
+        outboxBookmark
+      ).catch((error: unknown) => {
+        logRuntimeEvent("error", "runtime.realtime_notify_failed", {
+          errorName: error instanceof Error ? error.name : typeof error,
+          eventId: event.eventId,
+          generationId: generation.generationId,
+          shardName,
+        });
+      })
     )
   );
 }
@@ -151,12 +156,13 @@ async function notifyRealtimeSubscriptionShards(
 async function notifyRealtimeSubscriptionShard(
   stub: DurableObjectStub,
   eventId: string,
-  shardName: string
+  shardName: string,
+  outboxBookmark: string | null
 ): Promise<void> {
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
       const response = await stub.fetch("https://baseflare.internal/notify", {
-        body: JSON.stringify({ eventId, shardName }),
+        body: JSON.stringify({ eventId, outboxBookmark, shardName }),
         headers: JSON_HEADERS,
         method: "POST",
       });

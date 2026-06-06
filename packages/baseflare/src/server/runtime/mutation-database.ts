@@ -83,7 +83,9 @@ import type {
 } from "./realtime/types";
 import type { D1DatabaseSession, D1Result, RuntimeDatabase } from "./types";
 
-type SessionDatabase = Pick<RuntimeDatabase, "batch" | "prepare">;
+type SessionDatabase = Pick<D1DatabaseSession, "batch" | "prepare"> & {
+  readonly getBookmark?: () => string | null;
+};
 
 interface PendingMutationWrite {
   readonly baseRev?: number;
@@ -632,7 +634,10 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
     try {
       const results = await this.database.batch(statements);
       this.validateCommitResults(operations, results);
-      this.notifyRealtimeOutboxEvents(operations);
+      this.notifyRealtimeOutboxEvents(
+        operations,
+        this.database.getBookmark?.() ?? null
+      );
     } catch (error) {
       if (isRetryableConflict(error)) {
         recordOccConflictRetryMetrics(conflictMetricEvents);
@@ -1519,7 +1524,8 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
   }
 
   private notifyRealtimeOutboxEvents(
-    operations: readonly CommitOperation[]
+    operations: readonly CommitOperation[],
+    outboxBookmark: string | null
   ): void {
     const events = operations.flatMap((operation) =>
       operation.type === "insert-realtime-outbox" ? [operation.event] : []
@@ -1528,7 +1534,7 @@ export class MutationDatabase implements DatabaseWriter<RuntimeDocument> {
       return;
     }
 
-    this.realtime?.notify(events);
+    this.realtime?.notify(events, { outboxBookmark });
   }
 
   private validateCommitChangeCount(

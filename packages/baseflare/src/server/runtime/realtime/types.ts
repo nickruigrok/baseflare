@@ -38,7 +38,10 @@ export interface RealtimeSequencedOutboxEvent extends RealtimeOutboxEvent {
 
 export interface RealtimeMutationNotifier {
   readonly enabled: true;
-  notify(events: readonly RealtimeOutboxEvent[]): void;
+  notify(
+    events: readonly RealtimeOutboxEvent[],
+    options?: { readonly outboxBookmark?: string | null }
+  ): void;
 }
 
 export interface RealtimeOutboxOperation {
@@ -200,7 +203,7 @@ export const REALTIME_MAX_RESTORE_SUBSCRIPTIONS = 100;
 
 export const REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS = 3;
 
-export const REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS = 10;
+export const REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS = 50;
 
 export const REALTIME_NOTIFY_SHARD_RETRY_DELAY_MS = 10;
 

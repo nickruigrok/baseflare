@@ -71,6 +71,7 @@ import type {
   BaseflareManifest,
   BaseflareRuntimeEnv,
   D1Database,
+  D1DatabaseSession,
   DurableObjectId,
   DurableObjectNamespace,
   DurableObjectStub,
@@ -6511,6 +6512,164 @@ describe("worker runtime", () => {
 
     expect(response.status).toBe(200);
     expect(body.lastProcessedOutboxSequence).toBe(row?.sequence);
+  });
+
+  it("advances realtime notify cursor only after delivery evaluation", async () => {
+    await createTodoViaRpc("owner-a", "cursor-order");
+    await createRealtimeOutboxEvent("notify-cursor-order");
+    const row = await env.APP_DB.prepare(
+      "SELECT sequence FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("notify-cursor-order")
+      .first<{ sequence: number }>();
+    const runtimeId = createRealtimeRuntimeId();
+    let cursorDuringDelivery: number | null | undefined;
+    let subscriptionDo: RealtimeSubscriptionDO;
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/deliver") {
+          const registrationsResponse = await subscriptionDo.fetch(
+            new Request("https://baseflare.internal/registrations", {
+              body: "{}",
+              method: "POST",
+            })
+          );
+          const registrationsBody = (await registrationsResponse.json()) as {
+            lastProcessedOutboxSequence: number | null;
+          };
+          cursorDuringDelivery = registrationsBody.lastProcessedOutboxSequence;
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+        return Response.json({ ok: true });
+      }
+    );
+    subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-1",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "notify-cursor-order" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      lastProcessedOutboxSequence: number | null;
+    };
+
+    expect(response.status).toBe(200);
+    expect(cursorDuringDelivery).toBeNull();
+    expect(registrationsBody.lastProcessedOutboxSequence).toBe(row?.sequence);
+  });
+
+  it("passes mutation commit bookmarks to realtime notify shards", async () => {
+    const notifyBodies: unknown[] = [];
+    const bookmark = "commit-bookmark";
+    const session: D1DatabaseSession = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      getBookmark: () => bookmark,
+      prepare: (sql) => env.APP_DB.prepare(sql),
+    };
+    const database: D1Database = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      prepare: (sql) => env.APP_DB.prepare(sql),
+      withSession: () => session,
+    };
+    const runtimeEnv: BaseflareRuntimeEnv = {
+      ...env,
+      APP_DB: database,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          notifyBodies.push(await request.json());
+          return Response.json({ ok: true });
+        }
+      ),
+    };
+
+    const response = await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken: "owner-a", text: "bookmark-notify" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      },
+      worker,
+      runtimeEnv
+    );
+
+    expect(response.status).toBe(200);
+    expect(notifyBodies).toEqual([
+      expect.objectContaining({ outboxBookmark: bookmark }),
+    ]);
+  });
+
+  it("uses realtime notify bookmarks for outbox event lookup", async () => {
+    const sessionConstraints: string[] = [];
+    const session: D1DatabaseSession = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      getBookmark: () => "session-bookmark",
+      prepare: (sql) => env.APP_DB.prepare(sql),
+    };
+    const database: D1Database = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      prepare: (sql) => env.APP_DB.prepare(sql),
+      withSession: (constraint) => {
+        sessionConstraints.push(constraint ?? "");
+        return session;
+      },
+    };
+    await createRealtimeOutboxEvent("bookmark-lookup");
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: database,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "bookmark-lookup",
+          outboxBookmark: "commit-bookmark",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(response.status).toBe(200);
+    expect(sessionConstraints).toEqual(["commit-bookmark"]);
   });
 
   it("logs and fails realtime notify when the outbox row is missing", async () => {
