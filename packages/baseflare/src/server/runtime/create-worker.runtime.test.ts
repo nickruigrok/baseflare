@@ -8021,14 +8021,31 @@ describe("worker runtime", () => {
 
     expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
     expect(deliveries).toHaveLength(0);
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-1");
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const failedRegistration = indexState.registrations.get(registrationKey);
+    expect(failedRegistration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
 
+    const skippedResponse = await notify();
+    const skippedBody = (await skippedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(skippedBody).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(deliveryAttempts).toBe(1);
+    expect(deliveries).toHaveLength(0);
+
+    if (failedRegistration) {
+      failedRegistration.reEvaluationRetryAt = Date.now() - 1;
+    }
     const retriedResponse = await notify();
     const retriedBody = (await retriedResponse.json()) as {
       evaluated: number;
       failed: number;
       ok: boolean;
     };
-
     expect(retriedBody).toEqual({ evaluated: 1, failed: 0, ok: true });
     expect(deliveries).toHaveLength(1);
     expect(
@@ -8110,14 +8127,31 @@ describe("worker runtime", () => {
 
     expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
     expect(deliveries).toHaveLength(0);
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-1");
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const failedRegistration = indexState.registrations.get(registrationKey);
+    expect(failedRegistration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
 
+    const skippedResponse = await notify();
+    const skippedBody = (await skippedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(skippedBody).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(deliveryAttempts).toBe(1);
+    expect(deliveries).toHaveLength(0);
+
+    if (failedRegistration) {
+      failedRegistration.reEvaluationRetryAt = Date.now() - 1;
+    }
     const retriedResponse = await notify();
     const retriedBody = (await retriedResponse.json()) as {
       evaluated: number;
       failed: number;
       ok: boolean;
     };
-
     expect(retriedBody).toEqual({ evaluated: 1, failed: 0, ok: true });
     expect(deliveries).toHaveLength(1);
     expect(
@@ -8184,7 +8218,10 @@ describe("worker runtime", () => {
       })
     );
     const registrationsBody = (await registrationsResponse.json()) as {
-      registrations: Array<{ subscriptionId: string }>;
+      registrations: Array<{
+        reEvaluationRetryAt?: number;
+        subscriptionId: string;
+      }>;
     };
 
     expect(body).toEqual({ evaluated: 0, failed: 1, ok: true });
@@ -8193,6 +8230,9 @@ describe("worker runtime", () => {
         (registration) => registration.subscriptionId
       )
     ).toEqual(["sub-1"]);
+    expect(
+      registrationsBody.registrations[0]?.reEvaluationRetryAt
+    ).toBeGreaterThan(Date.now());
   });
 
   it("removes expired realtime registrations after non-ok delivery responses", async () => {

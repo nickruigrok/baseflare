@@ -747,7 +747,9 @@ export class RealtimeSubscriptionDO {
     } catch (error) {
       this.deliveryBatchFailuresSinceAutoscale += 1;
       for (const delivery of group.deliveries) {
-        this.deleteExpiredRegistration(delivery.registration);
+        if (!this.deleteExpiredRegistration(delivery.registration)) {
+          this.backOffRegistrationReEvaluation(delivery.registration);
+        }
         this.logReEvaluationFailure(delivery.registration, error);
       }
       emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
