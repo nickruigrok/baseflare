@@ -3057,22 +3057,26 @@ describe("worker runtime", () => {
     expect(clientBMessages).toEqual([]);
   });
 
-  it("repairs malformed hibernated realtime socket attachments with isolated keys", async () => {
+  it("closes malformed hibernated realtime socket attachments", async () => {
     const registerBodies: Array<{
       connectionKey: string;
+      runtimeId: string;
       subscriptionId: string;
     }> = [];
-    const unregisterBodies: Array<{
-      connectionKey: string;
-      subscriptionId: string;
-    }> = [];
+    const closes = new Map<
+      AttachedTestWebSocket,
+      Array<{ code: number; reason: string }>
+    >();
     const socketMessages = new Map<AttachedTestWebSocket, unknown[]>();
-    const serializedAttachments = new WeakMap<AttachedTestWebSocket, unknown>();
     const createMalformedSocket = (): AttachedTestWebSocket => {
       const messages: unknown[] = [];
+      const closeCalls: Array<{ code: number; reason: string }> = [];
       const socket = {
         accept() {
           // Hibernated sockets are already accepted.
+        },
+        close(code: number, reason: string) {
+          closeCalls.push({ code, reason });
         },
         deserializeAttachment() {
           return { malformed: true };
@@ -3080,11 +3084,9 @@ describe("worker runtime", () => {
         send(payload: string) {
           messages.push(JSON.parse(payload) as unknown);
         },
-        serializeAttachment(attachment: unknown) {
-          serializedAttachments.set(socket, attachment);
-        },
       } as AttachedTestWebSocket;
       socketMessages.set(socket, messages);
+      closes.set(socket, closeCalls);
       return socket;
     };
     const socketA = createMalformedSocket();
@@ -3101,14 +3103,7 @@ describe("worker runtime", () => {
               registerBodies.push(
                 (await request.json()) as {
                   connectionKey: string;
-                  subscriptionId: string;
-                }
-              );
-            }
-            if (path === "/unregister") {
-              unregisterBodies.push(
-                (await request.json()) as {
-                  connectionKey: string;
+                  runtimeId: string;
                   subscriptionId: string;
                 }
               );
@@ -3130,53 +3125,28 @@ describe("worker runtime", () => {
         })
       );
 
+    expect(closes.get(socketA)).toEqual([
+      { code: 1011, reason: "Session expired, please reconnect" },
+    ]);
+    expect(closes.get(socketB)).toEqual([
+      { code: 1011, reason: "Session expired, please reconnect" },
+    ]);
+
     await subscribe(socketA, "sub-a");
     await subscribe(socketB, "sub-b");
 
-    const [connectionKeyA, connectionKeyB] = registerBodies.map(
-      ({ connectionKey }) => connectionKey
-    );
-    expect(connectionKeyA).toBeTypeOf("string");
-    expect(connectionKeyB).toBeTypeOf("string");
-    expect(connectionKeyA).not.toBe("default");
-    expect(connectionKeyB).not.toBe("default");
-    expect(connectionKeyA).not.toBe(connectionKeyB);
-    expect(serializedAttachments.get(socketA)).toEqual(
-      expect.objectContaining({ connectionKey: connectionKeyA })
-    );
-    expect(serializedAttachments.get(socketB)).toEqual(
-      expect.objectContaining({ connectionKey: connectionKeyB })
-    );
-
-    await connectionDo.fetch(
-      new Request("https://baseflare.internal/deliver", {
-        body: JSON.stringify({
-          connectionKey: connectionKeyA,
-          deliveries: [
-            { result: [{ text: "isolated" }], subscriptionId: "sub-a" },
-          ],
-        }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      })
-    );
-    const socketADeliveries = socketMessages
-      .get(socketA)
-      ?.filter((message) => (message as { type?: string }).type === "delivery");
-    const socketBDeliveries = socketMessages
-      .get(socketB)
-      ?.filter((message) => (message as { type?: string }).type === "delivery");
-
-    expect(socketADeliveries).toHaveLength(1);
-    expect(socketBDeliveries).toEqual([]);
-
-    await connectionDo.webSocketMessage(
-      socketA,
-      JSON.stringify({ subscriptionId: "sub-a", type: "unsubscribe" })
-    );
-
-    expect(unregisterBodies).toEqual([
-      { connectionKey: connectionKeyA, subscriptionId: "sub-a" },
+    expect(registerBodies).toEqual([]);
+    expect(socketMessages.get(socketA)).toEqual([
+      {
+        error: "Realtime socket session expired",
+        type: "error",
+      },
+    ]);
+    expect(socketMessages.get(socketB)).toEqual([
+      {
+        error: "Realtime socket session expired",
+        type: "error",
+      },
     ]);
   });
 

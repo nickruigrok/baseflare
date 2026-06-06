@@ -553,6 +553,7 @@ export class RealtimeConnectionDO {
         socket.deserializeAttachment?.()
       );
       if (!attachment) {
+        this.closeExpiredSocketSession(socket);
         continue;
       }
 
@@ -818,13 +819,17 @@ export class RealtimeConnectionDO {
       return attachment;
     }
 
-    const repairedAttachment = createRealtimeSocketAttachment({
-      authorizationHeader: undefined,
-      connectionKey: crypto.randomUUID(),
-      runtimeId: "",
-    });
-    this.addSocket(socket, repairedAttachment);
-    return repairedAttachment;
+    this.closeExpiredSocketSession(socket);
+    throw new InternalRuntimeError("Realtime socket session expired");
+  }
+
+  private closeExpiredSocketSession(socket: RuntimeWebSocket): void {
+    try {
+      socket.close?.(1011, "Session expired, please reconnect");
+    } catch {
+      // Best-effort close: the socket may already be closing.
+    }
+    this.removeSocket(socket);
   }
 
   private setSocketAttachment(
