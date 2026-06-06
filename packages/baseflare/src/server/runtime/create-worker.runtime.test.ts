@@ -7974,9 +7974,28 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-b");
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const backedOffRegistration = indexState.registrations.get(registrationKey);
 
     expect(firstBody).toEqual({ evaluated: 1, failed: 1, ok: true });
-    expect(secondBody).toEqual({ evaluated: 2, failed: 0, ok: true });
+    expect(secondBody).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(backedOffRegistration?.reEvaluationRetryAt).toBeGreaterThan(
+      Date.now()
+    );
+
+    if (backedOffRegistration) {
+      backedOffRegistration.reEvaluationRetryAt = Date.now() - 1;
+    }
+    const retriedResponse = await notify();
+    const retriedBody = (await retriedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(retriedBody).toEqual({ evaluated: 2, failed: 0, ok: true });
+    expect(backedOffRegistration?.reEvaluationRetryAt).toBeUndefined();
     expect(
       deliveries.map((delivery) =>
         getRealtimeDeliveryItems(delivery).map((item) => item.subscriptionId)
@@ -8046,9 +8065,33 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const backedOffRegistrations = ["sub-a", "sub-b"].map((subscriptionId) =>
+      indexState.registrations.get(
+        realtimeRegistrationKey("client-a", subscriptionId)
+      )
+    );
 
     expect(firstBody).toEqual({ evaluated: 0, failed: 2, ok: true });
-    expect(secondBody).toEqual({ evaluated: 0, failed: 2, ok: true });
+    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: true });
+    for (const registration of backedOffRegistrations) {
+      expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    }
+    expect(deliveries).toHaveLength(1);
+
+    for (const registration of backedOffRegistrations) {
+      if (registration) {
+        registration.reEvaluationRetryAt = Date.now() - 1;
+      }
+    }
+    const retriedResponse = await notify();
+    const retriedBody = (await retriedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(retriedBody).toEqual({ evaluated: 0, failed: 2, ok: true });
     expect(deliveries).toHaveLength(2);
   });
 
@@ -8108,6 +8151,16 @@ describe("worker runtime", () => {
       );
 
     await notify("malformed-ack-first");
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const backedOffRegistration = indexState.registrations.get(registrationKey);
+    expect(backedOffRegistration?.reEvaluationRetryAt).toBeGreaterThan(
+      Date.now()
+    );
+
+    if (backedOffRegistration) {
+      backedOffRegistration.reEvaluationRetryAt = Date.now() - 1;
+    }
     await notify("malformed-ack-second");
 
     expect(
@@ -8281,9 +8334,28 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-1");
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const backedOffRegistration = indexState.registrations.get(registrationKey);
 
     expect(firstBody).toEqual({ evaluated: 0, failed: 1, ok: true });
-    expect(secondBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(backedOffRegistration?.reEvaluationRetryAt).toBeGreaterThan(
+      Date.now()
+    );
+    expect(connections.requests).toHaveLength(1);
+
+    if (backedOffRegistration) {
+      backedOffRegistration.reEvaluationRetryAt = Date.now() - 1;
+    }
+    const retriedResponse = await notify();
+    const retriedBody = (await retriedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(retriedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
     expect(connections.requests).toHaveLength(2);
   });
 

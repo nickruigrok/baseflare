@@ -742,7 +742,9 @@ export class RealtimeSubscriptionDO {
       const stateUpdates: Promise<void>[] = [];
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
-          this.deleteExpiredRegistration(delivery.registration);
+          if (!this.deleteExpiredRegistration(delivery.registration)) {
+            this.backOffRegistrationReEvaluation(delivery.registration);
+          }
           continue;
         }
 
