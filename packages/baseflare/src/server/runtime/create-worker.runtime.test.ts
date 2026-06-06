@@ -2050,7 +2050,9 @@ describe("worker runtime", () => {
     unregisterHandler: () => Promise<Response>
   ): Promise<{
     readonly errorLog: ReturnType<typeof vi.spyOn>;
-    readonly registrations: unknown[];
+    readonly globalShardName: string;
+    readonly registrations: Array<{ reEvaluationRetryAt?: number }>;
+    readonly subscriptionDo: RealtimeSubscriptionDO;
     readonly subscriptionPaths: string[];
   }> => {
     const errorLog = vi
@@ -2133,12 +2135,14 @@ describe("worker runtime", () => {
       })
     );
     const registrationsBody = (await registrationsResponse.json()) as {
-      registrations: unknown[];
+      registrations: Array<{ reEvaluationRetryAt?: number }>;
     };
 
     return {
       errorLog,
+      globalShardName,
       registrations: registrationsBody.registrations,
+      subscriptionDo,
       subscriptionPaths,
     };
   };
@@ -2347,12 +2351,21 @@ describe("worker runtime", () => {
       );
 
     expect(registrations).toHaveLength(1);
+    expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
     expect(subscriptionPaths).toContain("/unregister");
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
         event: "runtime.realtime_registration_move_failed",
         status: 500,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "InternalRuntimeError",
+        event: "runtime.realtime_registration_state_update_failed",
         subscriptionId: "sub-a",
       })
     );
@@ -2370,6 +2383,7 @@ describe("worker runtime", () => {
     );
 
     expect(registrations).toHaveLength(1);
+    expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -2388,6 +2402,14 @@ describe("worker runtime", () => {
         subscriptionId: "sub-a",
       })
     );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "InternalRuntimeError",
+        event: "runtime.realtime_registration_state_update_failed",
+        subscriptionId: "sub-a",
+      })
+    );
   });
 
   it("keeps source realtime registrations active when shard move rollback throws", async () => {
@@ -2396,6 +2418,7 @@ describe("worker runtime", () => {
     );
 
     expect(registrations).toHaveLength(1);
+    expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -2414,6 +2437,69 @@ describe("worker runtime", () => {
         subscriptionId: "sub-a",
       })
     );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "InternalRuntimeError",
+        event: "runtime.realtime_registration_state_update_failed",
+        subscriptionId: "sub-a",
+      })
+    );
+  });
+
+  it("backs off realtime shard move retries after connection update failure", async () => {
+    const { globalShardName, subscriptionDo, subscriptionPaths } =
+      await runRealtimeMoveRollbackScenario(() =>
+        Promise.resolve(Response.json({ ok: true }))
+      );
+    const adoptionAttemptsAfterFailure = subscriptionPaths.filter(
+      (path) => path === "/adopt-registration"
+    ).length;
+
+    await createTodoViaRpc("owner-a", "owner-a-move-backed-off");
+    await createRealtimeOutboxEvent("owner-a-move-backed-off", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "owner-a-move-backed-off",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    expect(
+      subscriptionPaths.filter((path) => path === "/adopt-registration")
+    ).toHaveLength(adoptionAttemptsAfterFailure);
+
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+    if (registration) {
+      registration.reEvaluationRetryAt = Date.now() - 1;
+    }
+    await createTodoViaRpc("owner-a", "owner-a-move-retry");
+    await createRealtimeOutboxEvent("owner-a-move-retry", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "owner-a-move-retry",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(
+      subscriptionPaths.filter((path) => path === "/adopt-registration")
+    ).toHaveLength(adoptionAttemptsAfterFailure + 1);
   });
 
   // Migration delivery suppression guard: a migrated registration must not

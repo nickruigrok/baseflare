@@ -1268,7 +1268,9 @@ export class RealtimeSubscriptionDO {
         status: connectionUpdateResponse.status,
         subscriptionId: registration.subscriptionId,
       });
-      return;
+      throw new InternalRuntimeError(
+        `Realtime registration move failed with status ${connectionUpdateResponse.status}`
+      );
     }
 
     this.deleteRegistrationByKey(registrationKey);
