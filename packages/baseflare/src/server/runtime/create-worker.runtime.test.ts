@@ -64,6 +64,7 @@ import {
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   REALTIME_MAX_SUBSCRIPTION_SHARDS,
   REALTIME_PENDING_WORK_LIMIT,
+  REALTIME_RUNTIME_EVICTIONS_METRIC,
   REALTIME_SCALE_DOWN_WINDOW_MS,
   REALTIME_SCALE_UP_WINDOW_MS,
 } from "./realtime/types";
@@ -1329,6 +1330,9 @@ describe("worker runtime", () => {
   });
 
   it("bounds configured realtime runtime state", () => {
+    const infoLog = vi.spyOn(console, "info").mockImplementation(() => {
+      // Runtime metrics are asserted below.
+    });
     const warnLog = vi.spyOn(console, "warn").mockImplementation(() => {
       // Runtime eviction is an operator diagnostic.
     });
@@ -1353,6 +1357,15 @@ describe("worker runtime", () => {
         event: "runtime.realtime_runtime_evicted",
         limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
         runtimeId: "runtime:1",
+      })
+    );
+    expect(infoLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.metric",
+        metric: REALTIME_RUNTIME_EVICTIONS_METRIC,
+        tags: { result: "evicted" },
+        value: 1,
       })
     );
   });
@@ -4625,7 +4638,7 @@ describe("worker runtime", () => {
       {
         failed: [
           {
-            error: "Realtime restore catch-up failed with status 500",
+            error: `Realtime restore catch-up failed for shard ${getRealtimeSubscriptionShardName()} with status 500`,
             index: -1,
           },
         ],
@@ -4633,6 +4646,108 @@ describe("worker runtime", () => {
         type: "restored",
       },
     ]);
+  });
+
+  it("reports partial realtime restore catch-up failures per shard", async () => {
+    const catchUpShardNames: string[] = [];
+    const subscriptionDo = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const pathname = new URL(request.url).pathname;
+        if (pathname === "/catch-up") {
+          const body = (await request.json()) as { shardName: string };
+          catchUpShardNames.push(body.shardName);
+          if (body.shardName === "subscription:g2:1") {
+            return Response.json({ ok: false }, { status: 503 });
+          }
+
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+
+        return Response.json({ ok: true });
+      }
+    );
+    let attachment: unknown = {
+      connectionKey: "client-a",
+      connectionName: getRealtimeConnectionShardName("client-a"),
+      latestDeliveredOutboxSequence: null,
+      runtimeId: "runtime:1",
+      subscriptions: [
+        {
+          args: { ownerToken: "owner-a" },
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-a",
+          subscriptionShardName: "subscription:g2:0",
+        },
+        {
+          args: { ownerToken: "owner-a" },
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-b",
+          subscriptionShardName: "subscription:g2:1",
+        },
+      ],
+    };
+    const messages: Array<{
+      failed?: Array<{ error: string; index: number }>;
+      reconciled?: boolean;
+      type: string;
+    }> = [];
+    const socket = {
+      accept() {
+        // Test socket accept is a no-op.
+      },
+      deserializeAttachment() {
+        return attachment;
+      },
+      send(payload: string) {
+        messages.push(JSON.parse(payload) as { type: string });
+      },
+      serializeAttachment(nextAttachment: unknown) {
+        attachment = nextAttachment;
+      },
+    } as AttachedTestWebSocket;
+    const state = new FakeRealtimeDurableObjectState([socket]);
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptionDo,
+    });
+    for (
+      let attempt = 0;
+      attempt < 20 && catchUpShardNames.length < 2;
+      attempt += 1
+    ) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    catchUpShardNames.length = 0;
+    messages.length = 0;
+
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({ subscriptions: [], type: "restore" })
+    );
+
+    expect(catchUpShardNames).toEqual([
+      "subscription:g2:0",
+      "subscription:g2:1",
+    ]);
+    expect(messages.at(-1)).toEqual({
+      failed: [
+        {
+          error:
+            "Realtime restore catch-up failed for shard subscription:g2:1 with status 503",
+          index: -1,
+        },
+      ],
+      reconciled: false,
+      type: "restored",
+    });
   });
 
   it("does not report direct realtime subscriptions as live after registration errors", async () => {
@@ -5727,6 +5842,23 @@ describe("worker runtime", () => {
     expect(response.status).toBe(200);
     expect(cursorDuringDelivery).toBeNull();
     expect(registrationsBody.lastProcessedOutboxSequence).toBe(row?.sequence);
+  });
+
+  it("requires realtime shard context before recording cursors", async () => {
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const advanceCursor = (
+      subscriptionDo as unknown as {
+        advanceLastProcessedOutboxSequence(sequence: number): Promise<void>;
+      }
+    ).advanceLastProcessedOutboxSequence.bind(subscriptionDo);
+
+    await expect(advanceCursor(1)).rejects.toThrow(
+      "Realtime shard cursor cannot advance without shard context"
+    );
   });
 
   it("skips the D1 re-query when subscription versions are unchanged", async () => {

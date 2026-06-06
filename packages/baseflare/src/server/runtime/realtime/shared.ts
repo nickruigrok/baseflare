@@ -15,6 +15,7 @@ import {
   JSON_HEADERS,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_OUTBOX_LAG_METRIC,
+  REALTIME_RUNTIME_EVICTIONS_METRIC,
 } from "./types";
 
 let nextRealtimeRuntimeId = 0;
@@ -46,6 +47,9 @@ function trimConfiguredRealtimeRuntimes(): void {
     logRuntimeEvent("warn", "runtime.realtime_runtime_evicted", {
       limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
       runtimeId: oldestRuntimeId,
+    });
+    emitRealtimeMetric(REALTIME_RUNTIME_EVICTIONS_METRIC, 1, {
+      result: "evicted",
     });
     configuredRealtimeRuntimes.delete(oldestRuntimeId);
   }

@@ -80,6 +80,11 @@ import {
   REALTIME_REEVALUATION_FAILURE_RETRY_MS,
 } from "./types";
 
+interface RealtimeShardContext {
+  readonly generationId: number;
+  readonly shardName: string;
+}
+
 export class RealtimeSubscriptionDO {
   private readonly database: D1Database;
   private readonly env: RealtimeObjectEnv;
@@ -210,7 +215,9 @@ export class RealtimeSubscriptionDO {
 
   private async handleNotify(request: Request): Promise<Response> {
     const body = await readJsonObject(request);
-    this.setCurrentShardName(getOptionalStringField(body, "shardName"));
+    const shardContext = this.setCurrentShardName(
+      getOptionalStringField(body, "shardName")
+    );
     const eventId = getStringField(body, "eventId");
     const outboxBookmark = getOptionalStringField(body, "outboxBookmark");
     const backpressureResponse = this.tryReserveNotifyEvent(eventId);
@@ -254,7 +261,10 @@ export class RealtimeSubscriptionDO {
       );
       // Advance after evaluation so an unexpected evaluation failure cannot
       // make this shard permanently skip the event.
-      await this.advanceLastProcessedOutboxSequence(event.sequence);
+      await this.advanceLastProcessedOutboxSequence(
+        event.sequence,
+        shardContext
+      );
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({ ...result, ok: true });
@@ -302,7 +312,9 @@ export class RealtimeSubscriptionDO {
 
   private async handleCatchUp(request: Request): Promise<Response> {
     const body = await readJsonObject(request);
-    this.setCurrentShardName(getOptionalStringField(body, "shardName"));
+    const shardContext = this.setCurrentShardName(
+      getOptionalStringField(body, "shardName")
+    );
     const afterSequence = getOptionalSequence(
       body.afterSequence,
       "afterSequence"
@@ -317,7 +329,10 @@ export class RealtimeSubscriptionDO {
         createFullRealtimeAffectedTargets(latestSequence),
         "catch_up"
       );
-      await this.advanceLastProcessedOutboxSequence(latestSequence);
+      await this.advanceLastProcessedOutboxSequence(
+        latestSequence,
+        shardContext
+      );
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({
@@ -340,7 +355,10 @@ export class RealtimeSubscriptionDO {
         createFullRealtimeAffectedTargets(catchUp.latestReadSequence),
         "catch_up"
       );
-      await this.advanceLastProcessedOutboxSequence(catchUp.latestReadSequence);
+      await this.advanceLastProcessedOutboxSequence(
+        catchUp.latestReadSequence,
+        shardContext
+      );
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({
@@ -353,7 +371,10 @@ export class RealtimeSubscriptionDO {
 
     const { events } = catchUp;
     if (events.length === 0) {
-      await this.advanceLastProcessedOutboxSequence(afterSequence);
+      await this.advanceLastProcessedOutboxSequence(
+        afterSequence,
+        shardContext
+      );
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({
@@ -371,7 +392,10 @@ export class RealtimeSubscriptionDO {
     );
     // Advance after evaluation so an unexpected evaluation failure cannot
     // make this shard permanently skip events.
-    await this.advanceLastProcessedOutboxSequence(events.at(-1)?.sequence);
+    await this.advanceLastProcessedOutboxSequence(
+      events.at(-1)?.sequence,
+      shardContext
+    );
     await this.cleanupRealtimeOutbox();
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({
@@ -413,10 +437,17 @@ export class RealtimeSubscriptionDO {
   }
 
   private async advanceLastProcessedOutboxSequence(
-    sequence: number | null | undefined
+    sequence: number | null | undefined,
+    shardContext?: RealtimeShardContext
   ): Promise<void> {
     if (sequence == null) {
       return;
+    }
+
+    if (!shardContext) {
+      throw new InternalRuntimeError(
+        "Realtime shard cursor cannot advance without shard context"
+      );
     }
 
     this.lastProcessedOutboxSequence = Math.max(
@@ -425,19 +456,23 @@ export class RealtimeSubscriptionDO {
     );
     await recordRealtimeShardCursor(
       this.database,
-      this.shardName,
-      this.shardGenerationId,
+      shardContext.shardName,
+      shardContext.generationId,
       this.lastProcessedOutboxSequence
     );
   }
 
-  private setCurrentShardName(shardName: string | undefined): void {
-    if (!shardName) {
-      return;
-    }
-
-    this.shardName = shardName;
-    this.shardGenerationId = getRealtimeShardGenerationIdFromName(shardName);
+  private setCurrentShardName(
+    shardName: string | undefined
+  ): RealtimeShardContext {
+    const currentShardName = shardName ?? getRealtimeSubscriptionShardName();
+    this.shardName = currentShardName;
+    this.shardGenerationId =
+      getRealtimeShardGenerationIdFromName(currentShardName);
+    return {
+      generationId: this.shardGenerationId,
+      shardName: this.shardName,
+    };
   }
 
   private async maybeEvaluateAutoscaling(): Promise<void> {

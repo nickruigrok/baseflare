@@ -388,28 +388,61 @@ export class RealtimeConnectionDO {
         "afterSequence"
       );
       const catchUpTargets = await this.subscriptionCatchUpTargets(socket);
-      await Promise.all(
+      const catchUpResults = await Promise.allSettled(
         catchUpTargets.map(async (catchUpTarget) => {
-          const catchUpResponse = await catchUpTarget.stub.fetch(
-            "https://baseflare.internal/catch-up",
-            {
-              body: JSON.stringify({
-                afterSequence,
-                shardName: catchUpTarget.shardName,
-              }),
-              headers: JSON_HEADERS,
-              method: "POST",
+          try {
+            const catchUpResponse = await catchUpTarget.stub.fetch(
+              "https://baseflare.internal/catch-up",
+              {
+                body: JSON.stringify({
+                  afterSequence,
+                  shardName: catchUpTarget.shardName,
+                }),
+                headers: JSON_HEADERS,
+                method: "POST",
+              }
+            );
+            if (!catchUpResponse.ok) {
+              throw new InternalRuntimeError(
+                `Realtime restore catch-up failed for shard ${catchUpTarget.shardName} with status ${catchUpResponse.status}`
+              );
             }
-          );
-          if (!catchUpResponse.ok) {
+          } catch (error) {
+            if (
+              error instanceof Error &&
+              error.message.includes(catchUpTarget.shardName)
+            ) {
+              throw error;
+            }
+
             throw new InternalRuntimeError(
-              `Realtime restore catch-up failed with status ${catchUpResponse.status}`
+              `Realtime restore catch-up failed for shard ${catchUpTarget.shardName}: ${
+                error instanceof Error ? error.message : "unknown error"
+              }`
             );
           }
         })
       );
-      reconciled = true;
-      this.updateLatestDeliveredOutboxSequence(socket, afterSequence);
+      const catchUpFailures = catchUpResults.flatMap((result) => {
+        if (result.status === "fulfilled") {
+          return [];
+        }
+
+        return [
+          {
+            error:
+              result.reason instanceof Error
+                ? result.reason.message
+                : "Realtime restore catch-up failed",
+            index: -1,
+          },
+        ];
+      });
+      failed.push(...catchUpFailures);
+      reconciled = catchUpFailures.length === 0;
+      if (reconciled) {
+        this.updateLatestDeliveredOutboxSequence(socket, afterSequence);
+      }
     } catch (error) {
       failed.push({
         error:

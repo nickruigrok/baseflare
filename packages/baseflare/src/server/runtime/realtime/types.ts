@@ -267,6 +267,9 @@ export const REALTIME_RESTORE_SUBSCRIPTIONS_METRIC =
 export const REALTIME_RECONCILIATIONS_METRIC =
   "baseflare.runtime.realtime.reconciliations";
 
+export const REALTIME_RUNTIME_EVICTIONS_METRIC =
+  "baseflare.runtime.realtime.runtime_evictions";
+
 export const JSON_HEADERS = { "content-type": "application/json" } as const;
 
 export const REALTIME_CONNECTION_KEY_HEADER =
@@ -282,6 +285,7 @@ export type RealtimeMetricResult =
   | "coalesced"
   | "delivered"
   | "evaluated"
+  | "evicted"
   | "failed"
   | "limited"
   | "reconciled"
