@@ -1,9 +1,4 @@
 import type { QueryDefinition } from "../../functions/types";
-import {
-  PARTITION_VERSION_TABLE_NAME,
-  TABLE_VERSION_TABLE_NAME,
-} from "../../schema/types";
-import { bindStatement } from "../d1";
 import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
 import { executeQueryDefinition } from "../execution";
 import { logRuntimeEvent } from "../logging";
@@ -60,7 +55,6 @@ import type {
   RealtimeDependencySet,
   RealtimeMetricSource,
   RealtimeObjectEnv,
-  RealtimePartitionTarget,
   RealtimePressureSnapshot,
   RealtimeRegistration,
   RealtimeSequencedOutboxEvent,
@@ -630,7 +624,6 @@ export class RealtimeSubscriptionDO {
       );
       if (!delivery) {
         this.clearRegistrationReEvaluationBackoff(registration);
-        this.deleteExpiredRegistration(registration);
         return { evaluated: 1, failed: 0, skipped: 0 };
       }
 
@@ -1001,39 +994,38 @@ export class RealtimeSubscriptionDO {
       return true;
     }
 
-    for (const tableName of registration.dependencies.tables) {
-      if (!targets.tables.has(tableName)) {
-        continue;
-      }
+    const relevant = this.getRelevantVersionGapDependencies(
+      registration.dependencies,
+      targets
+    );
+    if (relevant.forceEvaluation) {
+      return true;
+    }
 
-      const currentVersion = await this.fetchTableVersion(database, tableName);
+    const { dependencies: relevantDependencies } = relevant;
+    if (
+      relevantDependencies.tables.size === 0 &&
+      relevantDependencies.partitions.size === 0
+    ) {
+      return false;
+    }
+
+    const currentSnapshot = await fetchRealtimeVersionSnapshot(
+      database,
+      relevantDependencies
+    );
+    for (const tableName of relevantDependencies.tables) {
       if (
-        currentVersion !== registration.versionSnapshot.tables.get(tableName)
+        currentSnapshot.tables.get(tableName) !==
+        registration.versionSnapshot.tables.get(tableName)
       ) {
         return true;
       }
     }
 
-    for (const partitionId of registration.dependencies.partitions) {
-      const partition = parseRealtimePartitionId(partitionId);
-      if (!partition) {
-        return true;
-      }
-
-      if (targets.broadTables.has(partition.tableName)) {
-        return true;
-      }
-
-      if (!targets.partitions.has(partitionId)) {
-        continue;
-      }
-
-      const currentVersion = await this.fetchPartitionVersion(
-        database,
-        partition
-      );
+    for (const partitionId of relevantDependencies.partitions) {
       if (
-        currentVersion !==
+        currentSnapshot.partitions.get(partitionId) !==
         registration.versionSnapshot.partitions.get(partitionId)
       ) {
         return true;
@@ -1043,34 +1035,46 @@ export class RealtimeSubscriptionDO {
     return false;
   }
 
-  private async fetchTableVersion(
-    database: RuntimeDatabase,
-    tableName: string
-  ): Promise<number | null> {
-    const row = await bindStatement(
-      database,
-      `SELECT version FROM ${TABLE_VERSION_TABLE_NAME}
-       WHERE table_name = ?
-       LIMIT 1`,
-      [tableName]
-    ).first<{ version: number }>();
+  private getRelevantVersionGapDependencies(
+    registrationDependencies: RealtimeDependencySet,
+    targets: RealtimeAffectedTargets
+  ): {
+    readonly dependencies: {
+      readonly partitions: Set<string>;
+      readonly tables: Set<string>;
+    };
+    readonly forceEvaluation: boolean;
+  } {
+    const dependencies = {
+      partitions: new Set<string>(),
+      tables: new Set<string>(),
+    };
+    for (const tableName of registrationDependencies.tables) {
+      if (!targets.tables.has(tableName)) {
+        continue;
+      }
 
-    return typeof row?.version === "number" ? row.version : null;
-  }
+      dependencies.tables.add(tableName);
+    }
 
-  private async fetchPartitionVersion(
-    database: RuntimeDatabase,
-    partition: RealtimePartitionTarget
-  ): Promise<number> {
-    const row = await bindStatement(
-      database,
-      `SELECT version FROM ${PARTITION_VERSION_TABLE_NAME}
-       WHERE table_name = ? AND partition_key = ? AND partition_value = ?
-       LIMIT 1`,
-      [partition.tableName, partition.partitionKey, partition.partitionValue]
-    ).first<{ version: number }>();
+    for (const partitionId of registrationDependencies.partitions) {
+      const partition = parseRealtimePartitionId(partitionId);
+      if (!partition) {
+        return { dependencies, forceEvaluation: true };
+      }
 
-    return row?.version ?? 0;
+      if (targets.broadTables.has(partition.tableName)) {
+        return { dependencies, forceEvaluation: true };
+      }
+
+      if (!targets.partitions.has(partitionId)) {
+        continue;
+      }
+
+      dependencies.partitions.add(partitionId);
+    }
+
+    return { dependencies, forceEvaluation: false };
   }
 
   private deleteExpiredRegistration(

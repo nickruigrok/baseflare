@@ -73,6 +73,7 @@ import type {
   BaseflareRuntimeEnv,
   D1Database,
   D1DatabaseSession,
+  D1PreparedStatement,
   DurableObjectId,
   DurableObjectNamespace,
   DurableObjectStub,
@@ -2660,7 +2661,20 @@ describe("worker runtime", () => {
       registrationsBody.registrations.map(
         (registration) => registration.subscriptionId
       )
-    ).toEqual(["sub-a"]);
+    ).toEqual(["sub-a", "sub-expired"]);
+
+    await createTodoViaRpc("owner-a", "changed-after-expired-unchanged");
+    await createRealtimeOutboxEvent("ev3", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("ev3");
+    expect(deliveredIds.filter((id) => id === "sub-expired")).toHaveLength(2);
+
+    const renewedRegistration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-expired"));
+    expect(renewedRegistration?.leaseExpiresAt).toBeGreaterThan(Date.now());
   });
 
   it("preserves lastResultJson when adopting a migrated registration", async () => {
@@ -5920,6 +5934,140 @@ describe("worker runtime", () => {
     });
     expect(realtimeDependencyTrackingQueryCalls).toBe(2);
     expect(deliveries).toHaveLength(2);
+  });
+
+  it("batches relevant realtime version-gap reads", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    let tableVersionReads = 0;
+    let partitionVersionReads = 0;
+    const tableVersionBindSizes: number[] = [];
+    const partitionVersionBindSizes: number[] = [];
+    const database: D1Database = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      prepare(sql) {
+        const statement = env.APP_DB.prepare(sql);
+        if (sql.includes("FROM _bf_table_versions")) {
+          tableVersionReads += 1;
+        }
+        if (sql.includes("_bf_partition_versions")) {
+          partitionVersionReads += 1;
+        }
+        return new Proxy(statement, {
+          get(target, property, receiver) {
+            if (property !== "bind") {
+              return Reflect.get(target, property, receiver);
+            }
+
+            return (...values: Parameters<D1PreparedStatement["bind"]>) => {
+              if (sql.includes("FROM _bf_table_versions")) {
+                tableVersionBindSizes.push(values.length);
+              }
+              if (sql.includes("_bf_partition_versions")) {
+                partitionVersionBindSizes.push(values.length);
+              }
+              return target.bind(...values);
+            };
+          },
+        });
+      },
+    };
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: database,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const ownerAPartitionId = todoOwnerPartitionId("owner-a");
+    const ownerBPartitionId = todoOwnerPartitionId("owner-b");
+    const ownerCPartitionId = todoOwnerPartitionId("owner-c");
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const registration = indexState.registrations.get(registrationKey) as
+      | {
+          dependencies?: {
+            partitions: Set<string>;
+            tables: Set<string>;
+          };
+          versionSnapshot?: {
+            partitions: ReadonlyMap<string, number>;
+            tables: ReadonlyMap<string, number>;
+          };
+        }
+      | undefined;
+    if (!registration) {
+      throw new Error("Missing realtime registration");
+    }
+    const dependencies = {
+      partitions: new Set([
+        ownerAPartitionId,
+        ownerBPartitionId,
+        ownerCPartitionId,
+      ]),
+      tables: new Set(["comments", "labels", "todos"]),
+    };
+    registration.dependencies = dependencies;
+    registration.versionSnapshot = await fetchRealtimeVersionSnapshot(
+      env.APP_DB,
+      dependencies
+    );
+    tableVersionReads = 0;
+    partitionVersionReads = 0;
+    indexState.registrationKeysByTable.set(
+      "labels",
+      new Set([registrationKey])
+    );
+    indexState.registrationKeysByTable.set("todos", new Set([registrationKey]));
+    indexState.registrationKeysByPartition.set(
+      ownerAPartitionId,
+      new Set([registrationKey])
+    );
+    indexState.registrationKeysByPartition.set(
+      ownerBPartitionId,
+      new Set([registrationKey])
+    );
+    indexState.registrationKeysWithoutDependencies.delete(registrationKey);
+    await createRealtimeOutboxEvent("batched-version-gap", Date.now(), {
+      bumpVersions: false,
+      partitions: [
+        todoOwnerPartition("owner-a"),
+        todoOwnerPartition("owner-b"),
+      ],
+      tables: ["labels", "todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "batched-version-gap" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(await response.json()).toEqual({
+      evaluated: 0,
+      failed: 0,
+      ok: true,
+    });
+    expect(tableVersionReads).toBe(1);
+    expect(partitionVersionReads).toBe(1);
+    expect(tableVersionBindSizes).toEqual([2]);
+    expect(partitionVersionBindSizes).toEqual([8]);
   });
 
   it("indexes realtime registrations after dependency capture", async () => {
