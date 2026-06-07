@@ -1,4 +1,4 @@
-import { ValidationRuntimeError } from "../errors";
+import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
 import { emitRuntimeMetric, logRuntimeEvent } from "../logging";
 import { getRealtimeConnectionShardName } from "./routing";
 import type {
@@ -25,31 +25,28 @@ export const REALTIME_CONFIGURED_RUNTIME_LIMIT = 1024;
 export const configuredRealtimeRuntimes = new Map<string, RealtimeRuntime>();
 
 export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
+  if (configuredRealtimeRuntimes.size >= REALTIME_CONFIGURED_RUNTIME_LIMIT) {
+    logRuntimeEvent("warn", "runtime.realtime_runtime_limit_exceeded", {
+      limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
+      size: configuredRealtimeRuntimes.size,
+    });
+    emitRealtimeMetric(REALTIME_RUNTIME_EVICTIONS_METRIC, 1, {
+      result: "limit_exceeded",
+    });
+    throw new InternalRuntimeError(
+      `Realtime runtime configuration limit exceeded: ${REALTIME_CONFIGURED_RUNTIME_LIMIT}`
+    );
+  }
+
   nextRealtimeRuntimeId += 1;
   const runtimeId = `runtime:${nextRealtimeRuntimeId}`;
   configuredRealtimeRuntimes.set(runtimeId, runtime);
-  warnConfiguredRealtimeRuntimeLimit(runtimeId);
   return runtimeId;
 }
 
 export function resetRealtimeRuntimeStateForTest(): void {
   configuredRealtimeRuntimes.clear();
   nextRealtimeRuntimeId = 0;
-}
-
-function warnConfiguredRealtimeRuntimeLimit(runtimeId: string): void {
-  if (configuredRealtimeRuntimes.size <= REALTIME_CONFIGURED_RUNTIME_LIMIT) {
-    return;
-  }
-
-  logRuntimeEvent("warn", "runtime.realtime_runtime_limit_exceeded", {
-    limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
-    runtimeId,
-    size: configuredRealtimeRuntimes.size,
-  });
-  emitRealtimeMetric(REALTIME_RUNTIME_EVICTIONS_METRIC, 1, {
-    result: "limit_exceeded",
-  });
 }
 
 export function jsonResponse(
@@ -203,6 +200,7 @@ export function parseRealtimeSocketAttachment(
   const attachment = value as Record<string, unknown>;
   if (
     typeof attachment.connectionKey !== "string" ||
+    attachment.connectionKey.length === 0 ||
     typeof attachment.connectionName !== "string" ||
     typeof attachment.runtimeId !== "string" ||
     attachment.runtimeId.length === 0

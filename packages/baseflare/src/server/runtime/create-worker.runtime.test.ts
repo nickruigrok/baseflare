@@ -1332,7 +1332,7 @@ describe("worker runtime", () => {
     expect(index?.name).toBe("todos_by_owner");
   });
 
-  it("keeps configured realtime runtimes after the warning threshold is exceeded", () => {
+  it("rejects new realtime runtime configuration at the warning threshold", () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => {
       // Runtime metrics are asserted below.
     });
@@ -1341,26 +1341,29 @@ describe("worker runtime", () => {
     });
     resetRealtimeRuntimeStateForTest();
     let latestRuntimeId = "";
-    for (
-      let index = 0;
-      index < REALTIME_CONFIGURED_RUNTIME_LIMIT + 2;
-      index += 1
-    ) {
+    for (let index = 0; index < REALTIME_CONFIGURED_RUNTIME_LIMIT; index += 1) {
       latestRuntimeId = createRealtimeRuntimeId();
     }
 
+    expect(() => createRealtimeRuntimeId()).toThrow(
+      `Realtime runtime configuration limit exceeded: ${REALTIME_CONFIGURED_RUNTIME_LIMIT}`
+    );
     expect(configuredRealtimeRuntimes.size).toBe(
-      REALTIME_CONFIGURED_RUNTIME_LIMIT + 2
+      REALTIME_CONFIGURED_RUNTIME_LIMIT
     );
     expect(configuredRealtimeRuntimes.has("runtime:1")).toBe(true);
     expect(configuredRealtimeRuntimes.has(latestRuntimeId)).toBe(true);
+    expect(
+      configuredRealtimeRuntimes.has(
+        `runtime:${REALTIME_CONFIGURED_RUNTIME_LIMIT + 1}`
+      )
+    ).toBe(false);
     expect(warnLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
         event: "runtime.realtime_runtime_limit_exceeded",
         limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
-        runtimeId: `runtime:${REALTIME_CONFIGURED_RUNTIME_LIMIT + 1}`,
-        size: REALTIME_CONFIGURED_RUNTIME_LIMIT + 1,
+        size: REALTIME_CONFIGURED_RUNTIME_LIMIT,
       })
     );
     expect(infoLog).toHaveBeenCalledWith(
@@ -3534,6 +3537,86 @@ describe("worker runtime", () => {
         epoch: 1,
         queryName: "todos:list",
         subscriptionId: "sub-empty-runtime",
+        type: "subscribe",
+      })
+    );
+
+    expect(registerBodies).toEqual([]);
+    expect(messages).toEqual([
+      {
+        error: "Realtime socket session expired",
+        type: "error",
+      },
+    ]);
+  });
+
+  it("closes hibernated realtime socket attachments with empty connection keys", async () => {
+    const registerBodies: Array<{
+      connectionKey: string;
+      subscriptionId: string;
+    }> = [];
+    const closeCalls: Array<{ code: number; reason: string }> = [];
+    const messages: unknown[] = [];
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      close(code: number, reason: string) {
+        closeCalls.push({ code, reason });
+      },
+      deserializeAttachment() {
+        return {
+          connectionKey: "",
+          connectionName: getRealtimeConnectionShardName("client-a"),
+          latestDeliveredOutboxSequence: null,
+          runtimeId: "runtime:1",
+          subscriptions: [
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-empty-connection-key",
+            },
+          ],
+        };
+      },
+      send(payload: string) {
+        messages.push(JSON.parse(payload) as unknown);
+      },
+    } as AttachedTestWebSocket;
+
+    const connectionDo = new RealtimeConnectionDO(
+      new FakeRealtimeDurableObjectState([socket]),
+      {
+        APP_DB: env.APP_DB,
+        REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+        REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+          async (_name, request) => {
+            if (new URL(request.url).pathname === "/register") {
+              registerBodies.push(
+                (await request.json()) as {
+                  connectionKey: string;
+                  subscriptionId: string;
+                }
+              );
+            }
+
+            return Response.json({ ok: true });
+          }
+        ),
+      }
+    );
+
+    expect(closeCalls).toEqual([
+      { code: 1011, reason: "Session expired, please reconnect" },
+    ]);
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-empty-connection-key",
         type: "subscribe",
       })
     );
