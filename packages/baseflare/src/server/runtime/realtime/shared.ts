@@ -263,11 +263,17 @@ export function parseRealtimeSocketAttachment(
 }
 
 export function resolveRealtimeConnectionKey(url: URL): string {
-  return (
-    url.searchParams.get("clientId") ??
-    url.searchParams.get("sessionId") ??
-    `anonymous:${crypto.randomUUID()}`
-  );
+  const clientId = url.searchParams.get("clientId");
+  if (clientId) {
+    return `client:${clientId}`;
+  }
+
+  const sessionId = url.searchParams.get("sessionId");
+  if (sessionId) {
+    return `session:${sessionId}`;
+  }
+
+  return `anonymous:${crypto.randomUUID()}`;
 }
 
 export function emitRealtimeMetric(
