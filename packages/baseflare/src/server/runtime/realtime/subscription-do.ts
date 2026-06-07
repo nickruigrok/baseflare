@@ -137,6 +137,10 @@ export class RealtimeSubscriptionDO {
       return await this.handleAdoptRegistration(request);
     }
 
+    if (url.pathname === "/activate-registration") {
+      return await this.handleActivateRegistration(request);
+    }
+
     if (url.pathname === "/unregister") {
       return await this.handleUnregister(request);
     }
@@ -202,6 +206,7 @@ export class RealtimeSubscriptionDO {
         typeof body.lastResultJson === "string"
           ? body.lastResultJson
           : undefined,
+      movePending: true,
       versionSnapshot: parseRealtimeVersionSnapshotValue(body.versionSnapshot),
     };
     const registrationKey = createRegistrationKey(
@@ -218,6 +223,25 @@ export class RealtimeSubscriptionDO {
     }
     this.registrations.set(registrationKey, storedRegistration);
     this.addRegistrationToIndexes(registrationKey, storedRegistration);
+    await this.maybeEvaluateAutoscaling();
+    return jsonResponse({ ok: true });
+  }
+
+  private async handleActivateRegistration(
+    request: Request
+  ): Promise<Response> {
+    const body = await readJsonObject(request);
+    this.setCurrentShardName(getOptionalStringField(body, "shardName"));
+    const registrationKey = createRegistrationKey(
+      getStringField(body, "connectionKey"),
+      getStringField(body, "subscriptionId")
+    );
+    const registration = this.registrations.get(registrationKey);
+    if (!registration) {
+      return jsonResponse({ ok: false }, { status: 404 });
+    }
+
+    registration.movePending = false;
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
   }
@@ -609,6 +633,20 @@ export class RealtimeSubscriptionDO {
       while (nextRegistrationIndex < registrationKeys.length) {
         const registrationKey = registrationKeys[nextRegistrationIndex];
         nextRegistrationIndex += 1;
+        if (registrationKey === undefined) {
+          failed += 1;
+          logRuntimeEvent(
+            "error",
+            "runtime.realtime_registration_re_evaluation_failed",
+            {
+              errorName: "InternalRuntimeError",
+              errorMessage:
+                "Realtime registration key was missing during re-evaluation",
+            }
+          );
+          continue;
+        }
+
         const result = await this.tryEvaluateRegistration(
           registrationKey,
           targets,
@@ -655,7 +693,7 @@ export class RealtimeSubscriptionDO {
   }
 
   private async tryEvaluateRegistration(
-    registrationKey: string | undefined,
+    registrationKey: string,
     targets: RealtimeAffectedTargets,
     database: RuntimeDatabase
   ): Promise<{
@@ -664,13 +702,13 @@ export class RealtimeSubscriptionDO {
     readonly failed: number;
     readonly skipped: number;
   }> {
-    if (!registrationKey) {
-      return { evaluated: 0, failed: 0, skipped: 0 };
-    }
-
     const registration = this.registrations.get(registrationKey);
     if (!registration) {
       return { evaluated: 0, failed: 0, skipped: 0 };
+    }
+
+    if (registration.movePending) {
+      return { evaluated: 0, failed: 0, skipped: 1 };
     }
 
     if (this.isRegistrationReEvaluationBackedOff(registration)) {
@@ -1392,17 +1430,31 @@ export class RealtimeSubscriptionDO {
       );
     }
 
-    const connectionUpdateResponse = await this.env.REALTIME_CONNECTIONS.get(
-      this.env.REALTIME_CONNECTIONS.idFromName(registration.connectionName)
-    ).fetch("https://baseflare.internal/subscription-moved", {
-      body: JSON.stringify({
+    let connectionUpdateResponse: Response;
+    try {
+      connectionUpdateResponse = await this.moveConnectionRegistrationShard(
+        registration,
+        targetShardName
+      );
+    } catch (error) {
+      await this.rollbackAdoptedRegistration(
+        targetStub,
+        targetShardName,
+        registration
+      );
+      logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
         connectionKey: registration.connectionKey,
+        errorName: error instanceof Error ? error.name : typeof error,
+        shardName: targetShardName,
+        sourceRemoved: false,
         subscriptionId: registration.subscriptionId,
-        subscriptionShardName: targetShardName,
-      }),
-      headers: JSON_HEADERS,
-      method: "POST",
-    });
+      });
+      throw new InternalRuntimeError(
+        `Realtime registration move failed: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`
+      );
+    }
     if (!connectionUpdateResponse.ok) {
       await this.rollbackAdoptedRegistration(
         targetStub,
@@ -1421,7 +1473,111 @@ export class RealtimeSubscriptionDO {
       );
     }
 
+    let activationResponse: Response;
+    try {
+      activationResponse = await targetStub.fetch(
+        "https://baseflare.internal/activate-registration",
+        {
+          body: JSON.stringify({
+            connectionKey: registration.connectionKey,
+            shardName: targetShardName,
+            subscriptionId: registration.subscriptionId,
+          }),
+          headers: JSON_HEADERS,
+          method: "POST",
+        }
+      );
+    } catch (error) {
+      await this.rollbackAdoptedRegistration(
+        targetStub,
+        targetShardName,
+        registration
+      );
+      await this.restoreSourceRegistrationOwner(registration);
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_registration_activation_failed",
+        {
+          connectionKey: registration.connectionKey,
+          errorName: error instanceof Error ? error.name : typeof error,
+          shardName: targetShardName,
+          subscriptionId: registration.subscriptionId,
+        }
+      );
+      throw new InternalRuntimeError(
+        `Realtime registration activation failed: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`
+      );
+    }
+    if (!activationResponse.ok) {
+      await this.rollbackAdoptedRegistration(
+        targetStub,
+        targetShardName,
+        registration
+      );
+      await this.restoreSourceRegistrationOwner(registration);
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_registration_activation_failed",
+        {
+          connectionKey: registration.connectionKey,
+          shardName: targetShardName,
+          status: activationResponse.status,
+          subscriptionId: registration.subscriptionId,
+        }
+      );
+      throw new InternalRuntimeError(
+        `Realtime registration activation failed with status ${activationResponse.status}`
+      );
+    }
+
     this.deleteRegistrationByKey(registrationKey);
+  }
+
+  private async moveConnectionRegistrationShard(
+    registration: StoredRealtimeRegistration,
+    subscriptionShardName: string
+  ): Promise<Response> {
+    return await this.env.REALTIME_CONNECTIONS.get(
+      this.env.REALTIME_CONNECTIONS.idFromName(registration.connectionName)
+    ).fetch("https://baseflare.internal/subscription-moved", {
+      body: JSON.stringify({
+        connectionKey: registration.connectionKey,
+        subscriptionId: registration.subscriptionId,
+        subscriptionShardName,
+      }),
+      headers: JSON_HEADERS,
+      method: "POST",
+    });
+  }
+
+  private async restoreSourceRegistrationOwner(
+    registration: StoredRealtimeRegistration
+  ): Promise<void> {
+    try {
+      const response = await this.moveConnectionRegistrationShard(
+        registration,
+        this.shardName
+      );
+      if (!response.ok) {
+        logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
+          connectionKey: registration.connectionKey,
+          shardName: this.shardName,
+          sourceRemoved: false,
+          status: response.status,
+          subscriptionId: registration.subscriptionId,
+        });
+      }
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
+        connectionKey: registration.connectionKey,
+        errorName: error instanceof Error ? error.name : typeof error,
+        shardName: this.shardName,
+        sourceRemoved: false,
+        subscriptionId: registration.subscriptionId,
+      });
+    }
   }
 
   private async rollbackAdoptedRegistration(

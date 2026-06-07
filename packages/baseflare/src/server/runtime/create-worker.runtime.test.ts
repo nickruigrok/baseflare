@@ -1023,7 +1023,11 @@ interface RealtimeIndexTestState {
   readonly registrationKeysWithoutDependencies: Set<string>;
   readonly registrations: Map<
     string,
-    { leaseExpiresAt: number; reEvaluationRetryAt?: number }
+    {
+      leaseExpiresAt: number;
+      movePending?: boolean;
+      reEvaluationRetryAt?: number;
+    }
   >;
 }
 
@@ -2397,6 +2401,162 @@ describe("worker runtime", () => {
     ).toBe(true);
   });
 
+  it("keeps adopted realtime registrations inactive until shard ownership is confirmed", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveredIds: string[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/deliver") {
+          const body = (await request.json()) as {
+            deliveries: Array<{ subscriptionId: string }>;
+          };
+          deliveredIds.push(
+            ...body.deliveries.map((item) => item.subscriptionId)
+          );
+        }
+        return Response.json({
+          delivered: 1,
+          deliveredSubscriptions: ["sub-a"],
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/adopt-registration", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          dependencies: {
+            partitions: [],
+            tables: ["todos"],
+          },
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+          versionSnapshot: {
+            partitions: [],
+            tables: [["todos", 0]],
+          },
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "pending-adoption");
+    await createRealtimeOutboxEvent("pending-adoption-event", Date.now(), {
+      tables: ["todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "pending-adoption-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+    };
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+
+    expect(body).toEqual(expect.objectContaining({ evaluated: 0, failed: 0 }));
+    expect(deliveredIds).toEqual([]);
+    expect(registration?.movePending).toBe(true);
+  });
+
+  it("activates migrated realtime registrations only after ownership moves", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveredIds: string[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/deliver") {
+          const body = (await request.json()) as {
+            deliveries: Array<{ subscriptionId: string }>;
+          };
+          deliveredIds.push(
+            ...body.deliveries.map((item) => item.subscriptionId)
+          );
+        }
+        return Response.json({
+          delivered: 1,
+          deliveredSubscriptions: ["sub-a"],
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationBody = {
+      args: { ownerToken: "owner-a" },
+      authorizationHeader: "Bearer owner-a",
+      connectionKey: "client-a",
+      connectionName: "connection:0",
+      dependencies: {
+        partitions: [],
+        tables: ["todos"],
+      },
+      epoch: 1,
+      leaseExpiresAt: Date.now() + 60_000,
+      queryName: "todos:list",
+      runtimeId,
+      subscriptionId: "sub-a",
+      versionSnapshot: {
+        partitions: [],
+        tables: [["todos", 0]],
+      },
+    };
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/adopt-registration", {
+        body: JSON.stringify(registrationBody),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/activate-registration", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "activated-adoption");
+    await createRealtimeOutboxEvent("activated-adoption-event", Date.now(), {
+      tables: ["todos"],
+    });
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "activated-adoption-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+
+    expect(registration?.movePending).toBe(false);
+    expect(deliveredIds).toEqual(["sub-a"]);
+  });
+
   it("keeps source realtime registrations active when shard adoption fails", async () => {
     const errorLog = vi
       .spyOn(console, "error")
@@ -2484,6 +2644,101 @@ describe("worker runtime", () => {
         event: "runtime.realtime_registration_adoption_failed",
         shardName: expect.any(String),
         status: 500,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "InternalRuntimeError",
+        event: "runtime.realtime_registration_state_update_failed",
+        subscriptionId: "sub-a",
+      })
+    );
+  });
+
+  it("keeps source realtime registrations active when target activation fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const subscriptionPaths: string[] = [];
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      const pathname = new URL(request.url).pathname;
+      subscriptionPaths.push(pathname);
+      return Promise.resolve(
+        pathname === "/activate-registration"
+          ? Response.json({ ok: false }, { status: 503 })
+          : Response.json({ ok: true })
+      );
+    });
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(
+        Response.json({
+          delivered: 1,
+          deliveredSubscriptions: ["sub-a"],
+          ok: true,
+        })
+      )
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    await createTodoViaRpc("owner-a", "owner-a-activation-failed");
+    await createRealtimeOutboxEvent("owner-a-activation-failed", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "owner-a-activation-failed",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+
+    expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(subscriptionPaths).toContain("/activate-registration");
+    expect(subscriptionPaths).toContain("/unregister");
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_activation_failed",
+        status: 503,
         subscriptionId: "sub-a",
       })
     );
@@ -2653,6 +2908,43 @@ describe("worker runtime", () => {
     expect(
       subscriptionPaths.filter((path) => path === "/adopt-registration")
     ).toHaveLength(adoptionAttemptsAfterFailure + 1);
+  });
+
+  it("logs and counts unexpected missing realtime registration keys", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    (
+      subscriptionDo as unknown as {
+        getRelevantRegistrationKeys: () => Set<string | undefined>;
+      }
+    ).getRelevantRegistrationKeys = () => new Set([undefined]);
+    await createRealtimeOutboxEvent("missing-key-event", Date.now(), {
+      tables: ["todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "missing-key-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as { failed: number };
+
+    expect(body.failed).toBe(1);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "InternalRuntimeError",
+        event: "runtime.realtime_registration_re_evaluation_failed",
+      })
+    );
   });
 
   // Migration delivery suppression guard: a migrated registration must not
@@ -4421,6 +4713,7 @@ describe("worker runtime", () => {
       );
     }
 
+    let rejectSubB = true;
     connectionDo = new RealtimeConnectionDO(state, {
       APP_DB: env.APP_DB,
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
@@ -4429,7 +4722,9 @@ describe("worker runtime", () => {
           const body = (await request.json()) as Record<string, unknown>;
           const path = new URL(request.url).pathname;
           subscriptionRequests.push({ body, path });
-          return path === "/register" && body.subscriptionId === "sub-b"
+          return path === "/register" &&
+            body.subscriptionId === "sub-b" &&
+            rejectSubB
             ? Response.json({ ok: false }, { status: 503 })
             : Response.json({ events: [], ok: true });
         }
@@ -4452,9 +4747,19 @@ describe("worker runtime", () => {
       subscriptionRequests.filter(({ path }) => path === "/register")
     ).toEqual([
       expect.objectContaining({
-        body: expect.objectContaining({ subscriptionId: "sub-a" }),
+        body: expect.objectContaining({ subscriptionId: "sub-b" }),
         path: "/register",
       }),
+    ]);
+    expect(state.alarmTime).toBeTypeOf("number");
+
+    subscriptionRequests.length = 0;
+    rejectSubB = false;
+    await connectionDo.alarm();
+
+    expect(
+      subscriptionRequests.filter(({ path }) => path === "/register")
+    ).toEqual([
       expect.objectContaining({
         body: expect.objectContaining({ subscriptionId: "sub-b" }),
         path: "/register",
@@ -4463,7 +4768,13 @@ describe("worker runtime", () => {
     expect(subscriptionRequests.some(({ path }) => path === "/catch-up")).toBe(
       true
     );
-    expect(state.alarmTime).toBeTypeOf("number");
+
+    subscriptionRequests.length = 0;
+    await connectionDo.alarm();
+
+    expect(
+      subscriptionRequests.filter(({ path }) => path === "/register")
+    ).toEqual([]);
   });
 
   it("retries hibernation restore when generation lookup fails at wakeup", async () => {

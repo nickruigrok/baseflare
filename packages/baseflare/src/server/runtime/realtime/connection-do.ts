@@ -92,6 +92,7 @@ export class RealtimeConnectionDO {
     Set<RuntimeWebSocket>
   >();
   private readonly sockets = new Set<RuntimeWebSocket>();
+  private readonly restoredAttachedSubscriptionKeys = new Set<string>();
   private readonly state: RealtimeDurableObjectState;
   private hasPendingHibernationRestoreRetry = false;
 
@@ -516,7 +517,11 @@ export class RealtimeConnectionDO {
 
   private removeSocket(socket: RuntimeWebSocket): void {
     this.sockets.delete(socket);
-    const connectionKey = this.getSocketAttachment(socket)?.connectionKey;
+    const attachment = this.getSocketAttachment(socket);
+    if (attachment) {
+      this.forgetRestoredAttachedSubscriptions(attachment);
+    }
+    const connectionKey = attachment?.connectionKey;
     this.socketStates.delete(socket);
     if (!connectionKey) {
       return;
@@ -647,74 +652,42 @@ export class RealtimeConnectionDO {
       return { accepted: 0, rejected: 0 };
     }
 
+    const subscriptionsToRestore = subscriptions.filter(
+      ({ attachment, subscription }) =>
+        !this.restoredAttachedSubscriptionKeys.has(
+          this.createAttachedSubscriptionRestoreKey(attachment, subscription)
+        )
+    );
+    if (subscriptionsToRestore.length === 0) {
+      this.hasPendingHibernationRestoreRetry = false;
+      if (options.reconcileAfterRestore) {
+        await this.catchUpActiveSubscriptions();
+      }
+      return { accepted: 0, rejected: 0 };
+    }
+
     const subscriptionGeneration = await fetchActiveRealtimeShardGeneration(
       this.env.APP_DB
     );
     const results = await Promise.allSettled(
-      subscriptions.map(async ({ attachment, subscription }) => {
-        const subscriptionTarget = await this.subscriptionTarget(
-          subscription.subscriptionShardName,
-          createRealtimeGlobalSubscriptionRouteTarget(),
+      subscriptionsToRestore.map(({ attachment, subscription }) =>
+        this.restoreAttachedSubscription(
+          attachment,
+          subscription,
           subscriptionGeneration
-        );
-        const response = await subscriptionTarget.stub.fetch(
-          "https://baseflare.internal/register",
-          {
-            body: JSON.stringify({
-              args: subscription.args,
-              authorizationHeader: attachment.authorizationHeader,
-              connectionKey: attachment.connectionKey,
-              connectionName: attachment.connectionName,
-              epoch: subscription.epoch,
-              leaseExpiresAt: Date.now() + REALTIME_LEASE_MS,
-              queryName: subscription.queryName,
-              runtimeId: attachment.runtimeId,
-              shardName: subscriptionTarget.shardName,
-              subscriptionId: subscription.subscriptionId,
-            }),
-            headers: JSON_HEADERS,
-            method: "POST",
-          }
-        );
-        if (!response.ok) {
-          throw new InternalRuntimeError(
-            `Realtime subscription registration failed with status ${response.status}`
-          );
-        }
-      })
+        )
+      )
     );
-    // Surface per-subscription registration failures (e.g. a subscription DO
-    // shard transiently unavailable on hibernation wakeup) instead of silently
-    // swallowing them — otherwise the subscription is stranded with no signal.
-    let rejected = 0;
-    for (const [index, result] of results.entries()) {
-      if (result.status !== "rejected") {
-        continue;
-      }
-      rejected += 1;
-      logRuntimeEvent(
-        "error",
-        "runtime.realtime_hibernation_subscription_restore_failed",
-        {
-          errorMessage:
-            result.reason instanceof Error ? result.reason.message : undefined,
-          errorName:
-            result.reason instanceof Error
-              ? result.reason.name
-              : typeof result.reason,
-          queryName: subscriptions[index]?.subscription.queryName,
-          subscriptionShardName:
-            subscriptions[index]?.subscription.subscriptionShardName,
-          subscriptionId: subscriptions[index]?.subscription.subscriptionId,
-        }
-      );
-    }
+    const rejected = this.logRejectedAttachedSubscriptionRestores(
+      subscriptionsToRestore,
+      results
+    );
     if (rejected > 0) {
       emitRealtimeMetric(REALTIME_RESTORE_SUBSCRIPTIONS_METRIC, rejected, {
         result: "rejected",
       });
     }
-    const accepted = subscriptions.length - rejected;
+    const accepted = subscriptionsToRestore.length - rejected;
     if (accepted > 0) {
       emitRealtimeMetric(REALTIME_RESTORE_SUBSCRIPTIONS_METRIC, accepted, {
         result: "accepted",
@@ -739,6 +712,79 @@ export class RealtimeConnectionDO {
       await this.scheduleReconciliation();
     }
     return { accepted, rejected };
+  }
+
+  private logRejectedAttachedSubscriptionRestores(
+    subscriptions: readonly {
+      readonly attachment: RealtimeSocketAttachment;
+      readonly subscription: RealtimeSocketSubscription;
+    }[],
+    results: readonly PromiseSettledResult<void>[]
+  ): number {
+    let rejected = 0;
+    for (const [index, result] of results.entries()) {
+      if (result.status !== "rejected") {
+        continue;
+      }
+      rejected += 1;
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_hibernation_subscription_restore_failed",
+        {
+          errorMessage:
+            result.reason instanceof Error ? result.reason.message : undefined,
+          errorName:
+            result.reason instanceof Error
+              ? result.reason.name
+              : typeof result.reason,
+          queryName: subscriptions[index]?.subscription.queryName,
+          subscriptionShardName:
+            subscriptions[index]?.subscription.subscriptionShardName,
+          subscriptionId: subscriptions[index]?.subscription.subscriptionId,
+        }
+      );
+    }
+
+    return rejected;
+  }
+
+  private async restoreAttachedSubscription(
+    attachment: RealtimeSocketAttachment,
+    subscription: RealtimeSocketSubscription,
+    subscriptionGeneration: RealtimeShardGeneration
+  ): Promise<void> {
+    const subscriptionTarget = await this.subscriptionTarget(
+      subscription.subscriptionShardName,
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      subscriptionGeneration
+    );
+    const response = await subscriptionTarget.stub.fetch(
+      "https://baseflare.internal/register",
+      {
+        body: JSON.stringify({
+          args: subscription.args,
+          authorizationHeader: attachment.authorizationHeader,
+          connectionKey: attachment.connectionKey,
+          connectionName: attachment.connectionName,
+          epoch: subscription.epoch,
+          leaseExpiresAt: Date.now() + REALTIME_LEASE_MS,
+          queryName: subscription.queryName,
+          runtimeId: attachment.runtimeId,
+          shardName: subscriptionTarget.shardName,
+          subscriptionId: subscription.subscriptionId,
+        }),
+        headers: JSON_HEADERS,
+        method: "POST",
+      }
+    );
+    if (!response.ok) {
+      throw new InternalRuntimeError(
+        `Realtime subscription registration failed with status ${response.status}`
+      );
+    }
+    this.restoredAttachedSubscriptionKeys.add(
+      this.createAttachedSubscriptionRestoreKey(attachment, subscription)
+    );
   }
 
   private getAttachedSubscriptions(): Array<{
@@ -785,6 +831,7 @@ export class RealtimeConnectionDO {
       return;
     }
 
+    this.forgetRestoredAttachedSubscriptions(attachment, subscriptionId);
     this.setSocketAttachment(socket, {
       ...attachment,
       subscriptions: attachment.subscriptions.filter(
@@ -849,14 +896,67 @@ export class RealtimeConnectionDO {
         continue;
       }
 
-      this.setSocketAttachment(socket, {
+      const existingSubscription = attachment.subscriptions.find(
+        (subscription) => subscription.subscriptionId === subscriptionId
+      );
+      const wasRestored =
+        existingSubscription !== undefined &&
+        this.restoredAttachedSubscriptionKeys.delete(
+          this.createAttachedSubscriptionRestoreKey(
+            attachment,
+            existingSubscription
+          )
+        );
+      const updatedAttachment = {
         ...attachment,
         subscriptions: attachment.subscriptions.map((subscription) =>
           subscription.subscriptionId === subscriptionId
             ? { ...subscription, subscriptionShardName }
             : subscription
         ),
-      });
+      };
+      const updatedSubscription = updatedAttachment.subscriptions.find(
+        (subscription) => subscription.subscriptionId === subscriptionId
+      );
+      if (wasRestored && updatedSubscription) {
+        this.restoredAttachedSubscriptionKeys.add(
+          this.createAttachedSubscriptionRestoreKey(
+            updatedAttachment,
+            updatedSubscription
+          )
+        );
+      }
+      this.setSocketAttachment(socket, updatedAttachment);
+    }
+  }
+
+  private createAttachedSubscriptionRestoreKey(
+    attachment: RealtimeSocketAttachment,
+    subscription: RealtimeSocketSubscription
+  ): string {
+    return JSON.stringify([
+      attachment.connectionKey,
+      subscription.subscriptionId,
+      subscription.epoch,
+      subscription.subscriptionShardName ?? "",
+    ]);
+  }
+
+  private forgetRestoredAttachedSubscriptions(
+    attachment: RealtimeSocketAttachment,
+    subscriptionId?: string
+  ): void {
+    if (!Array.isArray(attachment.subscriptions)) {
+      return;
+    }
+
+    for (const subscription of attachment.subscriptions) {
+      if (subscriptionId && subscription.subscriptionId !== subscriptionId) {
+        continue;
+      }
+      this.restoredAttachedSubscriptionKeys.delete(
+        this.createAttachedSubscriptionRestoreKey(attachment, subscription)
+      );
     }
   }
 

@@ -82,6 +82,7 @@ export type StoredRealtimeRegistration = Omit<
   dependencies?: RealtimeDependencySet;
   leaseExpiresAt: number;
   lastResultJson?: string;
+  movePending?: boolean;
   reEvaluationRetryAt?: number;
   versionSnapshot?: RealtimeVersionSnapshot;
 };
