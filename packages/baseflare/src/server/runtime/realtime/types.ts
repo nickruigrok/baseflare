@@ -288,6 +288,7 @@ export type RealtimeMetricResult =
   | "evicted"
   | "failed"
   | "limited"
+  | "partial"
   | "reconciled"
   | "rejected"
   | "retired"

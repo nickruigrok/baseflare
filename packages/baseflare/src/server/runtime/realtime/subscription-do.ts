@@ -7,7 +7,7 @@ import {
   createRealtimeOutboxResponseEvents,
   deleteRealtimeOutboxEventsBefore,
   fetchRealtimeOutboxEventById,
-  fetchRealtimeOutboxEventRowExists,
+  fetchRealtimeOutboxEventSequenceById,
   fetchRealtimeOutboxEvents,
   fetchRealtimeOutboxHistoryGap,
 } from "./outbox";
@@ -242,7 +242,18 @@ export class RealtimeSubscriptionDO {
         outboxBookmark
       );
       if (eventLookup.status === "malformed") {
-        return jsonResponse({ evaluated: 0, failed: 0, ok: true });
+        const result = await this.reEvaluateActiveRegistrations(
+          createFullRealtimeAffectedTargets(eventLookup.sequence),
+          "notify",
+          eventLookup.database
+        );
+        await this.advanceLastProcessedOutboxSequence(
+          eventLookup.sequence,
+          shardContext
+        );
+        await this.cleanupRealtimeOutbox();
+        await this.maybeEvaluateAutoscaling();
+        return jsonResponse({ ...result, ok: true });
       }
 
       if (eventLookup.status !== "found") {
@@ -290,7 +301,12 @@ export class RealtimeSubscriptionDO {
         readonly event: RealtimeSequencedOutboxEvent;
         readonly status: "found";
       }
-    | { readonly status: "malformed" | "missing" }
+    | {
+        readonly database: RuntimeDatabase;
+        readonly sequence: number;
+        readonly status: "malformed";
+      }
+    | { readonly status: "missing" }
   > {
     const database =
       outboxBookmark && this.database.withSession
@@ -306,8 +322,12 @@ export class RealtimeSubscriptionDO {
         return { database, event, status: "found" };
       }
 
-      if (await fetchRealtimeOutboxEventRowExists(database, eventId)) {
-        return { status: "malformed" };
+      const malformedSequence = await fetchRealtimeOutboxEventSequenceById(
+        database,
+        eventId
+      );
+      if (malformedSequence !== null) {
+        return { database, sequence: malformedSequence, status: "malformed" };
       }
 
       if (attempt < REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS) {
@@ -770,7 +790,7 @@ export class RealtimeSubscriptionDO {
           failed += result.failed;
         }
         emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
-          result: failed === 0 ? "delivered" : "undelivered",
+          result: getRealtimeDeliveryGroupMetricResult(evaluated, failed),
         });
 
         return { evaluated, failed };
@@ -1495,4 +1515,15 @@ function waitForRealtimeNotifyEventLookupRetry(): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS);
   });
+}
+
+function getRealtimeDeliveryGroupMetricResult(
+  evaluated: number,
+  failed: number
+): "delivered" | "partial" | "undelivered" {
+  if (failed === 0) {
+    return "delivered";
+  }
+
+  return evaluated === 0 ? "undelivered" : "partial";
 }

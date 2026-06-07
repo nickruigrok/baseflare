@@ -384,16 +384,16 @@ export async function fetchRealtimeOutboxEventById(
   return parseRealtimeOutboxRow(row);
 }
 
-export async function fetchRealtimeOutboxEventRowExists(
+export async function fetchRealtimeOutboxEventSequenceById(
   database: Pick<RuntimeDatabase, "prepare">,
   eventId: string
-): Promise<boolean> {
+): Promise<number | null> {
   const row = await bindStatement(
     database,
-    `SELECT 1 AS exists_flag FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
+    `SELECT sequence FROM ${REALTIME_OUTBOX_TABLE_NAME} WHERE event_id = ?`,
     [eventId]
-  ).first<{ exists_flag: number }>();
-  return row != null;
+  ).first<{ sequence: number }>();
+  return typeof row?.sequence === "number" ? row.sequence : null;
 }
 
 function parseRealtimeOutboxRow(

@@ -44,6 +44,7 @@ import {
   getRealtimeAffectedSubscriptionRouteTargets,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
+  getRealtimeSubscriptionShardNames,
   isZeroRealtimeVersionSnapshot,
 } from "./realtime/routing";
 import {
@@ -1520,6 +1521,10 @@ describe("worker runtime", () => {
 
   it("scales realtime subscription generations geometrically", async () => {
     const startedAt = 1_000_000;
+    await createRealtimeOutboxEvent("scale-up-high-water");
+    const highWaterSequence = await getRealtimeOutboxSequence(
+      "scale-up-high-water"
+    );
     await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
       activeRegistrationCount: 1000,
       now: startedAt,
@@ -1535,6 +1540,12 @@ describe("worker runtime", () => {
       status: string;
       subscription_shard_count: number;
     }>();
+    const cursorRowsAfterScaleUp = await env.APP_DB.prepare(
+      "SELECT shard_name, last_processed_outbox_sequence FROM _bf_realtime_shard_cursors WHERE generation_id = 2 ORDER BY shard_name"
+    ).all<{
+      last_processed_outbox_sequence: number;
+      shard_name: string;
+    }>();
 
     expect(scaleUpResult).toBe("scaled_up");
     expect(generationsAfterScaleUp.results).toEqual([
@@ -1549,6 +1560,15 @@ describe("worker runtime", () => {
         subscription_shard_count: 2,
       },
     ]);
+    expect(cursorRowsAfterScaleUp.results).toEqual(
+      getRealtimeSubscriptionShardNames({
+        generationId: 2,
+        subscriptionShardCount: 2,
+      }).map((shardName) => ({
+        last_processed_outbox_sequence: highWaterSequence,
+        shard_name: shardName,
+      }))
+    );
 
     const lowLoadStartedAt = startedAt + 20 * 60 * 1000;
     await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
@@ -1625,6 +1645,36 @@ describe("worker runtime", () => {
           "baseflare.runtime.realtime.autoscaling"
       )
     ).toBe(false);
+  });
+
+  it("initializes new realtime shard cursors to zero without outbox rows", async () => {
+    const startedAt = 2_000_000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: startedAt,
+    });
+
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: startedAt + 10 * 60 * 1000,
+    });
+
+    const cursorRows = await env.APP_DB.prepare(
+      "SELECT shard_name, last_processed_outbox_sequence FROM _bf_realtime_shard_cursors WHERE generation_id = 2 ORDER BY shard_name"
+    ).all<{
+      last_processed_outbox_sequence: number;
+      shard_name: string;
+    }>();
+
+    expect(cursorRows.results).toEqual(
+      getRealtimeSubscriptionShardNames({
+        generationId: 2,
+        subscriptionShardCount: 2,
+      }).map((shardName) => ({
+        last_processed_outbox_sequence: 0,
+        shard_name: shardName,
+      }))
+    );
   });
 
   it("never scales realtime subscription shards beyond the cap", async () => {
@@ -1899,8 +1949,8 @@ describe("worker runtime", () => {
     );
     expect(mutationResponse.ok).toBe(true);
     const outboxRow = await env.APP_DB.prepare(
-      "SELECT event_id FROM _bf_realtime_outbox ORDER BY sequence DESC LIMIT 1"
-    ).first<{ event_id: string }>();
+      "SELECT event_id, sequence FROM _bf_realtime_outbox ORDER BY sequence DESC LIMIT 1"
+    ).first<{ event_id: string; sequence: number }>();
     expect(outboxRow?.event_id).toEqual(expect.any(String));
     const catchUpResponse = await env.REALTIME_SUBSCRIPTIONS.get(
       env.REALTIME_SUBSCRIPTIONS.idFromName("subscription:g1:0")
@@ -1936,7 +1986,7 @@ describe("worker runtime", () => {
         result: expect.arrayContaining([
           expect.objectContaining({ text: "real-do-delivery" }),
         ]),
-        sequence: 1,
+        sequence: outboxRow?.sequence,
         subscriptionId: "sub-real-do",
       },
       type: "delivery",
@@ -8753,20 +8803,51 @@ describe("worker runtime", () => {
     );
   });
 
-  it("logs and skips malformed realtime outbox rows during notify", async () => {
+  it("fully recovers and advances realtime cursors after malformed notify rows", async () => {
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "malformed-notify-recovered");
     await env.APP_DB.prepare(
       "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
     )
       .bind("malformed-notify", Date.now(), "not-json", JSON.stringify([]))
       .run();
+    const malformedSequence =
+      await getRealtimeOutboxSequence("malformed-notify");
+    const deliveries: unknown[] = [];
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
       APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          deliveries.push(await request.json());
+          return Response.json({
+            delivered: 1,
+            deliveredSubscriptions: ["sub-malformed-notify"],
+            ok: true,
+          });
+        }
+      ),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-malformed-notify",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {
@@ -8780,8 +8861,23 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      lastProcessedOutboxSequence: number | null;
+    };
 
-    expect(body).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(getFirstRealtimeDelivery(deliveries[0]).sequence).toBe(
+      malformedSequence
+    );
+    expect(registrationsBody.lastProcessedOutboxSequence).toBe(
+      malformedSequence
+    );
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -9838,7 +9934,7 @@ describe("worker runtime", () => {
     );
   });
 
-  it("emits one undelivered metric for a partially failed chunked realtime delivery group", async () => {
+  it("emits one partial metric for a partially failed chunked realtime delivery group", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const runtimeId = createRealtimeRuntimeId();
     const deliveries: unknown[] = [];
@@ -9916,7 +10012,7 @@ describe("worker runtime", () => {
     expect(deliveryBatchMetrics).toHaveLength(1);
     expect(deliveryBatchMetrics[0]?.[1]).toEqual(
       expect.objectContaining({
-        tags: { result: "undelivered" },
+        tags: { result: "partial" },
         value: 1,
       })
     );

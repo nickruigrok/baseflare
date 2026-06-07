@@ -348,6 +348,18 @@ export function getRealtimeSubscriptionShardName(
   return routeShardName;
 }
 
+export function getRealtimeSubscriptionShardNames(
+  generation: Pick<
+    RealtimeShardGeneration,
+    "generationId" | "subscriptionShardCount"
+  >
+): string[] {
+  return Array.from(
+    { length: generation.subscriptionShardCount },
+    (_value, index) => `subscription:g${generation.generationId}:${index}`
+  );
+}
+
 export function getRealtimeAffectedSubscriptionRouteTargets(
   event: Pick<RealtimeOutboxEvent, "partitions" | "tables">
 ): RealtimeSubscriptionRouteTarget[] {

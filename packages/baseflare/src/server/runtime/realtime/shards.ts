@@ -1,13 +1,17 @@
 import {
   PARTITION_VERSION_TABLE_NAME,
   REALTIME_AUTOSCALE_STATE_TABLE_NAME,
+  REALTIME_OUTBOX_TABLE_NAME,
   REALTIME_SHARD_CURSORS_TABLE_NAME,
   REALTIME_SHARD_GENERATIONS_TABLE_NAME,
   TABLE_VERSION_TABLE_NAME,
 } from "../../schema/types";
 import { bindStatement } from "../d1";
 import type { RuntimeDatabase } from "../types";
-import { parseRealtimePartitionId } from "./routing";
+import {
+  getRealtimeSubscriptionShardNames,
+  parseRealtimePartitionId,
+} from "./routing";
 import { emitRealtimeMetric } from "./shared";
 import type {
   RealtimeDependencySet,
@@ -394,6 +398,10 @@ async function createRealtimeShardGeneration(
   }
 ): Promise<boolean> {
   const nextGenerationId = activeGeneration.generationId + 1;
+  const nextGeneration = {
+    generationId: nextGenerationId,
+    subscriptionShardCount: input.shardCount,
+  };
   const statements = [
     bindStatement(
       database,
@@ -416,6 +424,15 @@ async function createRealtimeShardGeneration(
          (generation_id, subscription_shard_count, status, created_at, drain_after)
        VALUES (?, ?, 'active', ?, NULL)`,
       [nextGenerationId, input.shardCount, input.now]
+    ),
+    ...getRealtimeSubscriptionShardNames(nextGeneration).map((shardName) =>
+      bindStatement(
+        database,
+        `INSERT OR IGNORE INTO ${REALTIME_SHARD_CURSORS_TABLE_NAME}
+           (shard_name, generation_id, last_processed_outbox_sequence, updated_at)
+         SELECT ?, ?, COALESCE(MAX(sequence), 0), ? FROM ${REALTIME_OUTBOX_TABLE_NAME}`,
+        [shardName, nextGenerationId, input.now]
+      )
     ),
     bindStatement(
       database,
