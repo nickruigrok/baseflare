@@ -1072,6 +1072,10 @@ export class RealtimeConnectionDO {
 
   private async catchUpActiveSubscriptions(): Promise<void> {
     const targets = await this.reconciliationCatchUpTargets();
+    const reconciliationSession = this.env.APP_DB.withSession?.(
+      "first-unconstrained"
+    );
+    const outboxBookmark = reconciliationSession?.getBookmark();
     const results = await Promise.allSettled(
       targets.map(async (target) => {
         try {
@@ -1080,6 +1084,7 @@ export class RealtimeConnectionDO {
             {
               body: JSON.stringify({
                 afterSequence: target.afterSequence,
+                outboxBookmark,
                 shardName: target.shardName,
               }),
               headers: JSON_HEADERS,

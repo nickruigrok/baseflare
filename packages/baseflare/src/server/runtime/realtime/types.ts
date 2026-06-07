@@ -13,8 +13,14 @@ export interface RealtimeDurableObjectState {
   acceptWebSocket?(socket: RuntimeWebSocket): void;
   getWebSockets?(): RuntimeWebSocket[];
   storage?: {
+    delete?(key: string): Promise<void>;
     deleteAlarm?(): Promise<void>;
+    get?<T = unknown>(key: string): Promise<T | undefined>;
     getAlarm?(): Promise<number | null>;
+    list?<T = unknown>(options?: {
+      readonly prefix?: string;
+    }): Promise<Map<string, T>>;
+    put?<T = unknown>(key: string, value: T): Promise<void>;
     setAlarm?(scheduledTime: number): Promise<void>;
   };
 }

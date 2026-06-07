@@ -85,6 +85,22 @@ interface RealtimeShardContext {
   readonly shardName: string;
 }
 
+const REALTIME_REGISTRATION_STORAGE_PREFIX = "realtime:registration:";
+
+type StoredRealtimeRegistrationValue = Omit<
+  StoredRealtimeRegistration,
+  "dependencies" | "versionSnapshot"
+> & {
+  readonly dependencies?: {
+    readonly partitions: readonly string[];
+    readonly tables: readonly string[];
+  };
+  readonly versionSnapshot?: {
+    readonly partitions: ReadonlyArray<readonly [string, number]>;
+    readonly tables: ReadonlyArray<readonly [string, number]>;
+  };
+};
+
 export class RealtimeSubscriptionDO {
   private readonly database: D1Database;
   private readonly env: RealtimeObjectEnv;
@@ -106,6 +122,7 @@ export class RealtimeSubscriptionDO {
   private lastOutboxLagMs = 0;
   private lastProcessedOutboxSequence: number | null = null;
   private lastReEvaluationLatencyMs = 0;
+  private registrationsLoaded = false;
   private shardGenerationId = DEFAULT_REALTIME_SHARD_GENERATION.generationId;
   private shardName = getRealtimeSubscriptionShardName();
 
@@ -119,11 +136,14 @@ export class RealtimeSubscriptionDO {
   }
 
   async alarm(): Promise<void> {
+    await this.ensureStoredRegistrationsLoaded();
+    await this.cleanupExpiredRegistrations();
     await this.cleanupRealtimeOutbox();
     await this.scheduleOutboxCleanupAlarm({ replace: true });
   }
 
   async fetch(request: Request): Promise<Response> {
+    await this.ensureStoredRegistrationsLoaded();
     const url = new URL(request.url);
     if (request.method !== "POST") {
       return new Response("Not found", { status: 404 });
@@ -184,11 +204,7 @@ export class RealtimeSubscriptionDO {
     };
     const existing = this.registrations.get(registrationKey);
     if (!existing || registration.epoch >= existing.epoch) {
-      if (existing) {
-        this.removeRegistrationFromIndexes(registrationKey, existing);
-      }
-      this.registrations.set(registrationKey, storedRegistration);
-      this.addRegistrationToIndexes(registrationKey, storedRegistration);
+      await this.setRegistrationByKey(registrationKey, storedRegistration);
     }
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
@@ -218,11 +234,7 @@ export class RealtimeSubscriptionDO {
       return jsonResponse({ ok: true });
     }
 
-    if (existing) {
-      this.removeRegistrationFromIndexes(registrationKey, existing);
-    }
-    this.registrations.set(registrationKey, storedRegistration);
-    this.addRegistrationToIndexes(registrationKey, storedRegistration);
+    await this.setRegistrationByKey(registrationKey, storedRegistration);
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
   }
@@ -241,14 +253,16 @@ export class RealtimeSubscriptionDO {
       return jsonResponse({ ok: false }, { status: 404 });
     }
 
-    registration.movePending = false;
+    const activatedRegistration = { ...registration, movePending: false };
+    await this.persistRegistrationByKey(registrationKey, activatedRegistration);
+    this.registrations.set(registrationKey, activatedRegistration);
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
   }
 
   private async handleUnregister(request: Request): Promise<Response> {
     const body = await readJsonObject(request);
-    this.deleteRegistrationByKey(
+    await this.deleteRegistrationByKey(
       createRegistrationKey(
         getStringField(body, "connectionKey"),
         getStringField(body, "subscriptionId")
@@ -613,6 +627,129 @@ export class RealtimeSubscriptionDO {
     return Array.from(this.registrations.values());
   }
 
+  private async ensureStoredRegistrationsLoaded(): Promise<void> {
+    if (this.registrationsLoaded) {
+      return;
+    }
+
+    const storage = this.state.storage;
+    if (!storage?.list) {
+      this.registrationsLoaded = true;
+      return;
+    }
+
+    const storedRegistrations =
+      await storage.list<StoredRealtimeRegistrationValue>({
+        prefix: REALTIME_REGISTRATION_STORAGE_PREFIX,
+      });
+    for (const [storageKey, value] of storedRegistrations) {
+      const registration = this.parseStoredRegistrationValue(value);
+      if (!registration) {
+        continue;
+      }
+
+      const registrationKey = storageKey.slice(
+        REALTIME_REGISTRATION_STORAGE_PREFIX.length
+      );
+      this.registrations.set(registrationKey, registration);
+      this.addRegistrationToIndexes(registrationKey, registration);
+    }
+    this.registrationsLoaded = true;
+  }
+
+  private parseStoredRegistrationValue(
+    value: unknown
+  ): StoredRealtimeRegistration | undefined {
+    if (typeof value !== "object" || value === null || Array.isArray(value)) {
+      return undefined;
+    }
+
+    try {
+      const input = value as Record<string, unknown>;
+      return {
+        ...this.parseRegistration(input),
+        dependencies: parseRealtimeDependencySetValue(input.dependencies),
+        lastResultJson:
+          typeof input.lastResultJson === "string"
+            ? input.lastResultJson
+            : undefined,
+        movePending: input.movePending === true,
+        reEvaluationRetryAt:
+          typeof input.reEvaluationRetryAt === "number"
+            ? input.reEvaluationRetryAt
+            : undefined,
+        versionSnapshot: parseRealtimeVersionSnapshotValue(
+          input.versionSnapshot
+        ),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async setRegistrationByKey(
+    registrationKey: string,
+    registration: StoredRealtimeRegistration
+  ): Promise<void> {
+    await this.persistRegistrationByKey(registrationKey, registration);
+
+    const existing = this.registrations.get(registrationKey);
+    if (existing) {
+      this.removeRegistrationFromIndexes(registrationKey, existing);
+    }
+
+    this.registrations.set(registrationKey, registration);
+    this.addRegistrationToIndexes(registrationKey, registration);
+  }
+
+  private async persistRegistration(
+    registration: StoredRealtimeRegistration
+  ): Promise<void> {
+    await this.persistRegistrationByKey(
+      createRegistrationKey(
+        registration.connectionKey,
+        registration.subscriptionId
+      ),
+      registration
+    );
+  }
+
+  private async persistRegistrationByKey(
+    registrationKey: string,
+    registration: StoredRealtimeRegistration
+  ): Promise<void> {
+    await this.state.storage?.put?.(
+      this.registrationStorageKey(registrationKey),
+      this.serializeStoredRegistration(registration)
+    );
+  }
+
+  private serializeStoredRegistration(
+    registration: StoredRealtimeRegistration
+  ): StoredRealtimeRegistrationValue {
+    return {
+      ...registration,
+      dependencies: registration.dependencies
+        ? serializeRealtimeDependencySet(registration.dependencies)
+        : undefined,
+      versionSnapshot: registration.versionSnapshot
+        ? serializeRealtimeVersionSnapshot(registration.versionSnapshot)
+        : undefined,
+    };
+  }
+
+  private async deleteStoredRegistrationByKey(
+    registrationKey: string
+  ): Promise<void> {
+    await this.state.storage?.delete?.(
+      this.registrationStorageKey(registrationKey)
+    );
+  }
+
+  private registrationStorageKey(registrationKey: string): string {
+    return `${REALTIME_REGISTRATION_STORAGE_PREFIX}${registrationKey}`;
+  }
+
   private async reEvaluateActiveRegistrations(
     targets: RealtimeAffectedTargets,
     source: RealtimeMetricSource,
@@ -740,8 +877,9 @@ export class RealtimeSubscriptionDO {
       shouldRelease = false;
       return { delivery, evaluated: 0, failed: 0, skipped: 0 };
     } catch (error) {
-      if (!this.deleteExpiredRegistration(registration)) {
+      if (!(await this.deleteExpiredRegistration(registration))) {
         this.backOffRegistrationReEvaluation(registration);
+        await this.persistRegistration(registration);
       }
       this.logReEvaluationFailure(registration, error);
       return { evaluated: 0, failed: 1, skipped: 0 };
@@ -783,6 +921,7 @@ export class RealtimeSubscriptionDO {
   }> {
     if (registration.leaseExpiresAt > Date.now()) {
       this.clearRegistrationReEvaluationBackoff(registration);
+      await this.persistRegistration(registration);
       return { evaluated: 1, failed: 0, skipped: 0 };
     }
 
@@ -790,14 +929,16 @@ export class RealtimeSubscriptionDO {
       if (await this.hasActiveConnectionSockets(registration)) {
         registration.leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
         this.clearRegistrationReEvaluationBackoff(registration);
+        await this.persistRegistration(registration);
         return { evaluated: 1, failed: 0, skipped: 0 };
       }
 
-      this.deleteExpiredRegistration(registration);
+      await this.deleteExpiredRegistration(registration);
       return { evaluated: 1, failed: 0, skipped: 0 };
     } catch (error) {
-      if (!this.deleteExpiredRegistration(registration)) {
+      if (!(await this.deleteExpiredRegistration(registration))) {
         this.backOffRegistrationReEvaluation(registration);
+        await this.persistRegistration(registration);
       }
       this.logReEvaluationFailure(registration, error);
       return { evaluated: 0, failed: 1, skipped: 0 };
@@ -909,9 +1050,12 @@ export class RealtimeSubscriptionDO {
       const stateUpdates: Promise<void>[] = [];
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
-          const deleted = this.deleteExpiredRegistration(delivery.registration);
+          const deleted = await this.deleteExpiredRegistration(
+            delivery.registration
+          );
           if (!(deleted || noTargetSockets)) {
             this.backOffRegistrationReEvaluation(delivery.registration);
+            await this.persistRegistration(delivery.registration);
           }
           continue;
         }
@@ -919,6 +1063,7 @@ export class RealtimeSubscriptionDO {
         delivery.registration.lastResultJson = delivery.resultJson;
         delivery.registration.leaseExpiresAt = leaseExpiresAt;
         this.clearRegistrationReEvaluationBackoff(delivery.registration);
+        await this.persistRegistration(delivery.registration);
         stateUpdates.push(this.updateDeliveredRegistrationState(delivery));
       }
       await Promise.allSettled(stateUpdates);
@@ -930,8 +1075,9 @@ export class RealtimeSubscriptionDO {
     } catch (error) {
       this.deliveryBatchFailuresSinceAutoscale += 1;
       for (const delivery of group.deliveries) {
-        if (!this.deleteExpiredRegistration(delivery.registration)) {
+        if (!(await this.deleteExpiredRegistration(delivery.registration))) {
           this.backOffRegistrationReEvaluation(delivery.registration);
+          await this.persistRegistration(delivery.registration);
         }
         this.logReEvaluationFailure(delivery.registration, error);
       }
@@ -959,8 +1105,9 @@ export class RealtimeSubscriptionDO {
         delivery.versionSnapshot
       );
     } catch (error) {
-      if (!this.deleteExpiredRegistration(delivery.registration)) {
+      if (!(await this.deleteExpiredRegistration(delivery.registration))) {
         this.backOffRegistrationReEvaluation(delivery.registration);
+        await this.persistRegistration(delivery.registration);
       }
       logRuntimeEvent(
         "error",
@@ -973,6 +1120,22 @@ export class RealtimeSubscriptionDO {
         }
       );
     }
+  }
+
+  private async cleanupExpiredRegistrations(): Promise<void> {
+    const now = Date.now();
+    const expiredRegistrationKeys: string[] = [];
+    for (const [registrationKey, registration] of this.registrations) {
+      if (registration.leaseExpiresAt <= now) {
+        expiredRegistrationKeys.push(registrationKey);
+      }
+    }
+
+    await Promise.all(
+      expiredRegistrationKeys.map((registrationKey) =>
+        this.deleteRegistrationByKey(registrationKey)
+      )
+    );
   }
 
   private async deliverPendingGroup(
@@ -1256,14 +1419,14 @@ export class RealtimeSubscriptionDO {
     return { dependencies, forceEvaluation: false };
   }
 
-  private deleteExpiredRegistration(
+  private async deleteExpiredRegistration(
     registration: StoredRealtimeRegistration
-  ): boolean {
+  ): Promise<boolean> {
     if (registration.leaseExpiresAt > Date.now()) {
       return false;
     }
 
-    this.deleteRegistrationByKey(
+    await this.deleteRegistrationByKey(
       createRegistrationKey(
         registration.connectionKey,
         registration.subscriptionId
@@ -1340,6 +1503,7 @@ export class RealtimeSubscriptionDO {
     registration.dependencies = dependencies;
     registration.versionSnapshot = versionSnapshot;
     this.addRegistrationToIndexes(registrationKey, registration);
+    await this.persistRegistrationByKey(registrationKey, registration);
     await this.migrateRegistrationToHomeShard(registration);
   }
 
@@ -1532,7 +1696,7 @@ export class RealtimeSubscriptionDO {
       );
     }
 
-    this.deleteRegistrationByKey(registrationKey);
+    await this.deleteRegistrationByKey(registrationKey);
   }
 
   private async moveConnectionRegistrationShard(
@@ -1647,12 +1811,16 @@ export class RealtimeSubscriptionDO {
     index.set(indexKey, registrationKeys);
   }
 
-  private deleteRegistrationByKey(registrationKey: string): void {
+  private async deleteRegistrationByKey(
+    registrationKey: string
+  ): Promise<void> {
     const registration = this.registrations.get(registrationKey);
     if (!registration) {
+      await this.deleteStoredRegistrationByKey(registrationKey);
       return;
     }
 
+    await this.deleteStoredRegistrationByKey(registrationKey);
     this.removeRegistrationFromIndexes(registrationKey, registration);
     this.registrations.delete(registrationKey);
   }
