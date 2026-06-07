@@ -6128,7 +6128,7 @@ describe("worker runtime", () => {
 
       if (path === "/catch-up") {
         catchUpAttempts += 1;
-        return Promise.resolve(Response.json({ ok: false }, { status: 503 }));
+        return Promise.reject(new TypeError("catch-up transport unavailable"));
       }
 
       return Promise.resolve(Response.json({ ok: true }));
@@ -6149,11 +6149,18 @@ describe("worker runtime", () => {
     expect(notifyAttempts).toBe(2);
     expect(catchUpAttempts).toBe(1);
     expect(
-      errorLog.mock.calls.some(
-        ([, payload]) =>
-          (payload as { event?: string })?.event ===
-          "runtime.realtime_notify_failed"
-      )
+      errorLog.mock.calls.some(([, payload]) => {
+        const event = payload as {
+          errorName?: string;
+          event?: string;
+          shardName?: string;
+        };
+        return (
+          event.event === "runtime.realtime_notify_failed" &&
+          event.errorName === "TypeError" &&
+          event.shardName === undefined
+        );
+      })
     ).toBe(true);
   });
 

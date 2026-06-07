@@ -189,19 +189,19 @@ async function notifyRealtimeSubscriptionShards(
             generationId: generation.generationId,
             shardName,
           });
-          throw error;
+          throw catchUpError;
         }
       }
     })
   );
-  const failedCount = results.filter(
-    (result) => result.status === "rejected"
-  ).length;
-  if (failedCount > 0) {
+  const failures = results.filter((result) => result.status === "rejected");
+  if (failures.length === 1 && failures[0]) {
+    throw failures[0].reason;
+  }
+
+  if (failures.length > 0) {
     throw new InternalRuntimeError(
-      `Realtime notify failed for ${failedCount} shard${
-        failedCount === 1 ? "" : "s"
-      }`
+      `Realtime notify failed for ${failures.length} shards`
     );
   }
 }
