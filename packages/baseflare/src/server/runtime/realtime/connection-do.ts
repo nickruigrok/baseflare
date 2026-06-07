@@ -140,15 +140,21 @@ export class RealtimeConnectionDO {
       );
     }
 
-    const pair = new WebSocketPair();
-    const client = pair[0];
-    const server = pair[1];
     const url = new URL(request.url);
     const clientKey =
       request.headers.get(REALTIME_CONNECTION_KEY_HEADER) ??
       resolveRealtimeConnectionKey(url);
     const authorizationHeader = request.headers.get("authorization");
-    const runtimeId = request.headers.get(REALTIME_RUNTIME_ID_HEADER) ?? "";
+    const runtimeId = request.headers.get(REALTIME_RUNTIME_ID_HEADER);
+    if (!runtimeId) {
+      throw new ValidationRuntimeError(
+        "Realtime subscription requests require a runtime id"
+      );
+    }
+
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
     const attachment = createRealtimeSocketAttachment({
       authorizationHeader,
       connectionKey: clientKey,
@@ -936,6 +942,9 @@ export class RealtimeConnectionDO {
           reconcileAfterRestore: false,
         });
         if (restoreResult.rejected > 0) {
+          if (restoreResult.accepted > 0) {
+            await this.catchUpActiveSubscriptions();
+          }
           await this.scheduleReconciliation();
           return;
         }

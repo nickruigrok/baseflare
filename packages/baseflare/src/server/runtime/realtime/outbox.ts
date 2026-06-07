@@ -444,28 +444,35 @@ function isRealtimePartitionTarget(
   );
 }
 
-export async function fetchOldestRealtimeOutboxSequence(
-  database: Pick<RuntimeDatabase, "prepare">
-): Promise<number | null> {
+export async function fetchRealtimeOutboxHistoryGap(
+  database: Pick<RuntimeDatabase, "prepare">,
+  afterSequence: number | null
+): Promise<{
+  readonly hasGap: boolean;
+  readonly latestSequence: number | null;
+}> {
+  if (afterSequence === null) {
+    return { hasGap: false, latestSequence: null };
+  }
+
   const row = await bindStatement(
     database,
-    `SELECT MIN(sequence) AS sequence FROM ${REALTIME_OUTBOX_TABLE_NAME}`,
+    `SELECT MIN(sequence) AS oldest_sequence, MAX(sequence) AS latest_sequence FROM ${REALTIME_OUTBOX_TABLE_NAME}`,
     []
-  ).first<{ sequence: number | null }>();
+  ).first<{
+    oldest_sequence: number | null;
+    latest_sequence: number | null;
+  }>();
 
-  return typeof row?.sequence === "number" ? row.sequence : null;
-}
+  const oldestSequence =
+    typeof row?.oldest_sequence === "number" ? row.oldest_sequence : null;
+  const latestSequence =
+    typeof row?.latest_sequence === "number" ? row.latest_sequence : null;
 
-export async function fetchLatestRealtimeOutboxSequence(
-  database: Pick<RuntimeDatabase, "prepare">
-): Promise<number | null> {
-  const row = await bindStatement(
-    database,
-    `SELECT MAX(sequence) AS sequence FROM ${REALTIME_OUTBOX_TABLE_NAME}`,
-    []
-  ).first<{ sequence: number | null }>();
-
-  return typeof row?.sequence === "number" ? row.sequence : null;
+  return {
+    hasGap: oldestSequence !== null && afterSequence + 1 < oldestSequence,
+    latestSequence,
+  };
 }
 
 export async function deleteRealtimeOutboxEventsBefore(

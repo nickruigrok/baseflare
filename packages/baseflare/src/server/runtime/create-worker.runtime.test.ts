@@ -2962,7 +2962,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -2971,7 +2974,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-b",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -3062,7 +3068,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -3225,6 +3234,25 @@ describe("worker runtime", () => {
     expect(response.status).toBe(404);
   });
 
+  it("rejects direct realtime socket upgrades without a runtime id", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    await expect(
+      connectionDo.fetch(
+        new Request("https://baseflare.internal/api/subscribe", {
+          headers: { upgrade: "websocket" },
+          method: "GET",
+        })
+      )
+    ).rejects.toThrow("runtime id");
+    expect(state.acceptedSockets).toHaveLength(0);
+  });
+
   it("isolates anonymous realtime sockets from each other", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -3235,13 +3263,19 @@ describe("worker runtime", () => {
     const clientBMessages: unknown[] = [];
     const responseA = await connectionDo.fetch(
       new Request("https://baseflare.internal/api/subscribe", {
-        headers: { upgrade: "websocket" },
+        headers: {
+          upgrade: "websocket",
+          "x-baseflare-realtime-runtime-id": "runtime:1",
+        },
         method: "GET",
       })
     );
     const responseB = await connectionDo.fetch(
       new Request("https://baseflare.internal/api/subscribe", {
-        headers: { upgrade: "websocket" },
+        headers: {
+          upgrade: "websocket",
+          "x-baseflare-realtime-runtime-id": "runtime:1",
+        },
         method: "GET",
       })
     );
@@ -3480,7 +3514,10 @@ describe("worker runtime", () => {
         new Request(
           "https://baseflare.internal/api/subscribe?clientId=shared-client",
           {
-            headers: { upgrade: "websocket" },
+            headers: {
+              upgrade: "websocket",
+              "x-baseflare-realtime-runtime-id": "runtime:1",
+            },
             method: "GET",
           }
         )
@@ -4039,6 +4076,100 @@ describe("worker runtime", () => {
     );
   });
 
+  it("catches up accepted hibernation restores when another restore still fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionRequests: Array<{
+      body: Record<string, unknown>;
+      path: string;
+    }> = [];
+    let connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ ok: true }))
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const [socket] = state.acceptedSockets;
+    if (!socket) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    (
+      response as Response & { readonly webSocket?: AttachedTestWebSocket }
+    ).webSocket?.accept?.();
+    for (const subscriptionId of ["sub-a", "sub-b"]) {
+      await connectionDo.webSocketMessage(
+        socket,
+        JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          epoch: subscriptionId === "sub-a" ? 1 : 2,
+          queryName: "todos:list",
+          subscriptionId,
+          type: "subscribe",
+        })
+      );
+    }
+
+    connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          const path = new URL(request.url).pathname;
+          subscriptionRequests.push({ body, path });
+          return path === "/register" && body.subscriptionId === "sub-b"
+            ? Response.json({ ok: false }, { status: 503 })
+            : Response.json({ events: [], ok: true });
+        }
+      ),
+    });
+
+    await waitFor(() =>
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_hibernation_subscription_restore_failed"
+      )
+    );
+    subscriptionRequests.length = 0;
+    state.alarmTime = null;
+
+    await connectionDo.alarm();
+
+    expect(
+      subscriptionRequests.filter(({ path }) => path === "/register")
+    ).toEqual([
+      expect.objectContaining({
+        body: expect.objectContaining({ subscriptionId: "sub-a" }),
+        path: "/register",
+      }),
+      expect.objectContaining({
+        body: expect.objectContaining({ subscriptionId: "sub-b" }),
+        path: "/register",
+      }),
+    ]);
+    expect(subscriptionRequests.some(({ path }) => path === "/catch-up")).toBe(
+      true
+    );
+    expect(state.alarmTime).toBeTypeOf("number");
+  });
+
   it("retries hibernation restore when generation lookup fails at wakeup", async () => {
     const errorLog = vi
       .spyOn(console, "error")
@@ -4260,7 +4391,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -4341,7 +4475,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -4389,7 +4526,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -4467,7 +4607,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -4582,7 +4725,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -4673,7 +4819,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -4751,7 +4900,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -4908,7 +5060,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -5078,7 +5233,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -5134,7 +5292,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -5188,7 +5349,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -5257,7 +5421,10 @@ describe("worker runtime", () => {
       new Request(
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
-          headers: { upgrade: "websocket" },
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
           method: "GET",
         }
       )
@@ -5882,6 +6049,7 @@ describe("worker runtime", () => {
 
   it("fully re-evaluates realtime subscriptions when catch-up history has a gap", async () => {
     const runtimeId = createRealtimeRuntimeId();
+    const prepare = vi.spyOn(env.APP_DB, "prepare");
     await createTodoViaRpc("owner-a", "gap-recovered");
     await createRealtimeOutboxEvent("gap-deleted", Date.now(), {
       partitions: [todoOwnerPartition("owner-a")],
@@ -5944,6 +6112,11 @@ describe("worker runtime", () => {
       recoveredByFullReevaluation: boolean;
     };
     const latestSequence = await getRealtimeOutboxSequence("gap-retained");
+    const historyGapQueries = prepare.mock.calls.filter(
+      ([sql]) =>
+        sql.includes("MIN(sequence) AS oldest_sequence") &&
+        sql.includes("MAX(sequence) AS latest_sequence")
+    );
 
     expect(body).toEqual(
       expect.objectContaining({
@@ -5968,6 +6141,85 @@ describe("worker runtime", () => {
     };
 
     expect(registrationsBody.lastProcessedOutboxSequence).toBe(latestSequence);
+    expect(historyGapQueries).toHaveLength(1);
+  });
+
+  it("advances catch-up cursor to afterSequence when retained gap rows are gone", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "gap-empty-recovered");
+    let historyGapQueries = 0;
+    const database = {
+      batch: env.APP_DB.batch.bind(env.APP_DB),
+      prepare(queryText: string): D1PreparedStatement {
+        if (
+          queryText.includes("MIN(sequence) AS oldest_sequence") &&
+          queryText.includes("MAX(sequence) AS latest_sequence")
+        ) {
+          historyGapQueries += 1;
+          return {
+            bind: () =>
+              ({
+                first: async () => ({
+                  latest_sequence: null,
+                  oldest_sequence: 200,
+                }),
+              }) as D1PreparedStatement,
+          } as D1PreparedStatement;
+        }
+        return env.APP_DB.prepare(queryText);
+      },
+      withSession: env.APP_DB.withSession?.bind(env.APP_DB),
+    } as D1Database;
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: database,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(
+          Response.json({
+            delivered: 1,
+            deliveredSubscriptions: ["sub-gap-empty"],
+            ok: true,
+          })
+        )
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-gap-empty",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: 123, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      recoveredByFullReevaluation: boolean;
+    };
+    const cursor = await env.APP_DB.prepare(
+      "SELECT last_processed_outbox_sequence FROM _bf_realtime_shard_cursors WHERE shard_name = ?"
+    )
+      .bind(getRealtimeSubscriptionShardName())
+      .first<{ last_processed_outbox_sequence: number }>();
+
+    expect(body.recoveredByFullReevaluation).toBe(true);
+    expect(cursor?.last_processed_outbox_sequence).toBe(123);
+    expect(historyGapQueries).toBe(1);
   });
 
   it("removes expired realtime outbox rows during catch-up cleanup", async () => {

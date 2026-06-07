@@ -6,11 +6,10 @@ import type { D1Database, DurableObjectStub, RuntimeDatabase } from "../types";
 import {
   createRealtimeOutboxResponseEvents,
   deleteRealtimeOutboxEventsBefore,
-  fetchLatestRealtimeOutboxSequence,
-  fetchOldestRealtimeOutboxSequence,
   fetchRealtimeOutboxEventById,
   fetchRealtimeOutboxEventRowExists,
   fetchRealtimeOutboxEvents,
+  fetchRealtimeOutboxHistoryGap,
 } from "./outbox";
 import {
   createFullRealtimeAffectedTargets,
@@ -328,18 +327,18 @@ export class RealtimeSubscriptionDO {
       body.afterSequence,
       "afterSequence"
     );
-    const recoveredByFullReevaluation =
-      await this.hasRealtimeOutboxHistoryGap(afterSequence);
-    if (recoveredByFullReevaluation) {
-      const latestSequence = await fetchLatestRealtimeOutboxSequence(
-        this.database
-      );
+    const historyGap = await fetchRealtimeOutboxHistoryGap(
+      this.database,
+      afterSequence
+    );
+    if (historyGap.hasGap) {
+      const recoverySequence = historyGap.latestSequence ?? afterSequence;
       const result = await this.reEvaluateActiveRegistrations(
-        createFullRealtimeAffectedTargets(latestSequence),
+        createFullRealtimeAffectedTargets(recoverySequence),
         "catch_up"
       );
       await this.advanceLastProcessedOutboxSequence(
-        latestSequence,
+        recoverySequence,
         shardContext
       );
       await this.cleanupRealtimeOutbox();
@@ -348,7 +347,7 @@ export class RealtimeSubscriptionDO {
         ...result,
         events: [],
         ok: true,
-        recoveredByFullReevaluation,
+        recoveredByFullReevaluation: true,
       });
     }
 
@@ -411,7 +410,7 @@ export class RealtimeSubscriptionDO {
       ...result,
       events: createRealtimeOutboxResponseEvents(events),
       ok: true,
-      recoveredByFullReevaluation,
+      recoveredByFullReevaluation: false,
     });
   }
 
@@ -519,19 +518,6 @@ export class RealtimeSubscriptionDO {
         this.pendingNotifyEventIds.size + this.reEvaluatingRegistrations.size,
       reEvaluationLatencyMs: this.lastReEvaluationLatencyMs,
     };
-  }
-
-  private async hasRealtimeOutboxHistoryGap(
-    afterSequence: number | null
-  ): Promise<boolean> {
-    if (afterSequence === null) {
-      return false;
-    }
-
-    const oldestSequence = await fetchOldestRealtimeOutboxSequence(
-      this.database
-    );
-    return oldestSequence !== null && afterSequence + 1 < oldestSequence;
   }
 
   private parseRegistration(
