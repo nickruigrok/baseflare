@@ -1060,10 +1060,19 @@ export class RealtimeSubscriptionDO {
           continue;
         }
 
-        delivery.registration.lastResultJson = delivery.resultJson;
-        delivery.registration.leaseExpiresAt = leaseExpiresAt;
-        this.clearRegistrationReEvaluationBackoff(delivery.registration);
-        await this.persistRegistration(delivery.registration);
+        const deliveredRegistration = {
+          ...delivery.registration,
+          lastResultJson: delivery.resultJson,
+          leaseExpiresAt,
+          reEvaluationRetryAt: undefined,
+        };
+        await this.persistRegistration(deliveredRegistration);
+        delivery.registration.lastResultJson =
+          deliveredRegistration.lastResultJson;
+        delivery.registration.leaseExpiresAt =
+          deliveredRegistration.leaseExpiresAt;
+        delivery.registration.reEvaluationRetryAt =
+          deliveredRegistration.reEvaluationRetryAt;
         stateUpdates.push(this.updateDeliveredRegistrationState(delivery));
       }
       await Promise.allSettled(stateUpdates);

@@ -175,6 +175,9 @@ export class RealtimeConnectionDO {
       server.addEventListener("close", () => {
         this.removeSocket(server);
       });
+      server.addEventListener("error", () => {
+        this.removeSocket(server);
+      });
     }
 
     return new Response(null, {

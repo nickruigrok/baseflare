@@ -132,6 +132,7 @@ class FakeRealtimeDurableObjectState {
   readonly durableStorage = new Map<string, unknown>();
   private readonly hibernatedSockets: readonly AttachedTestWebSocket[];
   alarmTime: number | null = null;
+  failedStoragePuts = 0;
 
   constructor(hibernatedSockets: readonly AttachedTestWebSocket[] = []) {
     this.hibernatedSockets = hibernatedSockets;
@@ -169,6 +170,11 @@ class FakeRealtimeDurableObjectState {
       return Promise.resolve(new Map(entries) as Map<string, T>);
     },
     put: <T = unknown>(key: string, value: T) => {
+      if (this.failedStoragePuts > 0) {
+        this.failedStoragePuts -= 1;
+        return Promise.reject(new Error("Storage put failed"));
+      }
+
       this.durableStorage.set(key, value);
       return Promise.resolve();
     },
@@ -1041,6 +1047,7 @@ interface RealtimeIndexTestState {
   readonly registrations: Map<
     string,
     {
+      lastResultJson?: string;
       leaseExpiresAt: number;
       movePending?: boolean;
       reEvaluationRetryAt?: number;
@@ -2578,6 +2585,134 @@ describe("worker runtime", () => {
     );
   });
 
+  it("keeps in-memory delivery results behind storage when delivery persistence fails", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const state = new FakeRealtimeDurableObjectState();
+    const connections = new FakeDurableObjectNamespace((_name, request) =>
+      acknowledgeRealtimeDeliveryRequest(request)
+    );
+    let subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const emptyResultJson = JSON.stringify([]);
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client:client-a",
+          connectionName: "connection:0",
+          dependencies: {
+            partitions: [],
+            tables: ["todos"],
+          },
+          epoch: 1,
+          lastResultJson: emptyResultJson,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+          versionSnapshot: {
+            partitions: [],
+            tables: [["todos", 0]],
+          },
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "storage-failed-delivery");
+    await createRealtimeOutboxEvent("storage-failed-delivery", Date.now(), {
+      tables: ["todos"],
+    });
+    state.failedStoragePuts = 1;
+
+    const failedResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "storage-failed-delivery" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const failedBody = (await failedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+    };
+    const registrationKey = realtimeRegistrationKey("client:client-a", "sub-a");
+    const failedRegistration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+
+    expect(failedBody).toEqual(
+      expect.objectContaining({ evaluated: 0, failed: 1 })
+    );
+    expect(failedRegistration?.lastResultJson).toBe(emptyResultJson);
+
+    subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const restoredRegistration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+    expect(restoredRegistration).toBeUndefined();
+
+    const registrationsResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: Array<{
+        lastResultJson?: string;
+        reEvaluationRetryAt?: number;
+      }>;
+    };
+    expect(registrationsBody.registrations[0]?.lastResultJson).toBe(
+      emptyResultJson
+    );
+    const loadedRegistration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+    expect(loadedRegistration?.lastResultJson).toBe(emptyResultJson);
+    if (loadedRegistration) {
+      loadedRegistration.reEvaluationRetryAt = Date.now() - 1;
+    }
+
+    await createTodoViaRpc("owner-a", "storage-successful-delivery");
+    await createRealtimeOutboxEvent("storage-successful-delivery", Date.now(), {
+      tables: ["todos"],
+    });
+    const successfulResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "storage-successful-delivery" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const successfulBody = (await successfulResponse.json()) as {
+      evaluated: number;
+      failed: number;
+    };
+    const successfulRegistration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+
+    expect(successfulBody).toEqual(
+      expect.objectContaining({ evaluated: 1, failed: 0 })
+    );
+    expect(successfulRegistration?.lastResultJson).toContain(
+      "storage-successful-delivery"
+    );
+  });
+
   it("removes persisted realtime registrations on unregister", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const state = new FakeRealtimeDurableObjectState();
@@ -3772,6 +3907,66 @@ describe("worker runtime", () => {
     expect(
       sentPayloads.map((payload) => JSON.parse(payload) as unknown)
     ).toEqual([{ error: "bad message", type: "error" }]);
+  });
+
+  it("removes non-hibernated realtime sockets after socket errors", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    client.accept?.();
+
+    const connectedResponse = await connectionDo.fetch(
+      new Request("https://baseflare.internal/has-sockets", {
+        body: JSON.stringify({ connectionKey: "client:client-a" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const internals = connectionDo as unknown as {
+      sockets: Set<WebSocket>;
+      socketsByConnectionKey: Map<string, Set<WebSocket>>;
+    };
+    const [server] = Array.from(internals.sockets);
+    if (!server) {
+      throw new Error("Expected accepted realtime socket");
+    }
+
+    server.dispatchEvent(new Event("error"));
+
+    const disconnectedResponse = await connectionDo.fetch(
+      new Request("https://baseflare.internal/has-sockets", {
+        body: JSON.stringify({ connectionKey: "client:client-a" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const connectedBody = (await connectedResponse.json()) as {
+      connected: boolean;
+    };
+    const disconnectedBody = (await disconnectedResponse.json()) as {
+      connected: boolean;
+    };
+
+    expect(connectedBody.connected).toBe(true);
+    expect(disconnectedBody.connected).toBe(false);
+    expect(internals.sockets.size).toBe(0);
+    expect(internals.socketsByConnectionKey.has("client:client-a")).toBe(false);
   });
 
   it("does not expose placeholder realtime reconcile behavior", async () => {
