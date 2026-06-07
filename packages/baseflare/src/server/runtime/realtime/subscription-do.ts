@@ -971,6 +971,7 @@ export class RealtimeSubscriptionDO {
       return;
     }
 
+    this.lastOutboxCleanupAt = now;
     try {
       const protectedSequence = await fetchOldestRealtimeShardCursor(
         this.database
@@ -985,7 +986,6 @@ export class RealtimeSubscriptionDO {
         result:
           deleted >= REALTIME_OUTBOX_CLEANUP_LIMIT ? "limited" : "cleaned",
       });
-      this.lastOutboxCleanupAt = now;
     } catch (error) {
       logRuntimeEvent("error", "runtime.realtime_outbox_cleanup_failed", {
         errorName: error instanceof Error ? error.name : typeof error,

@@ -45,6 +45,15 @@ type RealtimeOutboxDatabase = Pick<RuntimeDatabase, "prepare"> & {
   ) => Pick<RuntimeDatabase, "prepare">;
 };
 
+class RealtimeNotifyFailure extends InternalRuntimeError {
+  readonly retryable: boolean;
+
+  constructor(message: string, retryable: boolean) {
+    super(message);
+    this.retryable = retryable;
+  }
+}
+
 export interface RealtimeOutboxFetchResult {
   readonly events: RealtimeSequencedOutboxEvent[];
   readonly hasMalformedEvents: boolean;
@@ -152,6 +161,16 @@ async function notifyRealtimeSubscriptionShards(
           outboxBookmark
         );
       } catch (error) {
+        if (!isRetryableRealtimeNotifyError(error)) {
+          logRuntimeEvent("error", "runtime.realtime_notify_failed", {
+            errorName: error instanceof Error ? error.name : typeof error,
+            eventId: event.eventId,
+            generationId: generation.generationId,
+            shardName,
+          });
+          throw error;
+        }
+
         try {
           await catchUpRealtimeSubscriptionShard(
             database,
@@ -237,16 +256,35 @@ async function notifyRealtimeSubscriptionShard(
         return;
       }
 
-      throw new InternalRuntimeError(
-        `Realtime notify failed for ${shardName} with status ${response.status}`
+      throw new RealtimeNotifyFailure(
+        `Realtime notify failed for ${shardName} with status ${response.status}`,
+        isRetryableRealtimeNotifyStatus(response.status)
       );
     } catch (error) {
-      if (attempt >= 2) {
+      if (attempt >= 2 || !isRetryableRealtimeNotifyError(error)) {
         throw error;
       }
       await waitForRealtimeNotifyShardRetry();
     }
   }
+}
+
+function isRetryableRealtimeNotifyError(error: unknown): boolean {
+  if (error instanceof RealtimeNotifyFailure) {
+    return error.retryable;
+  }
+
+  return true;
+}
+
+function isRetryableRealtimeNotifyStatus(status: number): boolean {
+  return (
+    status === 408 ||
+    status === 409 ||
+    status === 425 ||
+    status === 429 ||
+    status >= 500
+  );
 }
 
 function waitForRealtimeNotifyShardRetry(): Promise<void> {

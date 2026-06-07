@@ -472,16 +472,10 @@ export class RealtimeConnectionDO {
 
   private createRegistration(
     message: Record<string, unknown>,
-    socket?: RuntimeWebSocket
+    socket: RuntimeWebSocket
   ): RealtimeRegistration {
     const subscriptionId = getStringField(message, "subscriptionId");
-    const attachment = socket
-      ? this.ensureSocketAttachment(socket)
-      : createRealtimeSocketAttachment({
-          authorizationHeader: undefined,
-          connectionKey: crypto.randomUUID(),
-          runtimeId: "",
-        });
+    const attachment = this.ensureSocketAttachment(socket);
     const connectionKey = attachment.connectionKey;
     return {
       args: message.args ?? {},

@@ -5630,7 +5630,7 @@ describe("worker runtime", () => {
     ).toBe(false);
   });
 
-  it("recovers failed realtime shard notification with immediate catch-up", async () => {
+  it("recovers exhausted 429 realtime shard notification with immediate catch-up", async () => {
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -5647,7 +5647,7 @@ describe("worker runtime", () => {
           notifyAttempts += 1;
           const body = (await request.json()) as { eventId: string };
           eventId = body.eventId;
-          return Response.json({ ok: false }, { status: 503 });
+          return Response.json({ ok: false }, { status: 429 });
         }
 
         if (path === "/catch-up") {
@@ -5737,6 +5737,49 @@ describe("worker runtime", () => {
 
     expect(notifyAttempts).toBe(2);
     expect(catchUpAttempts).toBe(1);
+    expect(
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_notify_failed"
+      )
+    ).toBe(true);
+  });
+
+  it("does not retry non-retryable realtime shard notification failures", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let notifyAttempts = 0;
+    let catchUpAttempts = 0;
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      const path = new URL(request.url).pathname;
+      if (path === "/notify") {
+        notifyAttempts += 1;
+        return Promise.resolve(Response.json({ ok: false }, { status: 400 }));
+      }
+
+      if (path === "/catch-up") {
+        catchUpAttempts += 1;
+      }
+
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+
+    await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken: "owner-a", text: "bad-notify" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      },
+      worker,
+      { ...env, REALTIME_SUBSCRIPTIONS: subscriptions }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(notifyAttempts).toBe(1);
+    expect(catchUpAttempts).toBe(0);
     expect(
       errorLog.mock.calls.some(
         ([, payload]) =>
@@ -6046,7 +6089,7 @@ describe("worker runtime", () => {
     );
   });
 
-  it("retries realtime outbox cleanup after a cleanup failure", async () => {
+  it("throttles realtime outbox cleanup after a cleanup failure", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi
       .spyOn(console, "error")
@@ -6091,14 +6134,14 @@ describe("worker runtime", () => {
     await catchUp();
     await catchUp();
 
-    const remaining = await env.APP_DB.prepare(
+    let remaining = await env.APP_DB.prepare(
       "SELECT COUNT(*) AS count FROM _bf_realtime_outbox WHERE event_id = ?"
     )
       .bind("retry-expired-outbox-event")
       .first<{ count: number }>();
 
-    expect(cursorReadAttempts).toBe(2);
-    expect(remaining?.count).toBe(0);
+    expect(cursorReadAttempts).toBe(1);
+    expect(remaining?.count).toBe(1);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -6106,6 +6149,21 @@ describe("worker runtime", () => {
         event: "runtime.realtime_outbox_cleanup_failed",
       })
     );
+
+    const internals = subscriptionDo as unknown as {
+      lastOutboxCleanupAt: number;
+    };
+    internals.lastOutboxCleanupAt = 0;
+    await catchUp();
+
+    remaining = await env.APP_DB.prepare(
+      "SELECT COUNT(*) AS count FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("retry-expired-outbox-event")
+      .first<{ count: number }>();
+
+    expect(cursorReadAttempts).toBe(2);
+    expect(remaining?.count).toBe(0);
     expect(info).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
