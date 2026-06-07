@@ -39,6 +39,12 @@ interface RealtimeOutboxRow {
   readonly tables: string;
 }
 
+type RealtimeOutboxDatabase = Pick<RuntimeDatabase, "prepare"> & {
+  readonly withSession?: (
+    constraint?: string
+  ) => Pick<RuntimeDatabase, "prepare">;
+};
+
 export interface RealtimeOutboxFetchResult {
   readonly events: RealtimeSequencedOutboxEvent[];
   readonly hasMalformedEvents: boolean;
@@ -62,6 +68,8 @@ export function createRealtimeOutboxOperation(
 ): RealtimeOutboxOperation {
   return {
     event,
+    // The SQL guard can skip this insert if the mutation chain failed; the
+    // expected change count below makes that fail closed during commit.
     expectedChanges: 1,
     params: [
       event.eventId,
@@ -123,7 +131,7 @@ export function createRealtimeMutationNotifier(
 }
 
 async function notifyRealtimeSubscriptionShards(
-  database: Pick<RuntimeDatabase, "prepare">,
+  database: RealtimeOutboxDatabase,
   namespace: DurableObjectNamespace,
   event: RealtimeOutboxEvent,
   outboxBookmark: string | null
@@ -134,23 +142,82 @@ async function notifyRealtimeSubscriptionShards(
     getRealtimeAffectedSubscriptionRouteTargets(event),
     generations
   );
-  await Promise.all(
-    stubs.map(({ generation, shardName, stub }) =>
-      notifyRealtimeSubscriptionShard(
-        stub,
-        event.eventId,
-        shardName,
-        outboxBookmark
-      ).catch((error: unknown) => {
-        logRuntimeEvent("error", "runtime.realtime_notify_failed", {
-          errorName: error instanceof Error ? error.name : typeof error,
-          eventId: event.eventId,
-          generationId: generation.generationId,
+  const results = await Promise.allSettled(
+    stubs.map(async ({ generation, shardName, stub }) => {
+      try {
+        await notifyRealtimeSubscriptionShard(
+          stub,
+          event.eventId,
           shardName,
-        });
-      })
-    )
+          outboxBookmark
+        );
+      } catch (error) {
+        try {
+          await catchUpRealtimeSubscriptionShard(
+            database,
+            stub,
+            event.eventId,
+            shardName,
+            outboxBookmark
+          );
+        } catch (catchUpError) {
+          logRuntimeEvent("error", "runtime.realtime_notify_failed", {
+            errorName:
+              catchUpError instanceof Error
+                ? catchUpError.name
+                : typeof catchUpError,
+            eventId: event.eventId,
+            generationId: generation.generationId,
+            shardName,
+          });
+          throw error;
+        }
+      }
+    })
   );
+  const failedCount = results.filter(
+    (result) => result.status === "rejected"
+  ).length;
+  if (failedCount > 0) {
+    throw new InternalRuntimeError(
+      `Realtime notify failed for ${failedCount} shard${
+        failedCount === 1 ? "" : "s"
+      }`
+    );
+  }
+}
+
+async function catchUpRealtimeSubscriptionShard(
+  database: RealtimeOutboxDatabase,
+  stub: DurableObjectStub,
+  eventId: string,
+  shardName: string,
+  outboxBookmark: string | null
+): Promise<void> {
+  const eventDatabase =
+    outboxBookmark && database.withSession
+      ? database.withSession(outboxBookmark)
+      : database;
+  const event = await fetchRealtimeOutboxEventById(eventDatabase, eventId);
+  if (!event) {
+    throw new InternalRuntimeError(
+      `Realtime notify recovery could not find outbox event ${eventId}`
+    );
+  }
+
+  const response = await stub.fetch("https://baseflare.internal/catch-up", {
+    body: JSON.stringify({
+      afterSequence: event.sequence - 1,
+      shardName,
+    }),
+    headers: JSON_HEADERS,
+    method: "POST",
+  });
+  if (!response.ok) {
+    throw new InternalRuntimeError(
+      `Realtime notify recovery failed for ${shardName} with status ${response.status}`
+    );
+  }
 }
 
 async function notifyRealtimeSubscriptionShard(

@@ -2822,7 +2822,7 @@ describe("worker runtime", () => {
     ).toBe(false);
   });
 
-  it("backs off expired unchanged realtime registrations when liveness check fails", async () => {
+  it("deletes expired unchanged realtime registrations when liveness check fails", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await createTodoViaRpc("owner-a", "stable-liveness-failure");
     const connections = new FakeDurableObjectNamespace(
@@ -2901,7 +2901,11 @@ describe("worker runtime", () => {
     };
 
     expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
-    expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(
+      getRealtimeIndexTestState(subscriptionDo).registrations.has(
+        realtimeRegistrationKey("client-a", "sub-a")
+      )
+    ).toBe(false);
   });
 
   it("preserves lastResultJson when adopting a migrated registration", async () => {
@@ -5624,6 +5628,122 @@ describe("worker runtime", () => {
           "runtime.realtime_notify_failed"
       )
     ).toBe(false);
+  });
+
+  it("recovers failed realtime shard notification with immediate catch-up", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let eventId: string | undefined;
+    let notifyAttempts = 0;
+    const catchUpBodies: Array<{
+      afterSequence: number | null;
+      shardName: string;
+    }> = [];
+    const subscriptions = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/notify") {
+          notifyAttempts += 1;
+          const body = (await request.json()) as { eventId: string };
+          eventId = body.eventId;
+          return Response.json({ ok: false }, { status: 503 });
+        }
+
+        if (path === "/catch-up") {
+          catchUpBodies.push(
+            (await request.json()) as {
+              afterSequence: number | null;
+              shardName: string;
+            }
+          );
+          return Response.json({
+            evaluated: 0,
+            events: [],
+            failed: 0,
+            ok: true,
+          });
+        }
+
+        return Response.json({ ok: true });
+      }
+    );
+
+    await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken: "owner-a", text: "recover-notify" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      },
+      worker,
+      { ...env, REALTIME_SUBSCRIPTIONS: subscriptions }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    if (!eventId) {
+      throw new Error("Expected realtime notify event id");
+    }
+
+    const sequence = await getRealtimeOutboxSequence(eventId);
+    expect(notifyAttempts).toBe(2);
+    expect(catchUpBodies).toEqual([
+      expect.objectContaining({
+        afterSequence: sequence - 1,
+        shardName: getRealtimeSubscriptionShardName(),
+      }),
+    ]);
+    expect(
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_notify_failed"
+      )
+    ).toBe(false);
+  });
+
+  it("logs realtime notify failure when immediate catch-up recovery fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let notifyAttempts = 0;
+    let catchUpAttempts = 0;
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      const path = new URL(request.url).pathname;
+      if (path === "/notify") {
+        notifyAttempts += 1;
+        return Promise.resolve(Response.json({ ok: false }, { status: 503 }));
+      }
+
+      if (path === "/catch-up") {
+        catchUpAttempts += 1;
+        return Promise.resolve(Response.json({ ok: false }, { status: 503 }));
+      }
+
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+
+    await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken: "owner-a", text: "failed-recovery" }),
+        headers: { authorization: "Bearer owner-a" },
+        method: "POST",
+      },
+      worker,
+      { ...env, REALTIME_SUBSCRIPTIONS: subscriptions }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+
+    expect(notifyAttempts).toBe(2);
+    expect(catchUpAttempts).toBe(1);
+    expect(
+      errorLog.mock.calls.some(
+        ([, payload]) =>
+          (payload as { event?: string })?.event ===
+          "runtime.realtime_notify_failed"
+      )
+    ).toBe(true);
   });
 
   it("lets subscription Durable Objects catch up from the realtime outbox", async () => {

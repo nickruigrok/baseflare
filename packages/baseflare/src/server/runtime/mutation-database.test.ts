@@ -21,6 +21,7 @@ import {
   resetOccContentionWarningStateForTest,
   withMutationRetry,
 } from "./mutation-database";
+import type { RealtimeMutationNotifier } from "./realtime/types";
 import type {
   D1BindingValue,
   D1Database,
@@ -242,12 +243,14 @@ function createMutationDatabase(
   database: D1Database,
   options: {
     readonly missingRules?: boolean;
+    readonly realtime?: RealtimeMutationNotifier;
     readonly rules?: Rules;
   } = {}
 ): MutationDatabase {
   return new MutationDatabase({
     database,
     getContext: () => ({}) as never,
+    realtime: options.realtime,
     rules: options.missingRules ? undefined : (options.rules ?? rules),
     schema,
   });
@@ -1039,6 +1042,31 @@ describe("MutationDatabase", () => {
     expect(operations[2]?.params.at(-1)).toBe(2);
     expect(operations[3]?.sql).toContain("WHERE changes() = ?");
     expect(operations[3]?.params.at(-1)).toBe(1);
+  });
+
+  it("fails closed when the guarded realtime outbox insert is skipped", async () => {
+    const notify = vi.fn();
+    const mutationDb = createMutationDatabase(
+      createFakeDatabase({
+        batchResults: [
+          tableVersionResult({ todos: 0 }),
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 1 }, success: true },
+          { meta: { changes: 0 }, success: true },
+        ],
+      }),
+      {
+        realtime: {
+          enabled: true,
+          notify,
+        },
+      }
+    );
+
+    await mutationDb.insert("todos", { text: "guarded-outbox" });
+
+    await expect(mutationDb.commit()).rejects.toThrow(InternalRuntimeError);
+    expect(notify).not.toHaveBeenCalled();
   });
 
   it("checks stale read versions when a table is also mutated", async () => {

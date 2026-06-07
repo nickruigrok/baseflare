@@ -729,7 +729,9 @@ export class RealtimeSubscriptionDO {
       this.deleteExpiredRegistration(registration);
       return { evaluated: 1, failed: 0, skipped: 0 };
     } catch (error) {
-      this.backOffRegistrationReEvaluation(registration);
+      if (!this.deleteExpiredRegistration(registration)) {
+        this.backOffRegistrationReEvaluation(registration);
+      }
       this.logReEvaluationFailure(registration, error);
       return { evaluated: 0, failed: 1, skipped: 0 };
     }
