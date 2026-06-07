@@ -65,6 +65,7 @@ import {
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   REALTIME_MAX_SUBSCRIPTION_SHARDS,
+  REALTIME_OUTBOX_CLEANUP_INTERVAL_MS,
   REALTIME_PENDING_WORK_LIMIT,
   REALTIME_RUNTIME_EVICTIONS_METRIC,
   REALTIME_SCALE_DOWN_WINDOW_MS,
@@ -1331,12 +1332,12 @@ describe("worker runtime", () => {
     expect(index?.name).toBe("todos_by_owner");
   });
 
-  it("bounds configured realtime runtime state", () => {
+  it("keeps configured realtime runtimes after the warning threshold is exceeded", () => {
     const infoLog = vi.spyOn(console, "info").mockImplementation(() => {
       // Runtime metrics are asserted below.
     });
     const warnLog = vi.spyOn(console, "warn").mockImplementation(() => {
-      // Runtime eviction is an operator diagnostic.
+      // Runtime limit warnings are operator diagnostics.
     });
     resetRealtimeRuntimeStateForTest();
     let latestRuntimeId = "";
@@ -1349,16 +1350,17 @@ describe("worker runtime", () => {
     }
 
     expect(configuredRealtimeRuntimes.size).toBe(
-      REALTIME_CONFIGURED_RUNTIME_LIMIT
+      REALTIME_CONFIGURED_RUNTIME_LIMIT + 2
     );
-    expect(configuredRealtimeRuntimes.has("runtime:1")).toBe(false);
+    expect(configuredRealtimeRuntimes.has("runtime:1")).toBe(true);
     expect(configuredRealtimeRuntimes.has(latestRuntimeId)).toBe(true);
     expect(warnLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
-        event: "runtime.realtime_runtime_evicted",
+        event: "runtime.realtime_runtime_limit_exceeded",
         limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
-        runtimeId: "runtime:1",
+        runtimeId: `runtime:${REALTIME_CONFIGURED_RUNTIME_LIMIT + 1}`,
+        size: REALTIME_CONFIGURED_RUNTIME_LIMIT + 1,
       })
     );
     expect(infoLog).toHaveBeenCalledWith(
@@ -1366,7 +1368,7 @@ describe("worker runtime", () => {
       expect.objectContaining({
         event: "runtime.metric",
         metric: REALTIME_RUNTIME_EVICTIONS_METRIC,
-        tags: { result: "evicted" },
+        tags: { result: "limit_exceeded" },
         value: 1,
       })
     );
@@ -5007,13 +5009,25 @@ describe("worker runtime", () => {
   });
 
   it("runs realtime restore catch-up from the supplied outbox sequence", async () => {
-    let catchUpBody: { afterSequence: number | null } | undefined;
+    let catchUpBody:
+      | { afterSequence: number | null; outboxBookmark?: string }
+      | undefined;
     const catchUpResponse = createDeferred<Response>();
+    const restoreDatabase = {
+      batch: env.APP_DB.batch.bind(env.APP_DB),
+      prepare: env.APP_DB.prepare.bind(env.APP_DB),
+      withSession: () => ({
+        batch: env.APP_DB.batch.bind(env.APP_DB),
+        getBookmark: () => "restore-catch-up-bookmark",
+        prepare: env.APP_DB.prepare.bind(env.APP_DB),
+      }),
+    } as D1Database;
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
         if (new URL(request.url).pathname === "/catch-up") {
           catchUpBody = (await request.json()) as {
             afterSequence: number | null;
+            outboxBookmark?: string;
           };
           return await catchUpResponse.promise;
         }
@@ -5022,7 +5036,7 @@ describe("worker runtime", () => {
       }
     );
     const connectionDo = new RealtimeConnectionDO(null, {
-      APP_DB: env.APP_DB,
+      APP_DB: restoreDatabase,
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
       REALTIME_SUBSCRIPTIONS: subscriptionDo,
     });
@@ -5066,7 +5080,12 @@ describe("worker runtime", () => {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
 
-    expect(catchUpBody).toEqual(expect.objectContaining({ afterSequence: 42 }));
+    expect(catchUpBody).toEqual(
+      expect.objectContaining({
+        afterSequence: 42,
+        outboxBookmark: "restore-catch-up-bookmark",
+      })
+    );
     expect(messages).toEqual([]);
 
     catchUpResponse.resolve(
@@ -6592,6 +6611,136 @@ describe("worker runtime", () => {
     expect(response.status).toBe(200);
     expect(expired).toBeNull();
     expect(recent?.event_id).toBe("recent-outbox-event");
+  });
+
+  it("schedules realtime outbox cleanup alarms without delaying pending alarms", async () => {
+    const now = 1_000_000;
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    try {
+      await subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            connectionKey: "client:cleanup-alarm",
+            connectionName: getRealtimeConnectionShardName(
+              "client:cleanup-alarm"
+            ),
+            epoch: 1,
+            queryName: "todos:list",
+            runtimeId: "runtime:1",
+            subscriptionId: "sub-cleanup-alarm",
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+      const pendingAlarm = state.alarmTime;
+      expect(pendingAlarm).toBe(now + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
+
+      nowSpy.mockReturnValue(now + 10_000);
+      await subscriptionDo.fetch(
+        new Request("https://baseflare.internal/adopt-registration", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            connectionKey: "client:cleanup-alarm",
+            connectionName: getRealtimeConnectionShardName(
+              "client:cleanup-alarm"
+            ),
+            epoch: 2,
+            queryName: "todos:list",
+            runtimeId: "runtime:1",
+            subscriptionId: "sub-cleanup-alarm",
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+      expect(state.alarmTime).toBe(pendingAlarm);
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it("runs realtime outbox cleanup from subscription alarms and reschedules", async () => {
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const expiredAt = now - 8 * 24 * 60 * 60 * 1000;
+    const recentAt = now;
+    await createRealtimeOutboxEvent("alarm-expired-outbox-event", expiredAt);
+    await createRealtimeOutboxEvent("alarm-recent-outbox-event", recentAt);
+    const state = new FakeRealtimeDurableObjectState();
+    state.alarmTime = now;
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    try {
+      await subscriptionDo.alarm();
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    const expired = await env.APP_DB.prepare(
+      "SELECT event_id FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("alarm-expired-outbox-event")
+      .first<{ event_id: string }>();
+    const recent = await env.APP_DB.prepare(
+      "SELECT event_id FROM _bf_realtime_outbox WHERE event_id = ?"
+    )
+      .bind("alarm-recent-outbox-event")
+      .first<{ event_id: string }>();
+
+    expect(expired).toBeNull();
+    expect(recent?.event_id).toBe("alarm-recent-outbox-event");
+    expect(state.alarmTime).toBe(now + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
+  });
+
+  it("reschedules realtime outbox cleanup alarms after cleanup failure", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const state = new FakeRealtimeDurableObjectState();
+    state.alarmTime = now;
+    const failingDatabase = {
+      batch: env.APP_DB.batch.bind(env.APP_DB),
+      prepare(sql: string) {
+        if (sql.includes("MIN(last_processed_outbox_sequence)")) {
+          throw new Error("cleanup unavailable");
+        }
+
+        return env.APP_DB.prepare(sql);
+      },
+    } as unknown as D1Database;
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: failingDatabase,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    try {
+      await subscriptionDo.alarm();
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "DatabaseRuntimeError",
+        event: "runtime.realtime_outbox_cleanup_failed",
+      })
+    );
+    expect(state.alarmTime).toBe(now + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
   });
 
   it("bounds and throttles realtime outbox cleanup work", async () => {

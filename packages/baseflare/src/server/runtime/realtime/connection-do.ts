@@ -393,6 +393,10 @@ export class RealtimeConnectionDO {
         message.afterSequence,
         "afterSequence"
       );
+      const restoreSession = this.env.APP_DB.withSession?.(
+        "first-unconstrained"
+      );
+      const outboxBookmark = restoreSession?.getBookmark();
       const catchUpTargets = await this.subscriptionCatchUpTargets(socket);
       const catchUpResults = await Promise.allSettled(
         catchUpTargets.map(async (catchUpTarget) => {
@@ -402,6 +406,7 @@ export class RealtimeConnectionDO {
               {
                 body: JSON.stringify({
                   afterSequence,
+                  outboxBookmark,
                   shardName: catchUpTarget.shardName,
                 }),
                 headers: JSON_HEADERS,

@@ -28,7 +28,7 @@ export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
   nextRealtimeRuntimeId += 1;
   const runtimeId = `runtime:${nextRealtimeRuntimeId}`;
   configuredRealtimeRuntimes.set(runtimeId, runtime);
-  trimConfiguredRealtimeRuntimes();
+  warnConfiguredRealtimeRuntimeLimit(runtimeId);
   return runtimeId;
 }
 
@@ -37,22 +37,19 @@ export function resetRealtimeRuntimeStateForTest(): void {
   nextRealtimeRuntimeId = 0;
 }
 
-function trimConfiguredRealtimeRuntimes(): void {
-  while (configuredRealtimeRuntimes.size > REALTIME_CONFIGURED_RUNTIME_LIMIT) {
-    const oldestRuntimeId = configuredRealtimeRuntimes.keys().next().value;
-    if (typeof oldestRuntimeId !== "string") {
-      return;
-    }
-
-    logRuntimeEvent("warn", "runtime.realtime_runtime_evicted", {
-      limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
-      runtimeId: oldestRuntimeId,
-    });
-    emitRealtimeMetric(REALTIME_RUNTIME_EVICTIONS_METRIC, 1, {
-      result: "evicted",
-    });
-    configuredRealtimeRuntimes.delete(oldestRuntimeId);
+function warnConfiguredRealtimeRuntimeLimit(runtimeId: string): void {
+  if (configuredRealtimeRuntimes.size <= REALTIME_CONFIGURED_RUNTIME_LIMIT) {
+    return;
   }
+
+  logRuntimeEvent("warn", "runtime.realtime_runtime_limit_exceeded", {
+    limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
+    runtimeId,
+    size: configuredRealtimeRuntimes.size,
+  });
+  emitRealtimeMetric(REALTIME_RUNTIME_EVICTIONS_METRIC, 1, {
+    result: "limit_exceeded",
+  });
 }
 
 export function jsonResponse(

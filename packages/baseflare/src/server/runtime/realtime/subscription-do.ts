@@ -52,6 +52,7 @@ import type {
   RealtimeDeliveryGroup,
   RealtimeDeliveryResult,
   RealtimeDependencySet,
+  RealtimeDurableObjectState,
   RealtimeMetricSource,
   RealtimeObjectEnv,
   RealtimePressureSnapshot,
@@ -94,6 +95,7 @@ export class RealtimeSubscriptionDO {
   private readonly registrationKeysByPartition = new Map<string, Set<string>>();
   private readonly registrationKeysByTable = new Map<string, Set<string>>();
   private readonly registrationKeysWithoutDependencies = new Set<string>();
+  private readonly state: RealtimeDurableObjectState;
   private readonly pendingNotifyEventIds = new Set<string>();
   private readonly reEvaluatingRegistrations = new Set<string>();
   private deliveryBatchAttemptsSinceAutoscale = 0;
@@ -107,9 +109,18 @@ export class RealtimeSubscriptionDO {
   private shardGenerationId = DEFAULT_REALTIME_SHARD_GENERATION.generationId;
   private shardName = getRealtimeSubscriptionShardName();
 
-  constructor(_state: unknown, env: RealtimeObjectEnv) {
+  constructor(
+    state: RealtimeDurableObjectState | null,
+    env: RealtimeObjectEnv
+  ) {
     this.database = env.APP_DB;
     this.env = env;
+    this.state = state ?? {};
+  }
+
+  async alarm(): Promise<void> {
+    await this.cleanupRealtimeOutbox();
+    await this.scheduleOutboxCleanupAlarm({ replace: true });
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -152,6 +163,7 @@ export class RealtimeSubscriptionDO {
   private async handleRegister(request: Request): Promise<Response> {
     const body = await readJsonObject(request);
     this.setCurrentShardName(getOptionalStringField(body, "shardName"));
+    await this.scheduleOutboxCleanupAlarm();
     const registration = this.parseRegistration(body);
     const registrationKey = createRegistrationKey(
       registration.connectionKey,
@@ -181,6 +193,7 @@ export class RealtimeSubscriptionDO {
   private async handleAdoptRegistration(request: Request): Promise<Response> {
     const body = await readJsonObject(request);
     this.setCurrentShardName(getOptionalStringField(body, "shardName"));
+    await this.scheduleOutboxCleanupAlarm();
     const registration = this.parseRegistration(body);
     const storedRegistration: StoredRealtimeRegistration = {
       ...registration,
@@ -226,6 +239,7 @@ export class RealtimeSubscriptionDO {
     const shardContext = this.setCurrentShardName(
       getOptionalStringField(body, "shardName")
     );
+    await this.scheduleOutboxCleanupAlarm();
     const eventId = getStringField(body, "eventId");
     const outboxBookmark = getOptionalStringField(body, "outboxBookmark");
     const backpressureResponse = this.tryReserveNotifyEvent(eventId);
@@ -343,6 +357,7 @@ export class RealtimeSubscriptionDO {
     const shardContext = this.setCurrentShardName(
       getOptionalStringField(body, "shardName")
     );
+    await this.scheduleOutboxCleanupAlarm();
     const afterSequence = getOptionalSequence(
       body.afterSequence,
       "afterSequence"
@@ -1005,6 +1020,24 @@ export class RealtimeSubscriptionDO {
         errorName: error instanceof Error ? error.name : typeof error,
       });
     }
+  }
+
+  private async scheduleOutboxCleanupAlarm(
+    options: { readonly replace?: boolean } = {}
+  ): Promise<void> {
+    const storage = this.state.storage;
+    if (!storage?.setAlarm) {
+      return;
+    }
+
+    if (!options.replace) {
+      const scheduledTime = await storage.getAlarm?.();
+      if (scheduledTime !== null && scheduledTime !== undefined) {
+        return;
+      }
+    }
+
+    await storage.setAlarm(Date.now() + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
   }
 
   private async evaluateRegistration(
