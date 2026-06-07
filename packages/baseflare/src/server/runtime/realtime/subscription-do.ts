@@ -158,13 +158,22 @@ export class RealtimeSubscriptionDO {
       registration.connectionKey,
       registration.subscriptionId
     );
+    const storedRegistration: StoredRealtimeRegistration = {
+      ...registration,
+      dependencies: parseRealtimeDependencySetValue(body.dependencies),
+      lastResultJson:
+        typeof body.lastResultJson === "string"
+          ? body.lastResultJson
+          : undefined,
+      versionSnapshot: parseRealtimeVersionSnapshotValue(body.versionSnapshot),
+    };
     const existing = this.registrations.get(registrationKey);
     if (!existing || registration.epoch >= existing.epoch) {
       if (existing) {
         this.removeRegistrationFromIndexes(registrationKey, existing);
       }
-      this.registrations.set(registrationKey, registration);
-      this.registrationKeysWithoutDependencies.add(registrationKey);
+      this.registrations.set(registrationKey, storedRegistration);
+      this.addRegistrationToIndexes(registrationKey, storedRegistration);
     }
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });

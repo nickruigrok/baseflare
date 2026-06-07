@@ -921,26 +921,6 @@ export class RealtimeConnectionDO {
     );
   }
 
-  private getReconciliationAfterSequence(): number | null {
-    let afterSequence: number | null = null;
-    for (const { attachment } of this.socketStates.values()) {
-      if (attachment.subscriptions.length === 0) {
-        continue;
-      }
-
-      if (attachment.latestDeliveredOutboxSequence == null) {
-        continue;
-      }
-
-      afterSequence =
-        afterSequence == null
-          ? attachment.latestDeliveredOutboxSequence
-          : Math.min(afterSequence, attachment.latestDeliveredOutboxSequence);
-    }
-
-    return afterSequence;
-  }
-
   private hasActiveSocketSubscriptions(): boolean {
     return [...this.socketStates.values()].some(
       ({ attachment }) => attachment.subscriptions.length > 0
@@ -983,8 +963,7 @@ export class RealtimeConnectionDO {
   }
 
   private async catchUpActiveSubscriptions(): Promise<void> {
-    const afterSequence = this.getReconciliationAfterSequence();
-    const targets = await this.subscriptionCatchUpTargets();
+    const targets = await this.reconciliationCatchUpTargets();
     const results = await Promise.allSettled(
       targets.map(async (target) => {
         try {
@@ -992,7 +971,7 @@ export class RealtimeConnectionDO {
             "https://baseflare.internal/catch-up",
             {
               body: JSON.stringify({
-                afterSequence,
+                afterSequence: target.afterSequence,
                 shardName: target.shardName,
               }),
               headers: JSON_HEADERS,
@@ -1030,6 +1009,90 @@ export class RealtimeConnectionDO {
         }`
       );
     }
+  }
+
+  private async reconciliationCatchUpTargets(): Promise<
+    Array<{
+      readonly afterSequence: number | null;
+      readonly shardName: string;
+      readonly stub: DurableObjectStub;
+    }>
+  > {
+    const targets = new Map<
+      string,
+      {
+        afterSequence: number | null;
+        shardName: string;
+        stub: DurableObjectStub;
+      }
+    >();
+    let defaultTarget:
+      | {
+          readonly shardName: string;
+          readonly stub: DurableObjectStub;
+        }
+      | undefined;
+
+    for (const { attachment } of this.socketStates.values()) {
+      if (attachment.subscriptions.length === 0) {
+        continue;
+      }
+
+      for (const subscription of attachment.subscriptions) {
+        let target: {
+          readonly shardName: string;
+          readonly stub: DurableObjectStub;
+        };
+        if (subscription.subscriptionShardName == null) {
+          defaultTarget ??= await this.subscriptionTarget();
+          target = defaultTarget;
+        } else {
+          target = {
+            shardName: subscription.subscriptionShardName,
+            stub: this.env.REALTIME_SUBSCRIPTIONS.get(
+              this.env.REALTIME_SUBSCRIPTIONS.idFromName(
+                subscription.subscriptionShardName
+              )
+            ),
+          };
+        }
+
+        const existing = targets.get(target.shardName);
+        const afterSequence = this.minAfterSequence(
+          existing?.afterSequence ?? null,
+          attachment.latestDeliveredOutboxSequence
+        );
+        targets.set(target.shardName, {
+          afterSequence,
+          shardName: target.shardName,
+          stub: target.stub,
+        });
+      }
+    }
+
+    if (targets.size === 0) {
+      const target = await this.subscriptionTarget();
+      return [
+        {
+          afterSequence: null,
+          shardName: target.shardName,
+          stub: target.stub,
+        },
+      ];
+    }
+
+    return [...targets.values()];
+  }
+
+  private minAfterSequence(
+    current: number | null,
+    candidate: number | null
+  ): number | null {
+    if (candidate == null) {
+      return current;
+    }
+
+    return current == null ? candidate : Math.min(current, candidate);
   }
 
   private async scheduleReconciliation(): Promise<void> {
