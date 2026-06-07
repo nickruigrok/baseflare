@@ -227,6 +227,7 @@ async function catchUpRealtimeSubscriptionShard(
   const response = await stub.fetch("https://baseflare.internal/catch-up", {
     body: JSON.stringify({
       afterSequence: event.sequence - 1,
+      outboxBookmark,
       shardName,
     }),
     headers: JSON_HEADERS,

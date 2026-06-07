@@ -327,15 +327,21 @@ export class RealtimeSubscriptionDO {
       body.afterSequence,
       "afterSequence"
     );
+    const outboxBookmark = getOptionalStringField(body, "outboxBookmark");
+    const database =
+      outboxBookmark && this.database.withSession
+        ? this.database.withSession(outboxBookmark)
+        : this.database;
     const historyGap = await fetchRealtimeOutboxHistoryGap(
-      this.database,
+      database,
       afterSequence
     );
     if (historyGap.hasGap) {
       const recoverySequence = historyGap.latestSequence ?? afterSequence;
       const result = await this.reEvaluateActiveRegistrations(
         createFullRealtimeAffectedTargets(recoverySequence),
-        "catch_up"
+        "catch_up",
+        database
       );
       await this.advanceLastProcessedOutboxSequence(
         recoverySequence,
@@ -352,7 +358,7 @@ export class RealtimeSubscriptionDO {
     }
 
     const catchUp = await fetchRealtimeOutboxEvents(
-      this.database,
+      database,
       afterSequence,
       typeof body.limit === "number"
         ? body.limit
@@ -361,7 +367,8 @@ export class RealtimeSubscriptionDO {
     if (catchUp.hasMalformedEvents) {
       const result = await this.reEvaluateActiveRegistrations(
         createFullRealtimeAffectedTargets(catchUp.latestReadSequence),
-        "catch_up"
+        "catch_up",
+        database
       );
       await this.advanceLastProcessedOutboxSequence(
         catchUp.latestReadSequence,
@@ -396,7 +403,8 @@ export class RealtimeSubscriptionDO {
     this.lastOutboxLagMs = emitOutboxLagMetric("catch_up", events);
     const result = await this.reEvaluateActiveRegistrations(
       createRealtimeAffectedTargets(events),
-      "catch_up"
+      "catch_up",
+      database
     );
     // Advance after evaluation so an unexpected evaluation failure cannot
     // make this shard permanently skip events.

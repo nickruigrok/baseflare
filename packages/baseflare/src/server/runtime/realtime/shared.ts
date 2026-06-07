@@ -207,7 +207,8 @@ export function parseRealtimeSocketAttachment(
   if (
     typeof attachment.connectionKey !== "string" ||
     typeof attachment.connectionName !== "string" ||
-    typeof attachment.runtimeId !== "string"
+    typeof attachment.runtimeId !== "string" ||
+    attachment.runtimeId.length === 0
   ) {
     return null;
   }

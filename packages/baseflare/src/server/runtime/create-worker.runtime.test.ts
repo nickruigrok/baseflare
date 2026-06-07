@@ -3417,6 +3417,84 @@ describe("worker runtime", () => {
     ]);
   });
 
+  it("closes hibernated realtime socket attachments with empty runtime ids", async () => {
+    const registerBodies: Array<{ runtimeId: string; subscriptionId: string }> =
+      [];
+    const closeCalls: Array<{ code: number; reason: string }> = [];
+    const messages: unknown[] = [];
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      close(code: number, reason: string) {
+        closeCalls.push({ code, reason });
+      },
+      deserializeAttachment() {
+        return {
+          connectionKey: "client-a",
+          connectionName: getRealtimeConnectionShardName("client-a"),
+          latestDeliveredOutboxSequence: null,
+          runtimeId: "",
+          subscriptions: [
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-empty-runtime",
+            },
+          ],
+        };
+      },
+      send(payload: string) {
+        messages.push(JSON.parse(payload) as unknown);
+      },
+    } as AttachedTestWebSocket;
+
+    const connectionDo = new RealtimeConnectionDO(
+      new FakeRealtimeDurableObjectState([socket]),
+      {
+        APP_DB: env.APP_DB,
+        REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+        REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+          async (_name, request) => {
+            if (new URL(request.url).pathname === "/register") {
+              registerBodies.push(
+                (await request.json()) as {
+                  runtimeId: string;
+                  subscriptionId: string;
+                }
+              );
+            }
+
+            return Response.json({ ok: true });
+          }
+        ),
+      }
+    );
+
+    expect(closeCalls).toEqual([
+      { code: 1011, reason: "Session expired, please reconnect" },
+    ]);
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-empty-runtime",
+        type: "subscribe",
+      })
+    );
+
+    expect(registerBodies).toEqual([]);
+    expect(messages).toEqual([
+      {
+        error: "Realtime socket session expired",
+        type: "error",
+      },
+    ]);
+  });
+
   it("drops malformed hibernated realtime socket subscriptions without closing the socket", async () => {
     const warnLog = vi.spyOn(console, "warn").mockImplementation(() => {
       // Malformed hibernated subscription entries are operator diagnostics.
@@ -5884,10 +5962,22 @@ describe("worker runtime", () => {
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
+    const bookmark = "catch-up-bookmark";
+    const session: D1DatabaseSession = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      getBookmark: () => bookmark,
+      prepare: (sql) => env.APP_DB.prepare(sql),
+    };
+    const database: D1Database = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      prepare: (sql) => env.APP_DB.prepare(sql),
+      withSession: () => session,
+    };
     let eventId: string | undefined;
     let notifyAttempts = 0;
     const catchUpBodies: Array<{
       afterSequence: number | null;
+      outboxBookmark?: string | null;
       shardName: string;
     }> = [];
     const subscriptions = new FakeDurableObjectNamespace(
@@ -5904,6 +5994,7 @@ describe("worker runtime", () => {
           catchUpBodies.push(
             (await request.json()) as {
               afterSequence: number | null;
+              outboxBookmark?: string | null;
               shardName: string;
             }
           );
@@ -5927,7 +6018,7 @@ describe("worker runtime", () => {
         method: "POST",
       },
       worker,
-      { ...env, REALTIME_SUBSCRIPTIONS: subscriptions }
+      { ...env, APP_DB: database, REALTIME_SUBSCRIPTIONS: subscriptions }
     );
     await new Promise((resolve) => setTimeout(resolve, 25));
 
@@ -5940,6 +6031,7 @@ describe("worker runtime", () => {
     expect(catchUpBodies).toEqual([
       expect.objectContaining({
         afterSequence: sequence - 1,
+        outboxBookmark: bookmark,
         shardName: getRealtimeSubscriptionShardName(),
       }),
     ]);
@@ -6083,6 +6175,116 @@ describe("worker runtime", () => {
 
     expect(registrationsBody.lastProcessedOutboxSequence).toBe(
       body.events[0]?.sequence
+    );
+  });
+
+  it("uses realtime catch-up bookmarks for outbox event reads and evaluation", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const sessionConstraints: string[] = [];
+    const sessionPreparedSql: string[] = [];
+    const staleOutboxStatement = {
+      all: async () => ({ results: [] }),
+      bind() {
+        return this;
+      },
+      first: async () => null,
+      run: async () => ({ meta: {}, success: true }),
+    } as unknown as D1PreparedStatement;
+    const session: D1DatabaseSession = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      getBookmark: () => "session-bookmark",
+      prepare: (sql) => {
+        sessionPreparedSql.push(sql);
+        return env.APP_DB.prepare(sql);
+      },
+    };
+    const database: D1Database = {
+      batch: (statements) => env.APP_DB.batch(statements),
+      prepare: (sql) => {
+        if (
+          sql.includes("FROM _bf_realtime_outbox") &&
+          sql.includes("ORDER BY sequence ASC LIMIT")
+        ) {
+          return staleOutboxStatement;
+        }
+
+        return env.APP_DB.prepare(sql);
+      },
+      withSession: (constraint) => {
+        sessionConstraints.push(constraint ?? "");
+        return session;
+      },
+    };
+    await createTodoViaRpc("owner-a", "bookmark-catch-up");
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: database,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          deliveries.push(delivery);
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-catch-up-bookmark",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({
+          afterSequence: null,
+          limit: 10,
+          outboxBookmark: "commit-bookmark",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      events: unknown[];
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(response.status).toBe(200);
+    expect(body).toEqual(
+      expect.objectContaining({
+        evaluated: 1,
+        failed: 0,
+        ok: true,
+      })
+    );
+    expect(body.events).toHaveLength(1);
+    expect(deliveries).toHaveLength(1);
+    expect(sessionConstraints).toEqual(["commit-bookmark"]);
+    expect(
+      sessionPreparedSql.some((sql) => sql.includes("FROM _bf_realtime_outbox"))
+    ).toBe(true);
+    expect(sessionPreparedSql.some((sql) => sql.includes("FROM todos"))).toBe(
+      true
     );
   });
 
