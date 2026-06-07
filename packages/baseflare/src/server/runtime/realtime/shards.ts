@@ -314,10 +314,12 @@ export async function evaluateRealtimeAutoscaling(
 
 function hasHighRealtimePressure(
   pressure: RealtimePressureSnapshot,
-  targetRegistrations: number
+  targetCapacity: number
 ): boolean {
   return (
-    pressure.activeRegistrationCount >= targetRegistrations ||
+    pressure.activeRegistrationCount >= targetCapacity ||
+    (pressure.activeQueryCount ?? 0) >= targetCapacity ||
+    (pressure.maxFanoutPerActiveQuery ?? 0) >= targetCapacity ||
     (pressure.pendingWorkCount ?? 0) >= REALTIME_PENDING_WORK_LIMIT ||
     (pressure.reEvaluationLatencyMs ?? 0) >=
       REALTIME_AUTOSCALE_MAX_LATENCY_MS ||
@@ -331,10 +333,12 @@ function hasHighRealtimePressure(
 
 function hasLowRealtimePressure(
   pressure: RealtimePressureSnapshot,
-  lowRegistrations: number
+  lowCapacity: number
 ): boolean {
   return (
-    pressure.activeRegistrationCount <= lowRegistrations &&
+    pressure.activeRegistrationCount <= lowCapacity &&
+    (pressure.activeQueryCount ?? 0) <= lowCapacity &&
+    (pressure.maxFanoutPerActiveQuery ?? 0) <= lowCapacity &&
     (pressure.pendingWorkCount ?? 0) === 0 &&
     (pressure.reEvaluationLatencyMs ?? 0) < REALTIME_AUTOSCALE_LOW_LATENCY_MS &&
     (pressure.deliveryBatchLatencyMs ?? 0) <
@@ -366,9 +370,11 @@ async function retireDrainedRealtimeShardGenerations(
 export function evaluateRealtimeAutoscalingForTest(
   database: Pick<RuntimeDatabase, "batch" | "prepare">,
   input: {
+    readonly activeQueryCount?: number;
     readonly activeRegistrationCount: number;
     readonly deliveryBatchLatencyMs?: number;
     readonly failedDeliveryRate?: number;
+    readonly maxFanoutPerActiveQuery?: number;
     readonly now?: number;
     readonly outboxLagMs?: number;
     readonly pendingWorkCount?: number;
@@ -378,9 +384,11 @@ export function evaluateRealtimeAutoscalingForTest(
   return evaluateRealtimeAutoscaling(database, {
     now: input.now,
     pressure: {
+      activeQueryCount: input.activeQueryCount,
       activeRegistrationCount: input.activeRegistrationCount,
       deliveryBatchLatencyMs: input.deliveryBatchLatencyMs,
       failedDeliveryRate: input.failedDeliveryRate,
+      maxFanoutPerActiveQuery: input.maxFanoutPerActiveQuery,
       outboxLagMs: input.outboxLagMs,
       pendingWorkCount: input.pendingWorkCount,
       reEvaluationLatencyMs: input.reEvaluationLatencyMs,

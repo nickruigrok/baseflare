@@ -177,6 +177,8 @@ export function createRealtimeOutboxStatements(): SqlStatement[] {
       params: [],
     },
     {
+      // Retention cleanup uses created_at; sequence catch-up scans use the
+      // INTEGER PRIMARY KEY clustered index on `sequence`.
       sql: `CREATE INDEX IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME}_created_at ON ${REALTIME_OUTBOX_TABLE_NAME} (created_at)`,
       params: [],
     },

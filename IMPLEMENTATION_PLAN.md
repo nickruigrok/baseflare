@@ -831,7 +831,7 @@ Two internal Durable Object roles split the work:
   client/session delivery state, reconnect restore state, live reconciliation
   alarms, and delivery to clients. Connection DOs use a fixed internal shard
   count by client/session key.
-- `RealtimeSubscriptionDO` owns subscription registration, dependency indexes,
+- `RealtimeSubscriptionDO` owns active query state, subscriber registrations,
   version-first reconciliation, query re-evaluation, outbox catch-up, and
   fanout planning.
 
@@ -846,8 +846,9 @@ draining generations use deterministic DO names:
 `subscription:g{generationId}:{shardIndex}`. New registrations use the active
 generation global route until the first successful query run captures
 dependencies. The owning subscription shard may then adopt the registration via
-an internal `/adopt-registration` handoff, and the source shard removes its copy
-only after adoption succeeds. Draining generations keep serving existing
+an internal `/adopt-registration` handoff. The target remains pending until the
+connection DO owner pointer moves and the target is activated; only then does
+the source shard remove its copy. Draining generations keep serving existing
 registrations until leases expire and outbox catch-up closes the gap. Live
 WebSockets are not moved between connection DOs; reconnect, hibernation restore,
 and lease drain make generation changes safe.
@@ -864,15 +865,23 @@ drain. It never increments by `+1` and never downscales below one shard.
   so client-local subscription ids cannot collide across sockets.
 - Anonymous sockets get server-generated connection keys. Explicit `clientId`
   or `sessionId` values still group intentional multi-tab sessions.
+- Identical safe subscriptions share one active query per subscription shard.
+  Active query keys include runtime id, query name, canonical args,
+  authorization header, and current home route, so different auth contexts never
+  coalesce.
 - Query dependencies are captured at runtime through the D1 read observer, not
   static analysis. Point reads and broad/unpartitioned queries record table
   dependencies. Partition-aligned queries record partition dependencies.
-- `RealtimeSubscriptionDO` maintains in-memory table/partition dependency
-  indexes and an unknown-dependency set so notify/catch-up selects relevant
-  registrations before query re-evaluation.
+- `RealtimeSubscriptionDO` persists active queries and registrations in Durable
+  Object storage. On wake it rebuilds active query membership, dependency
+  indexes, and conservative unknown-dependency indexes before notify/catch-up.
+- Active queries own dependencies, version snapshots, last result JSON, retry
+  state, and member registration keys. Registrations own subscriber lifecycle:
+  connection key, connection DO name, subscription id, epoch, lease, owner shard,
+  pending move state, and active query membership.
 - Dependency snapshots are replaced only after a successful re-evaluation. A
   failed re-evaluation keeps the previous snapshot so future events still find
-  the registration.
+  the active query.
 
 **Notification pipeline:**
 1. Mutation executes on D1 via Worker.
@@ -882,12 +891,17 @@ drain. It never increments by `+1` and never downscales below one shard.
    `RealtimeSubscriptionDO` generation shards as the fast path.
 5. Subscription DOs catch up from `_bf_realtime_outbox` when notifications are
    missed or coalesced under pressure.
-6. Subscription DOs compare monotonic table/partition versions before
-   re-querying. Unknown dependencies and retained-history gaps fall back to
-   full active-registration re-evaluation.
-7. Changed results are batched per `{ connectionName, connectionKey }` and sent
-   to `RealtimeConnectionDO` through item-acknowledged `/deliver-batch` calls.
-8. Connection DOs deliver individual `{ type: "delivery", message }` WebSocket
+6. Subscription DOs resolve affected active queries from dependency indexes and
+   compare monotonic table/partition versions before re-querying. Unknown
+   dependencies and retained-history gaps fall back to full active-query
+   re-evaluation.
+7. Each changed active query executes once per shard evaluation pass, then fans
+   out one pending delivery per member registration whose subscriber should
+   receive the new result.
+8. Changed results are batched per `{ connectionName, connectionKey }` and sent
+   to `RealtimeConnectionDO` through item-acknowledged internal `/deliver`
+   calls.
+9. Connection DOs deliver individual `{ type: "delivery", message }` WebSocket
    frames. Delivery messages include internal outbox `sequence` metadata.
 
 **Recovery model:** Worker-to-subscription notification is recovered by D1
@@ -898,13 +912,14 @@ hibernation stores socket attachments with active subscriptions and latest
 delivered outbox sequence. On wake, the connection DO rebuilds socket maps,
 re-registers attached subscriptions, and catches up from the stored sequence.
 Live reconciliation alarms run while active subscriptions exist and call
-catch-up using the minimum latest delivered sequence across active sockets.
+catch-up using a per-subscription-shard minimum latest delivered sequence across
+active sockets.
 
 Outbox cleanup is cursor-safe. Each active or draining subscription shard
 records `lastProcessedOutboxSequence`; cleanup preserves rows at or after the
 oldest required cursor and uses the retained-window policy only for older rows.
 If catch-up detects that retained history is incomplete, the shard performs a
-full active-registration re-evaluation and reports internal diagnostics.
+full active-query re-evaluation and reports internal diagnostics.
 
 **Registration lifecycle:** Connection-to-subscription registrations use leases and epochs. Subscription DOs expire stale registrations and ignore old epochs so restarted/evicted connection DOs do not leave phantom delivery targets.
 
@@ -928,9 +943,10 @@ item-level, so undelivered subscription results stay retryable.
    - Registers subscriptions with `RealtimeSubscriptionDO`
    - Reconciles subscriptions on reconnect, hibernation wake, and live alarms
 2. `RealtimeSubscriptionDO` Durable Object class:
-   - Tracks subscriptions with table/partition dependency indexes and shard cursors
+   - Tracks active queries with table/partition dependency indexes and shard cursors
+   - Tracks subscriber registrations as active query members
    - Handles outbox catch-up and `notify(eventId)`
-   - Compares versions, re-runs affected queries, re-evaluates permissions, and batches delivery per connection DO
+   - Compares versions, re-runs each affected active query once, re-evaluates permissions, and batches delivery per connection DO
 3. Realtime outbox:
    - D1-backed, append-only, compact event rows written with mutation commits
    - Outbox GC based on shard cursors and retained-window fallback
@@ -994,7 +1010,7 @@ item-level, so undelivered subscription results stay retryable.
   - unknown dependency/version state remains conservative
 - Performance:
   - local workerd-backed `pnpm test:perf` simulates high registration counts, hot partitions, broad subscriptions, reconnect storms, hibernation wake, autoscale decisions, and retained-cursor cleanup
-  - hot partition evaluates once per subscription key and batches connection delivery
+  - hot shared partitions evaluate once per active query and batch connection delivery
   - broad table/global queries are bounded by D1 concurrency
   - outbox GC and catch-up stay within configured lag budgets
 - Release commands:

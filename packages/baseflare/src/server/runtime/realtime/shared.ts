@@ -15,7 +15,7 @@ import {
   JSON_HEADERS,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_OUTBOX_LAG_METRIC,
-  REALTIME_RUNTIME_EVICTIONS_METRIC,
+  REALTIME_RUNTIME_LIMIT_EXCEEDED_METRIC,
 } from "./types";
 
 let nextRealtimeRuntimeId = 0;
@@ -30,7 +30,7 @@ export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
       limit: REALTIME_CONFIGURED_RUNTIME_LIMIT,
       size: configuredRealtimeRuntimes.size,
     });
-    emitRealtimeMetric(REALTIME_RUNTIME_EVICTIONS_METRIC, 1, {
+    emitRealtimeMetric(REALTIME_RUNTIME_LIMIT_EXCEEDED_METRIC, 1, {
       result: "limit_exceeded",
     });
     throw new InternalRuntimeError(

@@ -3,6 +3,7 @@ import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
 import { executeQueryDefinition } from "../execution";
 import { logRuntimeEvent } from "../logging";
 import type { D1Database, DurableObjectStub, RuntimeDatabase } from "../types";
+import { RealtimeActiveQueryStore } from "./active-query-store";
 import {
   createRealtimeOutboxResponseEvents,
   deleteRealtimeOutboxEventsBefore,
@@ -11,12 +12,12 @@ import {
   fetchRealtimeOutboxEvents,
   fetchRealtimeOutboxHistoryGap,
 } from "./outbox";
+import { RealtimeRegistrationStore } from "./registration-store";
 import {
   createFullRealtimeAffectedTargets,
   createRealtimeAffectedTargets,
   createRealtimeDependencySet,
   createRegistrationKey,
-  getPartitionDependencyTable,
   getRealtimeRegistrationHomeRouteTarget,
   getRealtimeShardGenerationIdFromName,
   getRealtimeSubscriptionShardName,
@@ -59,11 +60,13 @@ import type {
   RealtimeRegistration,
   RealtimeSequencedOutboxEvent,
   RealtimeVersionSnapshot,
+  StoredRealtimeActiveQuery,
   StoredRealtimeRegistration,
 } from "./types";
 import {
   DEFAULT_REALTIME_SHARD_GENERATION,
   JSON_HEADERS,
+  REALTIME_ACTIVE_QUERIES_METRIC,
   REALTIME_BACKPRESSURE_METRIC,
   REALTIME_CATCH_UP_EVENT_LIMIT,
   REALTIME_DELIVERY_BATCHES_METRIC,
@@ -75,9 +78,9 @@ import {
   REALTIME_OUTBOX_CLEANUPS_METRIC,
   REALTIME_OUTBOX_RETENTION_MS,
   REALTIME_PENDING_WORK_LIMIT,
+  REALTIME_QUERY_EXECUTIONS_SAVED_METRIC,
   REALTIME_RE_EVALUATIONS_METRIC,
   REALTIME_REEVALUATION_CONCURRENCY,
-  REALTIME_REEVALUATION_FAILURE_RETRY_MS,
 } from "./types";
 
 interface RealtimeShardContext {
@@ -85,34 +88,21 @@ interface RealtimeShardContext {
   readonly shardName: string;
 }
 
-const REALTIME_REGISTRATION_STORAGE_PREFIX = "realtime:registration:";
-
-type StoredRealtimeRegistrationValue = Omit<
-  StoredRealtimeRegistration,
-  "dependencies" | "versionSnapshot"
-> & {
-  readonly dependencies?: {
-    readonly partitions: readonly string[];
-    readonly tables: readonly string[];
-  };
-  readonly versionSnapshot?: {
-    readonly partitions: ReadonlyArray<readonly [string, number]>;
-    readonly tables: ReadonlyArray<readonly [string, number]>;
-  };
-};
+interface RealtimeEvaluationResult {
+  readonly dependencies: RealtimeDependencySet;
+  readonly result: unknown;
+  readonly resultJson: string;
+  readonly versionSnapshot: RealtimeVersionSnapshot;
+}
 
 export class RealtimeSubscriptionDO {
   private readonly database: D1Database;
   private readonly env: RealtimeObjectEnv;
-  private readonly registrations = new Map<
-    string,
-    StoredRealtimeRegistration
-  >();
-  private readonly registrationKeysByPartition = new Map<string, Set<string>>();
-  private readonly registrationKeysByTable = new Map<string, Set<string>>();
-  private readonly registrationKeysWithoutDependencies = new Set<string>();
+  private readonly activeQueryStore: RealtimeActiveQueryStore;
+  private readonly registrationStore: RealtimeRegistrationStore;
   private readonly state: RealtimeDurableObjectState;
   private readonly pendingNotifyEventIds = new Set<string>();
+  private readonly reEvaluatingActiveQueries = new Set<string>();
   private readonly reEvaluatingRegistrations = new Set<string>();
   private deliveryBatchAttemptsSinceAutoscale = 0;
   private deliveryBatchFailuresSinceAutoscale = 0;
@@ -122,7 +112,6 @@ export class RealtimeSubscriptionDO {
   private lastOutboxLagMs = 0;
   private lastProcessedOutboxSequence: number | null = null;
   private lastReEvaluationLatencyMs = 0;
-  private registrationsLoaded = false;
   private shardGenerationId = DEFAULT_REALTIME_SHARD_GENERATION.generationId;
   private shardName = getRealtimeSubscriptionShardName();
 
@@ -133,17 +122,22 @@ export class RealtimeSubscriptionDO {
     this.database = env.APP_DB;
     this.env = env;
     this.state = state ?? {};
+    this.activeQueryStore = new RealtimeActiveQueryStore(this.state);
+    this.registrationStore = new RealtimeRegistrationStore(
+      this.state,
+      this.activeQueryStore
+    );
   }
 
   async alarm(): Promise<void> {
-    await this.ensureStoredRegistrationsLoaded();
-    await this.cleanupExpiredRegistrations();
+    await this.loadRealtimeState();
+    await this.registrationStore.cleanupExpired();
     await this.cleanupRealtimeOutbox();
     await this.scheduleOutboxCleanupAlarm({ replace: true });
   }
 
   async fetch(request: Request): Promise<Response> {
-    await this.ensureStoredRegistrationsLoaded();
+    await this.loadRealtimeState();
     const url = new URL(request.url);
     if (request.method !== "POST") {
       return new Response("Not found", { status: 404 });
@@ -176,12 +170,17 @@ export class RealtimeSubscriptionDO {
     if (url.pathname === "/registrations") {
       return jsonResponse({
         lastProcessedOutboxSequence: this.lastProcessedOutboxSequence,
-        registrations: this.getStoredRegistrations(),
+        registrations: this.registrationStore.values(),
         shardName: this.shardName,
       });
     }
 
     return new Response("Not found", { status: 404 });
+  }
+
+  private async loadRealtimeState(): Promise<void> {
+    await this.activeQueryStore.loadOnce();
+    await this.registrationStore.loadOnce();
   }
 
   private async handleRegister(request: Request): Promise<Response> {
@@ -202,9 +201,9 @@ export class RealtimeSubscriptionDO {
           : undefined,
       versionSnapshot: parseRealtimeVersionSnapshotValue(body.versionSnapshot),
     };
-    const existing = this.registrations.get(registrationKey);
+    const existing = this.registrationStore.get(registrationKey);
     if (!existing || registration.epoch >= existing.epoch) {
-      await this.setRegistrationByKey(registrationKey, storedRegistration);
+      await this.registrationStore.upsert(registrationKey, storedRegistration);
     }
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
@@ -229,12 +228,12 @@ export class RealtimeSubscriptionDO {
       storedRegistration.connectionKey,
       storedRegistration.subscriptionId
     );
-    const existing = this.registrations.get(registrationKey);
+    const existing = this.registrationStore.get(registrationKey);
     if (existing && storedRegistration.epoch < existing.epoch) {
       return jsonResponse({ ok: true });
     }
 
-    await this.setRegistrationByKey(registrationKey, storedRegistration);
+    await this.registrationStore.upsert(registrationKey, storedRegistration);
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
   }
@@ -248,21 +247,20 @@ export class RealtimeSubscriptionDO {
       getStringField(body, "connectionKey"),
       getStringField(body, "subscriptionId")
     );
-    const registration = this.registrations.get(registrationKey);
+    const registration = this.registrationStore.get(registrationKey);
     if (!registration) {
       return jsonResponse({ ok: false }, { status: 404 });
     }
 
     const activatedRegistration = { ...registration, movePending: false };
-    await this.persistRegistrationByKey(registrationKey, activatedRegistration);
-    this.registrations.set(registrationKey, activatedRegistration);
+    await this.registrationStore.upsert(registrationKey, activatedRegistration);
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
   }
 
   private async handleUnregister(request: Request): Promise<Response> {
     const body = await readJsonObject(request);
-    await this.deleteRegistrationByKey(
+    await this.registrationStore.delete(
       createRegistrationKey(
         getStringField(body, "connectionKey"),
         getStringField(body, "subscriptionId")
@@ -294,6 +292,15 @@ export class RealtimeSubscriptionDO {
         outboxBookmark
       );
       if (eventLookup.status === "malformed") {
+        logRuntimeEvent(
+          "warn",
+          "runtime.realtime_notify_malformed_outbox_recovered",
+          {
+            eventId,
+            sequence: eventLookup.sequence,
+            shardName: this.shardName,
+          }
+        );
         const result = await this.reEvaluateActiveRegistrations(
           createFullRealtimeAffectedTargets(eventLookup.sequence),
           "notify",
@@ -587,13 +594,15 @@ export class RealtimeSubscriptionDO {
 
   private createRealtimePressureSnapshot(): RealtimePressureSnapshot {
     return {
-      activeRegistrationCount: this.registrations.size,
+      activeQueryCount: this.activeQueryStore.size(),
+      activeRegistrationCount: this.registrationStore.size(),
       deliveryBatchLatencyMs: this.lastDeliveryBatchLatencyMs,
       failedDeliveryRate:
         this.deliveryBatchAttemptsSinceAutoscale === 0
           ? 0
           : this.deliveryBatchFailuresSinceAutoscale /
             this.deliveryBatchAttemptsSinceAutoscale,
+      maxFanoutPerActiveQuery: this.activeQueryStore.maxFanout(),
       outboxLagMs: this.lastOutboxLagMs,
       pendingWorkCount:
         this.pendingNotifyEventIds.size + this.reEvaluatingRegistrations.size,
@@ -623,133 +632,6 @@ export class RealtimeSubscriptionDO {
     };
   }
 
-  private getStoredRegistrations(): StoredRealtimeRegistration[] {
-    return Array.from(this.registrations.values());
-  }
-
-  private async ensureStoredRegistrationsLoaded(): Promise<void> {
-    if (this.registrationsLoaded) {
-      return;
-    }
-
-    const storage = this.state.storage;
-    if (!storage?.list) {
-      this.registrationsLoaded = true;
-      return;
-    }
-
-    const storedRegistrations =
-      await storage.list<StoredRealtimeRegistrationValue>({
-        prefix: REALTIME_REGISTRATION_STORAGE_PREFIX,
-      });
-    for (const [storageKey, value] of storedRegistrations) {
-      const registration = this.parseStoredRegistrationValue(value);
-      if (!registration) {
-        continue;
-      }
-
-      const registrationKey = storageKey.slice(
-        REALTIME_REGISTRATION_STORAGE_PREFIX.length
-      );
-      this.registrations.set(registrationKey, registration);
-      this.addRegistrationToIndexes(registrationKey, registration);
-    }
-    this.registrationsLoaded = true;
-  }
-
-  private parseStoredRegistrationValue(
-    value: unknown
-  ): StoredRealtimeRegistration | undefined {
-    if (typeof value !== "object" || value === null || Array.isArray(value)) {
-      return undefined;
-    }
-
-    try {
-      const input = value as Record<string, unknown>;
-      return {
-        ...this.parseRegistration(input),
-        dependencies: parseRealtimeDependencySetValue(input.dependencies),
-        lastResultJson:
-          typeof input.lastResultJson === "string"
-            ? input.lastResultJson
-            : undefined,
-        movePending: input.movePending === true,
-        reEvaluationRetryAt:
-          typeof input.reEvaluationRetryAt === "number"
-            ? input.reEvaluationRetryAt
-            : undefined,
-        versionSnapshot: parseRealtimeVersionSnapshotValue(
-          input.versionSnapshot
-        ),
-      };
-    } catch {
-      return undefined;
-    }
-  }
-
-  private async setRegistrationByKey(
-    registrationKey: string,
-    registration: StoredRealtimeRegistration
-  ): Promise<void> {
-    await this.persistRegistrationByKey(registrationKey, registration);
-
-    const existing = this.registrations.get(registrationKey);
-    if (existing) {
-      this.removeRegistrationFromIndexes(registrationKey, existing);
-    }
-
-    this.registrations.set(registrationKey, registration);
-    this.addRegistrationToIndexes(registrationKey, registration);
-  }
-
-  private async persistRegistration(
-    registration: StoredRealtimeRegistration
-  ): Promise<void> {
-    await this.persistRegistrationByKey(
-      createRegistrationKey(
-        registration.connectionKey,
-        registration.subscriptionId
-      ),
-      registration
-    );
-  }
-
-  private async persistRegistrationByKey(
-    registrationKey: string,
-    registration: StoredRealtimeRegistration
-  ): Promise<void> {
-    await this.state.storage?.put?.(
-      this.registrationStorageKey(registrationKey),
-      this.serializeStoredRegistration(registration)
-    );
-  }
-
-  private serializeStoredRegistration(
-    registration: StoredRealtimeRegistration
-  ): StoredRealtimeRegistrationValue {
-    return {
-      ...registration,
-      dependencies: registration.dependencies
-        ? serializeRealtimeDependencySet(registration.dependencies)
-        : undefined,
-      versionSnapshot: registration.versionSnapshot
-        ? serializeRealtimeVersionSnapshot(registration.versionSnapshot)
-        : undefined,
-    };
-  }
-
-  private async deleteStoredRegistrationByKey(
-    registrationKey: string
-  ): Promise<void> {
-    await this.state.storage?.delete?.(
-      this.registrationStorageKey(registrationKey)
-    );
-  }
-
-  private registrationStorageKey(registrationKey: string): string {
-    return `${REALTIME_REGISTRATION_STORAGE_PREFIX}${registrationKey}`;
-  }
-
   private async reEvaluateActiveRegistrations(
     targets: RealtimeAffectedTargets,
     source: RealtimeMetricSource,
@@ -762,38 +644,42 @@ export class RealtimeSubscriptionDO {
     let evaluated = 0;
     let failed = 0;
     let skipped = 0;
+    const candidateActiveQueries: StoredRealtimeActiveQuery[] = [];
     const pendingDeliveries: PendingRealtimeDelivery[] = [];
-    const registrationKeys = [...this.getRelevantRegistrationKeys(targets)];
-    skipped += Math.max(0, this.registrations.size - registrationKeys.length);
-    let nextRegistrationIndex = 0;
-    const evaluateNextRegistration = async (): Promise<void> => {
-      while (nextRegistrationIndex < registrationKeys.length) {
-        const registrationKey = registrationKeys[nextRegistrationIndex];
-        nextRegistrationIndex += 1;
-        if (registrationKey === undefined) {
+    const activeQueryKeys = [...this.activeQueryStore.getRelevantKeys(targets)];
+    skipped += Math.max(
+      0,
+      this.activeQueryStore.size() - activeQueryKeys.length
+    );
+    let nextActiveQueryIndex = 0;
+    const prepareNextActiveQuery = async (): Promise<void> => {
+      while (nextActiveQueryIndex < activeQueryKeys.length) {
+        const activeQueryKey = activeQueryKeys[nextActiveQueryIndex];
+        nextActiveQueryIndex += 1;
+        if (activeQueryKey === undefined) {
           failed += 1;
           logRuntimeEvent(
             "error",
-            "runtime.realtime_registration_re_evaluation_failed",
+            "runtime.realtime_active_query_evaluation_failed",
             {
               errorName: "InternalRuntimeError",
               errorMessage:
-                "Realtime registration key was missing during re-evaluation",
+                "Realtime active query key was missing during re-evaluation",
             }
           );
           continue;
         }
 
-        const result = await this.tryEvaluateRegistration(
-          registrationKey,
+        const result = await this.prepareActiveQueryForEvaluation(
+          activeQueryKey,
           targets,
           database
         );
         evaluated += result.evaluated;
         failed += result.failed;
         skipped += result.skipped;
-        if (result.delivery) {
-          pendingDeliveries.push(result.delivery);
+        if (result.activeQuery) {
+          candidateActiveQueries.push(result.activeQuery);
         }
       }
     };
@@ -802,12 +688,21 @@ export class RealtimeSubscriptionDO {
         {
           length: Math.min(
             REALTIME_REEVALUATION_CONCURRENCY,
-            registrationKeys.length
+            activeQueryKeys.length
           ),
         },
-        () => evaluateNextRegistration()
+        () => prepareNextActiveQuery()
       )
     );
+
+    const evaluationResult = await this.evaluateActiveQueries(
+      candidateActiveQueries,
+      targets.sequence,
+      database
+    );
+    evaluated += evaluationResult.evaluated;
+    failed += evaluationResult.failed;
+    pendingDeliveries.push(...evaluationResult.deliveries);
 
     const deliveryResult = await this.flushPendingDeliveries(pendingDeliveries);
     evaluated += deliveryResult.evaluated;
@@ -825,69 +720,299 @@ export class RealtimeSubscriptionDO {
       source,
     });
     this.lastReEvaluationLatencyMs = Date.now() - startedAt;
+    emitRealtimeMetric(
+      REALTIME_ACTIVE_QUERIES_METRIC,
+      this.activeQueryStore.size(),
+      {
+        result: "active",
+        source,
+      }
+    );
+    emitRealtimeMetric(
+      REALTIME_ACTIVE_QUERIES_METRIC,
+      this.activeQueryStore.maxFanout(),
+      {
+        result: "fanout",
+        source,
+      }
+    );
 
     return { evaluated, failed };
   }
 
-  private async tryEvaluateRegistration(
-    registrationKey: string,
+  private async prepareActiveQueryForEvaluation(
+    activeQueryKey: string,
     targets: RealtimeAffectedTargets,
     database: RuntimeDatabase
   ): Promise<{
-    readonly delivery?: PendingRealtimeDelivery;
     readonly evaluated: number;
     readonly failed: number;
+    readonly activeQuery?: StoredRealtimeActiveQuery;
     readonly skipped: number;
   }> {
-    const registration = this.registrations.get(registrationKey);
-    if (!registration) {
+    const activeQuery = this.activeQueryStore.get(activeQueryKey);
+    if (!activeQuery) {
       return { evaluated: 0, failed: 0, skipped: 0 };
     }
 
-    if (registration.movePending) {
+    if (this.isActiveQueryReEvaluationBackedOff(activeQuery)) {
       return { evaluated: 0, failed: 0, skipped: 1 };
     }
 
-    if (this.isRegistrationReEvaluationBackedOff(registration)) {
+    if (this.reEvaluatingActiveQueries.has(activeQueryKey)) {
       return { evaluated: 0, failed: 0, skipped: 1 };
     }
 
-    if (this.reEvaluatingRegistrations.has(registrationKey)) {
-      return { evaluated: 0, failed: 0, skipped: 1 };
-    }
-
-    this.reEvaluatingRegistrations.add(registrationKey);
+    this.reEvaluatingActiveQueries.add(activeQueryKey);
     let shouldRelease = true;
     try {
-      if (
-        !(await this.hasRelevantVersionGap(registration, targets, database))
-      ) {
+      if (!(await this.hasRelevantVersionGap(activeQuery, targets, database))) {
         return { evaluated: 0, failed: 0, skipped: 1 };
       }
 
-      const delivery = await this.evaluateRegistration(
-        registration,
-        targets.sequence,
-        database
-      );
-      if (!delivery) {
-        return await this.handleUnchangedRegistration(registration);
-      }
-
       shouldRelease = false;
-      return { delivery, evaluated: 0, failed: 0, skipped: 0 };
-    } catch (error) {
-      if (!(await this.deleteExpiredRegistration(registration))) {
-        this.backOffRegistrationReEvaluation(registration);
-        await this.persistRegistration(registration);
-      }
-      this.logReEvaluationFailure(registration, error);
+      return { activeQuery, evaluated: 0, failed: 0, skipped: 0 };
+    } catch {
+      await this.recoverFailedActiveQueryEvaluation(activeQuery);
       return { evaluated: 0, failed: 1, skipped: 0 };
     } finally {
       if (shouldRelease) {
-        this.reEvaluatingRegistrations.delete(registrationKey);
+        this.reEvaluatingActiveQueries.delete(activeQueryKey);
       }
     }
+  }
+
+  private async evaluateActiveQueries(
+    activeQueries: readonly StoredRealtimeActiveQuery[],
+    sequence: number | null,
+    database: RuntimeDatabase
+  ): Promise<{
+    readonly deliveries: PendingRealtimeDelivery[];
+    readonly evaluated: number;
+    readonly failed: number;
+  }> {
+    let nextGroupIndex = 0;
+    const deliveries: PendingRealtimeDelivery[] = [];
+    let evaluated = 0;
+    let failed = 0;
+    const evaluateNextGroup = async (): Promise<void> => {
+      while (nextGroupIndex < activeQueries.length) {
+        const activeQuery = activeQueries[nextGroupIndex];
+        nextGroupIndex += 1;
+        if (!activeQuery) {
+          continue;
+        }
+
+        const result = await this.evaluateActiveQuery(
+          activeQuery,
+          sequence,
+          database
+        );
+        evaluated += result.evaluated;
+        failed += result.failed;
+        deliveries.push(...result.deliveries);
+        emitRealtimeMetric(REALTIME_ACTIVE_QUERIES_METRIC, 1, {
+          result: result.failed > 0 ? "failed" : "evaluated",
+        });
+      }
+    };
+
+    await Promise.all(
+      Array.from(
+        {
+          length: Math.min(
+            REALTIME_REEVALUATION_CONCURRENCY,
+            activeQueries.length
+          ),
+        },
+        () => evaluateNextGroup()
+      )
+    );
+
+    return { deliveries, evaluated, failed };
+  }
+
+  private async evaluateActiveQuery(
+    activeQuery: StoredRealtimeActiveQuery,
+    sequence: number | null,
+    database: RuntimeDatabase
+  ): Promise<{
+    readonly deliveries: PendingRealtimeDelivery[];
+    readonly evaluated: number;
+    readonly failed: number;
+  }> {
+    const registrations = this.getActiveQueryRegistrations(activeQuery);
+    if (registrations.length === 0) {
+      this.releaseActiveQueryEvaluation(activeQuery);
+      return { deliveries: [], evaluated: 0, failed: 0 };
+    }
+
+    try {
+      const evaluation = await this.evaluateActiveQueryDefinition(
+        activeQuery,
+        database
+      );
+      const result = await this.createActiveQueryDeliveries(
+        activeQuery,
+        registrations,
+        sequence,
+        evaluation
+      );
+      emitRealtimeMetric(
+        REALTIME_QUERY_EXECUTIONS_SAVED_METRIC,
+        Math.max(0, registrations.length - 1),
+        { result: registrations.length > 1 ? "fanout" : "single" }
+      );
+      return result;
+    } catch (error) {
+      await this.recoverFailedActiveQueryEvaluation(activeQuery);
+      await Promise.allSettled(
+        registrations.map((registration) =>
+          this.recoverFailedEvaluationRegistration(registration, error)
+        )
+      );
+      this.releaseActiveQueryEvaluation(activeQuery);
+      return {
+        deliveries: [],
+        evaluated: 0,
+        failed: registrations.length,
+      };
+    }
+  }
+
+  private async createActiveQueryDeliveries(
+    activeQuery: StoredRealtimeActiveQuery,
+    registrations: readonly StoredRealtimeRegistration[],
+    sequence: number | null,
+    evaluation: RealtimeEvaluationResult
+  ): Promise<{
+    readonly deliveries: PendingRealtimeDelivery[];
+    readonly evaluated: number;
+    readonly failed: number;
+  }> {
+    const deliveries: PendingRealtimeDelivery[] = [];
+    let evaluated = 0;
+    let failed = 0;
+    for (const registration of registrations) {
+      const registrationKey = createRegistrationKey(
+        registration.connectionKey,
+        registration.subscriptionId
+      );
+      this.reEvaluatingRegistrations.add(registrationKey);
+      try {
+        if (evaluation.resultJson === registration.lastResultJson) {
+          const unchanged =
+            await this.handleUnchangedRegistration(registration);
+          evaluated += unchanged.evaluated;
+          failed += unchanged.failed;
+          if (unchanged.active) {
+            await this.updateRegistrationDependencies(
+              registration,
+              evaluation.dependencies,
+              evaluation.versionSnapshot
+            );
+          }
+          this.releaseRegistrationEvaluation(registration);
+          continue;
+        }
+
+        deliveries.push(
+          this.createPendingDelivery(registration, sequence, evaluation)
+        );
+      } catch (error) {
+        await this.recoverFailedEvaluationRegistration(registration, error);
+        this.releaseRegistrationEvaluation(registration);
+        failed += 1;
+      }
+    }
+
+    this.releaseActiveQueryEvaluation(activeQuery);
+    return { deliveries, evaluated, failed };
+  }
+
+  private getActiveQueryRegistrations(
+    activeQuery: StoredRealtimeActiveQuery
+  ): StoredRealtimeRegistration[] {
+    const registrations: StoredRealtimeRegistration[] = [];
+    for (const registrationKey of activeQuery.memberRegistrationKeys) {
+      const registration = this.registrationStore.get(registrationKey);
+      if (!registration || registration.movePending) {
+        continue;
+      }
+
+      if (this.isRegistrationReEvaluationBackedOff(registration)) {
+        continue;
+      }
+
+      registrations.push(registration);
+    }
+
+    return registrations;
+  }
+
+  private async recoverFailedEvaluationRegistration(
+    registration: StoredRealtimeRegistration,
+    error: unknown
+  ): Promise<void> {
+    try {
+      if (!(await this.registrationStore.deleteExpired(registration))) {
+        await this.registrationStore.markBackedOff(registration);
+      }
+    } catch (recoveryError) {
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_registration_state_update_failed",
+        {
+          connectionKey: registration.connectionKey,
+          errorName:
+            recoveryError instanceof Error
+              ? recoveryError.name
+              : typeof recoveryError,
+          queryName: registration.queryName,
+          subscriptionId: registration.subscriptionId,
+        }
+      );
+    } finally {
+      this.logReEvaluationFailure(registration, error);
+    }
+  }
+
+  private async recoverFailedActiveQueryEvaluation(
+    activeQuery: StoredRealtimeActiveQuery
+  ): Promise<void> {
+    try {
+      await this.activeQueryStore.markBackedOff(activeQuery);
+    } catch (recoveryError) {
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_active_query_state_update_failed",
+        {
+          activeQueryKey: activeQuery.key,
+          errorName:
+            recoveryError instanceof Error
+              ? recoveryError.name
+              : typeof recoveryError,
+          queryName: activeQuery.queryName,
+        }
+      );
+    }
+  }
+
+  private releaseRegistrationEvaluation(
+    registration: StoredRealtimeRegistration
+  ): void {
+    this.reEvaluatingRegistrations.delete(
+      createRegistrationKey(
+        registration.connectionKey,
+        registration.subscriptionId
+      )
+    );
+  }
+
+  private releaseActiveQueryEvaluation(
+    activeQuery: StoredRealtimeActiveQuery
+  ): void {
+    this.reEvaluatingActiveQueries.delete(activeQuery.key);
   }
 
   private isRegistrationReEvaluationBackedOff(
@@ -899,49 +1024,46 @@ export class RealtimeSubscriptionDO {
     );
   }
 
-  private backOffRegistrationReEvaluation(
-    registration: StoredRealtimeRegistration
-  ): void {
-    registration.reEvaluationRetryAt =
-      Date.now() + REALTIME_REEVALUATION_FAILURE_RETRY_MS;
-  }
-
-  private clearRegistrationReEvaluationBackoff(
-    registration: StoredRealtimeRegistration
-  ): void {
-    registration.reEvaluationRetryAt = undefined;
+  private isActiveQueryReEvaluationBackedOff(
+    activeQuery: StoredRealtimeActiveQuery
+  ): boolean {
+    return (
+      typeof activeQuery.reEvaluationRetryAt === "number" &&
+      activeQuery.reEvaluationRetryAt > Date.now()
+    );
   }
 
   private async handleUnchangedRegistration(
     registration: StoredRealtimeRegistration
   ): Promise<{
+    readonly active: boolean;
     readonly evaluated: number;
     readonly failed: number;
     readonly skipped: number;
   }> {
     if (registration.leaseExpiresAt > Date.now()) {
-      this.clearRegistrationReEvaluationBackoff(registration);
-      await this.persistRegistration(registration);
-      return { evaluated: 1, failed: 0, skipped: 0 };
+      await this.registrationStore.clearBackoff(registration);
+      return { active: true, evaluated: 1, failed: 0, skipped: 0 };
     }
 
     try {
       if (await this.hasActiveConnectionSockets(registration)) {
-        registration.leaseExpiresAt = Date.now() + REALTIME_LEASE_MS;
-        this.clearRegistrationReEvaluationBackoff(registration);
-        await this.persistRegistration(registration);
-        return { evaluated: 1, failed: 0, skipped: 0 };
+        await this.registrationStore.renewLease(
+          registration,
+          Date.now() + REALTIME_LEASE_MS
+        );
+        return { active: true, evaluated: 1, failed: 0, skipped: 0 };
       }
 
-      await this.deleteExpiredRegistration(registration);
-      return { evaluated: 1, failed: 0, skipped: 0 };
+      await this.registrationStore.deleteExpired(registration);
+      return { active: false, evaluated: 1, failed: 0, skipped: 0 };
     } catch (error) {
-      if (!(await this.deleteExpiredRegistration(registration))) {
-        this.backOffRegistrationReEvaluation(registration);
-        await this.persistRegistration(registration);
+      const deleted = await this.registrationStore.deleteExpired(registration);
+      if (!deleted) {
+        await this.registrationStore.markBackedOff(registration);
       }
       this.logReEvaluationFailure(registration, error);
-      return { evaluated: 0, failed: 1, skipped: 0 };
+      return { active: !deleted, evaluated: 0, failed: 1, skipped: 0 };
     }
   }
 
@@ -1050,29 +1172,20 @@ export class RealtimeSubscriptionDO {
       const stateUpdates: Promise<void>[] = [];
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
-          const deleted = await this.deleteExpiredRegistration(
+          const deleted = await this.registrationStore.deleteExpired(
             delivery.registration
           );
           if (!(deleted || noTargetSockets)) {
-            this.backOffRegistrationReEvaluation(delivery.registration);
-            await this.persistRegistration(delivery.registration);
+            await this.registrationStore.markBackedOff(delivery.registration);
           }
           continue;
         }
 
-        const deliveredRegistration = {
-          ...delivery.registration,
-          lastResultJson: delivery.resultJson,
-          leaseExpiresAt,
-          reEvaluationRetryAt: undefined,
-        };
-        await this.persistRegistration(deliveredRegistration);
-        delivery.registration.lastResultJson =
-          deliveredRegistration.lastResultJson;
-        delivery.registration.leaseExpiresAt =
-          deliveredRegistration.leaseExpiresAt;
-        delivery.registration.reEvaluationRetryAt =
-          deliveredRegistration.reEvaluationRetryAt;
+        await this.registrationStore.markDelivered(
+          delivery.registration,
+          delivery.resultJson,
+          leaseExpiresAt
+        );
         stateUpdates.push(this.updateDeliveredRegistrationState(delivery));
       }
       await Promise.allSettled(stateUpdates);
@@ -1083,13 +1196,11 @@ export class RealtimeSubscriptionDO {
       };
     } catch (error) {
       this.deliveryBatchFailuresSinceAutoscale += 1;
-      for (const delivery of group.deliveries) {
-        if (!(await this.deleteExpiredRegistration(delivery.registration))) {
-          this.backOffRegistrationReEvaluation(delivery.registration);
-          await this.persistRegistration(delivery.registration);
-        }
-        this.logReEvaluationFailure(delivery.registration, error);
-      }
+      await Promise.allSettled(
+        group.deliveries.map((delivery) =>
+          this.recoverFailedDeliveryRegistration(delivery, error)
+        )
+      );
       this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
       return { evaluated: 0, failed: group.deliveries.length };
     } finally {
@@ -1104,6 +1215,35 @@ export class RealtimeSubscriptionDO {
     }
   }
 
+  private async recoverFailedDeliveryRegistration(
+    delivery: PendingRealtimeDelivery,
+    deliveryError: unknown
+  ): Promise<void> {
+    try {
+      if (
+        !(await this.registrationStore.deleteExpired(delivery.registration))
+      ) {
+        await this.registrationStore.markBackedOff(delivery.registration);
+      }
+    } catch (recoveryError) {
+      logRuntimeEvent(
+        "error",
+        "runtime.realtime_registration_state_update_failed",
+        {
+          connectionKey: delivery.registration.connectionKey,
+          errorName:
+            recoveryError instanceof Error
+              ? recoveryError.name
+              : typeof recoveryError,
+          queryName: delivery.registration.queryName,
+          subscriptionId: delivery.registration.subscriptionId,
+        }
+      );
+    } finally {
+      this.logReEvaluationFailure(delivery.registration, deliveryError);
+    }
+  }
+
   private async updateDeliveredRegistrationState(
     delivery: PendingRealtimeDelivery
   ): Promise<void> {
@@ -1114,9 +1254,10 @@ export class RealtimeSubscriptionDO {
         delivery.versionSnapshot
       );
     } catch (error) {
-      if (!(await this.deleteExpiredRegistration(delivery.registration))) {
-        this.backOffRegistrationReEvaluation(delivery.registration);
-        await this.persistRegistration(delivery.registration);
+      if (
+        !(await this.registrationStore.deleteExpired(delivery.registration))
+      ) {
+        await this.registrationStore.markBackedOff(delivery.registration);
       }
       logRuntimeEvent(
         "error",
@@ -1129,22 +1270,6 @@ export class RealtimeSubscriptionDO {
         }
       );
     }
-  }
-
-  private async cleanupExpiredRegistrations(): Promise<void> {
-    const now = Date.now();
-    const expiredRegistrationKeys: string[] = [];
-    for (const [registrationKey, registration] of this.registrations) {
-      if (registration.leaseExpiresAt <= now) {
-        expiredRegistrationKeys.push(registrationKey);
-      }
-    }
-
-    await Promise.all(
-      expiredRegistrationKeys.map((registrationKey) =>
-        this.deleteRegistrationByKey(registrationKey)
-      )
-    );
   }
 
   private async deliverPendingGroup(
@@ -1250,12 +1375,11 @@ export class RealtimeSubscriptionDO {
     await storage.setAlarm(Date.now() + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
   }
 
-  private async evaluateRegistration(
-    registration: StoredRealtimeRegistration,
-    sequence: number | null,
+  private async evaluateActiveQueryDefinition(
+    activeQuery: StoredRealtimeActiveQuery,
     database: RuntimeDatabase
-  ): Promise<PendingRealtimeDelivery | null> {
-    const runtime = configuredRealtimeRuntimes.get(registration.runtimeId);
+  ): Promise<RealtimeEvaluationResult> {
+    const runtime = configuredRealtimeRuntimes.get(activeQuery.runtimeId);
     if (!runtime) {
       throw new InternalRuntimeError(
         "Baseflare runtime misconfiguration: realtime query runtime is not configured"
@@ -1264,18 +1388,18 @@ export class RealtimeSubscriptionDO {
 
     const entry = runtime.functionIndex.getByName(
       "query",
-      registration.queryName,
+      activeQuery.queryName,
       "public"
     );
     if (!entry) {
       throw new ValidationRuntimeError(
-        `Realtime query "${registration.queryName}" was not found`
+        `Realtime query "${activeQuery.queryName}" was not found`
       );
     }
 
     const headers = new Headers();
-    if (registration.authorizationHeader) {
-      headers.set("authorization", registration.authorizationHeader);
+    if (activeQuery.authorizationHeader) {
+      headers.set("authorization", activeQuery.authorizationHeader);
     }
 
     const { dependencies, readObserver } = createRealtimeDependencySet();
@@ -1294,59 +1418,59 @@ export class RealtimeSubscriptionDO {
         rules: runtime.rules,
         schema: runtime.schema,
       },
-      registration.args
+      activeQuery.args
     );
     const resultJson = JSON.stringify(result);
     const versionSnapshot = await fetchRealtimeVersionSnapshot(
       database,
       dependencies
     );
-    if (resultJson === registration.lastResultJson) {
-      await this.updateRegistrationDependencies(
-        registration,
-        dependencies,
-        versionSnapshot
-      );
-      return null;
-    }
 
+    return { dependencies, result, resultJson, versionSnapshot };
+  }
+
+  private createPendingDelivery(
+    registration: StoredRealtimeRegistration,
+    sequence: number | null,
+    evaluation: RealtimeEvaluationResult
+  ): PendingRealtimeDelivery {
     return {
-      dependencies,
+      dependencies: evaluation.dependencies,
       message: {
-        result,
+        result: evaluation.result,
         sequence,
         subscriptionId: registration.subscriptionId,
       },
       registration,
-      resultJson,
-      versionSnapshot,
+      resultJson: evaluation.resultJson,
+      versionSnapshot: evaluation.versionSnapshot,
     };
   }
 
   private async hasRelevantVersionGap(
-    registration: StoredRealtimeRegistration,
+    activeQuery: StoredRealtimeActiveQuery,
     targets: RealtimeAffectedTargets,
     database: RuntimeDatabase
   ): Promise<boolean> {
     if (
       targets.all ||
-      !registration.dependencies ||
-      !registration.versionSnapshot
+      !activeQuery.dependencies ||
+      !activeQuery.versionSnapshot
     ) {
       return true;
     }
     if (
-      registration.dependencies.tables.size === 0 &&
-      registration.dependencies.partitions.size === 0
+      activeQuery.dependencies.tables.size === 0 &&
+      activeQuery.dependencies.partitions.size === 0
     ) {
       return true;
     }
-    if (isZeroRealtimeVersionSnapshot(registration.versionSnapshot)) {
+    if (isZeroRealtimeVersionSnapshot(activeQuery.versionSnapshot)) {
       return true;
     }
 
     const relevant = this.getRelevantVersionGapDependencies(
-      registration.dependencies,
+      activeQuery.dependencies,
       targets
     );
     if (relevant.forceEvaluation) {
@@ -1368,7 +1492,7 @@ export class RealtimeSubscriptionDO {
     for (const tableName of relevantDependencies.tables) {
       if (
         currentSnapshot.tables.get(tableName) !==
-        registration.versionSnapshot.tables.get(tableName)
+        activeQuery.versionSnapshot.tables.get(tableName)
       ) {
         return true;
       }
@@ -1377,7 +1501,7 @@ export class RealtimeSubscriptionDO {
     for (const partitionId of relevantDependencies.partitions) {
       if (
         currentSnapshot.partitions.get(partitionId) !==
-        registration.versionSnapshot.partitions.get(partitionId)
+        activeQuery.versionSnapshot.partitions.get(partitionId)
       ) {
         return true;
       }
@@ -1428,77 +1552,6 @@ export class RealtimeSubscriptionDO {
     return { dependencies, forceEvaluation: false };
   }
 
-  private async deleteExpiredRegistration(
-    registration: StoredRealtimeRegistration
-  ): Promise<boolean> {
-    if (registration.leaseExpiresAt > Date.now()) {
-      return false;
-    }
-
-    await this.deleteRegistrationByKey(
-      createRegistrationKey(
-        registration.connectionKey,
-        registration.subscriptionId
-      )
-    );
-    return true;
-  }
-
-  private getRelevantRegistrationKeys(
-    targets: RealtimeAffectedTargets
-  ): Set<string> {
-    if (targets.all) {
-      return new Set(this.registrations.keys());
-    }
-
-    const registrationKeys = new Set(this.registrationKeysWithoutDependencies);
-
-    for (const tableName of targets.tables) {
-      this.addIndexedRegistrationKeys(
-        registrationKeys,
-        this.registrationKeysByTable.get(tableName)
-      );
-    }
-
-    for (const partitionId of targets.partitions) {
-      this.addIndexedRegistrationKeys(
-        registrationKeys,
-        this.registrationKeysByPartition.get(partitionId)
-      );
-    }
-
-    for (const tableName of targets.broadTables) {
-      this.addPartitionRegistrationKeysForTable(registrationKeys, tableName);
-    }
-
-    return registrationKeys;
-  }
-
-  private addPartitionRegistrationKeysForTable(
-    target: Set<string>,
-    tableName: string
-  ): void {
-    for (const [partitionId, registrationKeys] of this
-      .registrationKeysByPartition) {
-      if (getPartitionDependencyTable(partitionId) === tableName) {
-        this.addIndexedRegistrationKeys(target, registrationKeys);
-      }
-    }
-  }
-
-  private addIndexedRegistrationKeys(
-    target: Set<string>,
-    registrationKeys: ReadonlySet<string> | undefined
-  ): void {
-    if (!registrationKeys) {
-      return;
-    }
-
-    for (const registrationKey of registrationKeys) {
-      target.add(registrationKey);
-    }
-  }
-
   private async updateRegistrationDependencies(
     registration: StoredRealtimeRegistration,
     dependencies: RealtimeDependencySet,
@@ -1508,62 +1561,49 @@ export class RealtimeSubscriptionDO {
       registration.connectionKey,
       registration.subscriptionId
     );
-    this.removeRegistrationFromIndexes(registrationKey, registration);
-    registration.dependencies = dependencies;
-    registration.versionSnapshot = versionSnapshot;
-    this.addRegistrationToIndexes(registrationKey, registration);
-    await this.persistRegistrationByKey(registrationKey, registration);
-    await this.migrateRegistrationToHomeShard(registration);
-  }
-
-  private addRegistrationToIndexes(
-    registrationKey: string,
-    registration: StoredRealtimeRegistration
-  ): void {
-    if (
-      !registration.dependencies ||
-      (registration.dependencies.tables.size === 0 &&
-        registration.dependencies.partitions.size === 0)
-    ) {
-      this.registrationKeysWithoutDependencies.add(registrationKey);
+    const nextRegistration = {
+      ...registration,
+      dependencies,
+      versionSnapshot,
+    };
+    const targetShardName =
+      await this.resolveActiveHomeShardName(nextRegistration);
+    if (targetShardName && targetShardName !== this.shardName) {
+      await this.migrateRegistrationToHomeShard(
+        nextRegistration,
+        targetShardName
+      );
       return;
     }
 
-    for (const tableName of registration.dependencies.tables) {
-      this.addRegistrationToIndex(
-        this.registrationKeysByTable,
-        tableName,
-        registrationKey
-      );
-    }
-
-    for (const partitionId of registration.dependencies.partitions) {
-      this.addRegistrationToIndex(
-        this.registrationKeysByPartition,
-        partitionId,
-        registrationKey
-      );
-    }
+    await this.registrationStore.updateSameShardDependencies(
+      registrationKey,
+      registration,
+      dependencies,
+      versionSnapshot
+    );
   }
 
-  private async migrateRegistrationToHomeShard(
+  private async resolveActiveHomeShardName(
     registration: StoredRealtimeRegistration
-  ): Promise<void> {
+  ): Promise<string | null> {
     const activeGeneration = await fetchActiveRealtimeShardGeneration(
       this.database
     );
     if (activeGeneration.generationId !== this.shardGenerationId) {
-      return;
+      return null;
     }
 
-    const targetShardName = getRealtimeSubscriptionShardName(
+    return getRealtimeSubscriptionShardName(
       getRealtimeRegistrationHomeRouteTarget(registration.dependencies),
       activeGeneration
     );
-    if (targetShardName === this.shardName) {
-      return;
-    }
+  }
 
+  private async migrateRegistrationToHomeShard(
+    registration: StoredRealtimeRegistration,
+    targetShardName: string
+  ): Promise<void> {
     const registrationKey = createRegistrationKey(
       registration.connectionKey,
       registration.subscriptionId
@@ -1705,7 +1745,7 @@ export class RealtimeSubscriptionDO {
       );
     }
 
-    await this.deleteRegistrationByKey(registrationKey);
+    await this.registrationStore.delete(registrationKey);
   }
 
   private async moveConnectionRegistrationShard(
@@ -1808,72 +1848,6 @@ export class RealtimeSubscriptionDO {
         subscriptionId: registration.subscriptionId,
       }
     );
-  }
-
-  private addRegistrationToIndex(
-    index: Map<string, Set<string>>,
-    indexKey: string,
-    registrationKey: string
-  ): void {
-    const registrationKeys = index.get(indexKey) ?? new Set<string>();
-    registrationKeys.add(registrationKey);
-    index.set(indexKey, registrationKeys);
-  }
-
-  private async deleteRegistrationByKey(
-    registrationKey: string
-  ): Promise<void> {
-    const registration = this.registrations.get(registrationKey);
-    if (!registration) {
-      await this.deleteStoredRegistrationByKey(registrationKey);
-      return;
-    }
-
-    await this.deleteStoredRegistrationByKey(registrationKey);
-    this.removeRegistrationFromIndexes(registrationKey, registration);
-    this.registrations.delete(registrationKey);
-  }
-
-  private removeRegistrationFromIndexes(
-    registrationKey: string,
-    registration: StoredRealtimeRegistration
-  ): void {
-    this.registrationKeysWithoutDependencies.delete(registrationKey);
-    if (!registration.dependencies) {
-      return;
-    }
-
-    for (const tableName of registration.dependencies.tables) {
-      this.removeRegistrationFromIndex(
-        this.registrationKeysByTable,
-        tableName,
-        registrationKey
-      );
-    }
-
-    for (const partitionId of registration.dependencies.partitions) {
-      this.removeRegistrationFromIndex(
-        this.registrationKeysByPartition,
-        partitionId,
-        registrationKey
-      );
-    }
-  }
-
-  private removeRegistrationFromIndex(
-    index: Map<string, Set<string>>,
-    indexKey: string,
-    registrationKey: string
-  ): void {
-    const registrationKeys = index.get(indexKey);
-    if (!registrationKeys) {
-      return;
-    }
-
-    registrationKeys.delete(registrationKey);
-    if (registrationKeys.size === 0) {
-      index.delete(indexKey);
-    }
   }
 }
 

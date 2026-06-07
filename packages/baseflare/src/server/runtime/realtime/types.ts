@@ -85,6 +85,7 @@ export type StoredRealtimeRegistration = Omit<
   RealtimeRegistration,
   "leaseExpiresAt"
 > & {
+  activeQueryKey?: string;
   dependencies?: RealtimeDependencySet;
   leaseExpiresAt: number;
   lastResultJson?: string;
@@ -92,6 +93,19 @@ export type StoredRealtimeRegistration = Omit<
   reEvaluationRetryAt?: number;
   versionSnapshot?: RealtimeVersionSnapshot;
 };
+
+export interface StoredRealtimeActiveQuery {
+  readonly args: unknown;
+  readonly authorizationHeader?: string;
+  dependencies?: RealtimeDependencySet;
+  readonly key: string;
+  lastResultJson?: string;
+  readonly memberRegistrationKeys: Set<string>;
+  readonly queryName: string;
+  reEvaluationRetryAt?: number;
+  readonly runtimeId: string;
+  versionSnapshot?: RealtimeVersionSnapshot;
+}
 
 export interface RealtimeDependencySet {
   readonly partitions: ReadonlySet<string>;
@@ -104,9 +118,11 @@ export interface RealtimeVersionSnapshot {
 }
 
 export interface RealtimePressureSnapshot {
+  readonly activeQueryCount?: number;
   readonly activeRegistrationCount: number;
   readonly deliveryBatchLatencyMs?: number;
   readonly failedDeliveryRate?: number;
+  readonly maxFanoutPerActiveQuery?: number;
   readonly outboxLagMs?: number;
   readonly pendingWorkCount?: number;
   readonly reEvaluationLatencyMs?: number;
@@ -268,14 +284,20 @@ export const REALTIME_OUTBOX_CLEANUPS_METRIC =
 export const REALTIME_RE_EVALUATIONS_METRIC =
   "baseflare.runtime.realtime.re_evaluations";
 
+export const REALTIME_QUERY_EXECUTIONS_SAVED_METRIC =
+  "baseflare.runtime.realtime.query_executions_saved";
+
+export const REALTIME_ACTIVE_QUERIES_METRIC =
+  "baseflare.runtime.realtime.active_queries";
+
 export const REALTIME_RESTORE_SUBSCRIPTIONS_METRIC =
   "baseflare.runtime.realtime.restore_subscriptions";
 
 export const REALTIME_RECONCILIATIONS_METRIC =
   "baseflare.runtime.realtime.reconciliations";
 
-export const REALTIME_RUNTIME_EVICTIONS_METRIC =
-  "baseflare.runtime.realtime.runtime_evictions";
+export const REALTIME_RUNTIME_LIMIT_EXCEEDED_METRIC =
+  "baseflare.runtime.realtime.runtime_limit_exceeded";
 
 export const JSON_HEADERS = { "content-type": "application/json" } as const;
 
@@ -288,12 +310,15 @@ export type RealtimeMetricSource = "catch_up" | "notify";
 
 export type RealtimeMetricResult =
   | "accepted"
+  | "active"
   | "cleaned"
   | "coalesced"
   | "delivered"
+  | "empty"
   | "evaluated"
   | "evicted"
   | "failed"
+  | "fanout"
   | "limited"
   | "limit_exceeded"
   | "partial"
@@ -303,4 +328,5 @@ export type RealtimeMetricResult =
   | "scaled_down"
   | "scaled_up"
   | "skipped"
+  | "single"
   | "undelivered";

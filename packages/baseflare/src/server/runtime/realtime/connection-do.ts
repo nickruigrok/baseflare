@@ -20,6 +20,7 @@ import {
   readJsonObject,
   resolveRealtimeConnectionKey,
 } from "./shared";
+import { RealtimeSocketRegistry } from "./socket-registry";
 import type {
   RealtimeDeliveryResult,
   RealtimeDurableObjectState,
@@ -27,7 +28,6 @@ import type {
   RealtimeRegistration,
   RealtimeShardGeneration,
   RealtimeSocketAttachment,
-  RealtimeSocketState,
   RealtimeSocketSubscription,
   RealtimeSubscriptionRouteTarget,
   RuntimeWebSocket,
@@ -83,16 +83,8 @@ export async function routeRealtimeSubscribe(
 
 export class RealtimeConnectionDO {
   private readonly env: RealtimeObjectEnv;
-  private readonly socketStates = new Map<
-    RuntimeWebSocket,
-    RealtimeSocketState
-  >();
-  private readonly socketsByConnectionKey = new Map<
-    string,
-    Set<RuntimeWebSocket>
-  >();
-  private readonly sockets = new Set<RuntimeWebSocket>();
   private readonly restoredAttachedSubscriptionKeys = new Set<string>();
+  private readonly socketRegistry: RealtimeSocketRegistry;
   private readonly state: RealtimeDurableObjectState;
   private hasPendingHibernationRestoreRetry = false;
 
@@ -102,6 +94,11 @@ export class RealtimeConnectionDO {
   ) {
     this.state = isRealtimeDurableObjectState(state) ? state : {};
     this.env = env;
+    this.socketRegistry = new RealtimeSocketRegistry({
+      onRemoveAttachment: (attachment) => {
+        this.forgetRestoredAttachedSubscriptions(attachment);
+      },
+    });
     this.restoreHibernatedSockets();
   }
 
@@ -120,8 +117,7 @@ export class RealtimeConnectionDO {
     if (request.method === "POST" && url.pathname === "/has-sockets") {
       const message = await readJsonObject(request);
       const connectionKey = getStringField(message, "connectionKey");
-      const connected =
-        (this.socketsByConnectionKey.get(connectionKey)?.size ?? 0) > 0;
+      const connected = this.socketRegistry.hasSockets(connectionKey);
       return jsonResponse({ connected, ok: true });
     }
 
@@ -163,20 +159,20 @@ export class RealtimeConnectionDO {
     });
     if (this.state.acceptWebSocket) {
       this.state.acceptWebSocket(server);
-      this.addSocket(server, attachment);
+      this.socketRegistry.add(server, attachment);
     } else {
       server.accept();
-      this.addSocket(server, attachment);
+      this.socketRegistry.add(server, attachment);
       server.addEventListener("message", (event: MessageEvent) => {
         this.handleMessage(server, event.data).catch((error: unknown) => {
           this.sendSocketError(server, error);
         });
       });
       server.addEventListener("close", () => {
-        this.removeSocket(server);
+        this.socketRegistry.remove(server);
       });
       server.addEventListener("error", () => {
-        this.removeSocket(server);
+        this.socketRegistry.remove(server);
       });
     }
 
@@ -198,11 +194,11 @@ export class RealtimeConnectionDO {
   }
 
   webSocketClose(socket: RuntimeWebSocket): void {
-    this.removeSocket(socket);
+    this.socketRegistry.remove(socket);
   }
 
   webSocketError(socket: RuntimeWebSocket): void {
-    this.removeSocket(socket);
+    this.socketRegistry.remove(socket);
   }
 
   async alarm(): Promise<void> {
@@ -272,7 +268,7 @@ export class RealtimeConnectionDO {
       );
     }
 
-    this.addSocketSubscription(socket, {
+    this.socketRegistry.addSubscription(socket, {
       args: message.args ?? {},
       epoch: registration.epoch,
       queryName: registration.queryName,
@@ -292,8 +288,9 @@ export class RealtimeConnectionDO {
     socket: RuntimeWebSocket
   ): Promise<void> {
     const subscriptionId = getStringField(message, "subscriptionId");
-    const connectionKey = this.ensureSocketAttachment(socket).connectionKey;
-    const existingSubscription = this.getSocketSubscription(
+    const connectionKey =
+      this.socketRegistry.ensureAttachment(socket).connectionKey;
+    const existingSubscription = this.socketRegistry.getSubscription(
       socket,
       subscriptionId
     );
@@ -314,7 +311,16 @@ export class RealtimeConnectionDO {
       );
     }
 
-    this.removeSocketSubscription(socket, subscriptionId);
+    const removedSubscription = this.socketRegistry.removeSubscription(
+      socket,
+      subscriptionId
+    );
+    if (removedSubscription) {
+      this.forgetRestoredAttachedSubscriptions(
+        removedSubscription.attachment,
+        subscriptionId
+      );
+    }
     await this.scheduleReconciliation();
     socket.send(JSON.stringify({ subscriptionId, type: "unsubscribed" }));
   }
@@ -490,7 +496,7 @@ export class RealtimeConnectionDO {
     socket: RuntimeWebSocket
   ): RealtimeRegistration {
     const subscriptionId = getStringField(message, "subscriptionId");
-    const attachment = this.ensureSocketAttachment(socket);
+    const attachment = this.socketRegistry.ensureAttachment(socket);
     const connectionKey = attachment.connectionKey;
     return {
       args: message.args ?? {},
@@ -505,38 +511,6 @@ export class RealtimeConnectionDO {
     };
   }
 
-  private addSocket(
-    socket: RuntimeWebSocket,
-    attachment: RealtimeSocketAttachment
-  ): void {
-    this.sockets.add(socket);
-    this.setSocketAttachment(socket, attachment);
-    const sockets =
-      this.socketsByConnectionKey.get(attachment.connectionKey) ??
-      new Set<RuntimeWebSocket>();
-    sockets.add(socket);
-    this.socketsByConnectionKey.set(attachment.connectionKey, sockets);
-  }
-
-  private removeSocket(socket: RuntimeWebSocket): void {
-    this.sockets.delete(socket);
-    const attachment = this.getSocketAttachment(socket);
-    if (attachment) {
-      this.forgetRestoredAttachedSubscriptions(attachment);
-    }
-    const connectionKey = attachment?.connectionKey;
-    this.socketStates.delete(socket);
-    if (!connectionKey) {
-      return;
-    }
-
-    const sockets = this.socketsByConnectionKey.get(connectionKey);
-    sockets?.delete(socket);
-    if (sockets?.size === 0) {
-      this.socketsByConnectionKey.delete(connectionKey);
-    }
-  }
-
   private deliver(message: Record<string, unknown>): RealtimeDeliveryResult {
     const connectionKey = getStringField(message, "connectionKey");
     const deliveries = message.deliveries;
@@ -546,58 +520,10 @@ export class RealtimeConnectionDO {
       );
     }
 
-    return this.deliverMessages(
+    return this.socketRegistry.deliver(
       connectionKey,
       deliveries.map((delivery) => parseObject(delivery, "Realtime delivery"))
     );
-  }
-
-  private deliverMessages(
-    connectionKey: string,
-    messages: readonly Record<string, unknown>[]
-  ): RealtimeDeliveryResult {
-    const sockets = this.socketsByConnectionKey.get(connectionKey);
-    if (!sockets || messages.length === 0) {
-      return { delivered: 0, deliveredSubscriptions: [] };
-    }
-
-    let delivered = 0;
-    const deliveredSubscriptions = new Set<string>();
-    for (const message of messages) {
-      const subscriptionId = getStringField(message, "subscriptionId");
-      const sent = this.deliverMessageToSockets(sockets, message);
-      delivered += sent;
-      if (sent > 0) {
-        deliveredSubscriptions.add(subscriptionId);
-      }
-    }
-
-    return {
-      delivered,
-      deliveredSubscriptions: [...deliveredSubscriptions],
-    };
-  }
-
-  private deliverMessageToSockets(
-    sockets: Set<RuntimeWebSocket>,
-    message: Record<string, unknown>
-  ): number {
-    const payload = JSON.stringify({
-      message,
-      type: "delivery",
-    });
-    let delivered = 0;
-    for (const socket of [...sockets]) {
-      try {
-        socket.send(payload);
-        this.updateSocketDeliveredOutboxSequence(socket, message.sequence);
-        delivered += 1;
-      } catch {
-        this.removeSocket(socket);
-      }
-    }
-
-    return delivered;
   }
 
   private restoreHibernatedSockets(): void {
@@ -607,11 +533,11 @@ export class RealtimeConnectionDO {
         socket.deserializeAttachment?.()
       );
       if (!attachment) {
-        this.closeExpiredSocketSession(socket);
+        this.socketRegistry.closeExpiredSession(socket);
         continue;
       }
 
-      this.addSocket(socket, attachment);
+      this.socketRegistry.add(socket, attachment);
     }
 
     if (sockets.length > 0) {
@@ -794,91 +720,14 @@ export class RealtimeConnectionDO {
     readonly attachment: RealtimeSocketAttachment;
     readonly subscription: RealtimeSocketSubscription;
   }> {
-    const attachedSubscriptions: Array<{
-      readonly attachment: RealtimeSocketAttachment;
-      readonly subscription: RealtimeSocketSubscription;
-    }> = [];
-    for (const { attachment } of this.socketStates.values()) {
-      for (const subscription of attachment.subscriptions) {
-        attachedSubscriptions.push({ attachment, subscription });
-      }
-    }
-
-    return attachedSubscriptions;
-  }
-
-  private addSocketSubscription(
-    socket: RuntimeWebSocket,
-    subscription: RealtimeSocketSubscription
-  ): void {
-    const attachment = this.getSocketAttachment(socket);
-    if (!attachment) {
-      return;
-    }
-
-    const subscriptions = attachment.subscriptions.filter(
-      (existing) => existing.subscriptionId !== subscription.subscriptionId
-    );
-    this.setSocketAttachment(socket, {
-      ...attachment,
-      subscriptions: [...subscriptions, subscription],
-    });
-  }
-
-  private removeSocketSubscription(
-    socket: RuntimeWebSocket,
-    subscriptionId: string
-  ): void {
-    const attachment = this.getSocketAttachment(socket);
-    if (!attachment) {
-      return;
-    }
-
-    this.forgetRestoredAttachedSubscriptions(attachment, subscriptionId);
-    this.setSocketAttachment(socket, {
-      ...attachment,
-      subscriptions: attachment.subscriptions.filter(
-        (subscription) => subscription.subscriptionId !== subscriptionId
-      ),
-    });
-  }
-
-  private getSocketSubscription(
-    socket: RuntimeWebSocket,
-    subscriptionId: string
-  ): RealtimeSocketSubscription | undefined {
-    return this.getSocketAttachment(socket)?.subscriptions.find(
-      (subscription) => subscription.subscriptionId === subscriptionId
-    );
-  }
-
-  private updateSocketDeliveredOutboxSequence(
-    socket: RuntimeWebSocket,
-    sequence: unknown
-  ): void {
-    if (sequence == null || !Number.isSafeInteger(sequence)) {
-      return;
-    }
-
-    const attachment = this.getSocketAttachment(socket);
-    if (!attachment) {
-      return;
-    }
-
-    this.setSocketAttachment(socket, {
-      ...attachment,
-      latestDeliveredOutboxSequence: Math.max(
-        attachment.latestDeliveredOutboxSequence ?? 0,
-        sequence as number
-      ),
-    });
+    return this.socketRegistry.attachedSubscriptions();
   }
 
   private updateLatestDeliveredOutboxSequence(
     socket: RuntimeWebSocket,
     sequence: number | null
   ): void {
-    this.updateSocketDeliveredOutboxSequence(socket, sequence);
+    this.socketRegistry.updateDeliveredSequence(socket, sequence);
   }
 
   private updateSubscriptionShardName(message: Record<string, unknown>): void {
@@ -888,48 +737,26 @@ export class RealtimeConnectionDO {
       message,
       "subscriptionShardName"
     );
-    const sockets = this.socketsByConnectionKey.get(connectionKey);
-    if (!sockets) {
-      return;
-    }
-
-    for (const socket of sockets) {
-      const attachment = this.getSocketAttachment(socket);
-      if (!attachment) {
-        continue;
-      }
-
-      const existingSubscription = attachment.subscriptions.find(
-        (subscription) => subscription.subscriptionId === subscriptionId
+    const updates = this.socketRegistry.updateSubscriptionShardName(
+      connectionKey,
+      subscriptionId,
+      subscriptionShardName
+    );
+    for (const update of updates) {
+      const wasRestored = this.restoredAttachedSubscriptionKeys.delete(
+        this.createAttachedSubscriptionRestoreKey(
+          update.previousAttachment,
+          update.previousSubscription
+        )
       );
-      const wasRestored =
-        existingSubscription !== undefined &&
-        this.restoredAttachedSubscriptionKeys.delete(
-          this.createAttachedSubscriptionRestoreKey(
-            attachment,
-            existingSubscription
-          )
-        );
-      const updatedAttachment = {
-        ...attachment,
-        subscriptions: attachment.subscriptions.map((subscription) =>
-          subscription.subscriptionId === subscriptionId
-            ? { ...subscription, subscriptionShardName }
-            : subscription
-        ),
-      };
-      const updatedSubscription = updatedAttachment.subscriptions.find(
-        (subscription) => subscription.subscriptionId === subscriptionId
-      );
-      if (wasRestored && updatedSubscription) {
+      if (wasRestored) {
         this.restoredAttachedSubscriptionKeys.add(
           this.createAttachedSubscriptionRestoreKey(
-            updatedAttachment,
-            updatedSubscription
+            update.nextAttachment,
+            update.nextSubscription
           )
         );
       }
-      this.setSocketAttachment(socket, updatedAttachment);
     }
   }
 
@@ -963,46 +790,6 @@ export class RealtimeConnectionDO {
     }
   }
 
-  private getSocketAttachment(
-    socket: RuntimeWebSocket
-  ): RealtimeSocketAttachment | undefined {
-    return (
-      this.socketStates.get(socket)?.attachment ??
-      parseRealtimeSocketAttachment(socket.deserializeAttachment?.()) ??
-      undefined
-    );
-  }
-
-  private ensureSocketAttachment(
-    socket: RuntimeWebSocket
-  ): RealtimeSocketAttachment {
-    const attachment = this.getSocketAttachment(socket);
-    if (attachment) {
-      this.addSocket(socket, attachment);
-      return attachment;
-    }
-
-    this.closeExpiredSocketSession(socket);
-    throw new InternalRuntimeError("Realtime socket session expired");
-  }
-
-  private closeExpiredSocketSession(socket: RuntimeWebSocket): void {
-    try {
-      socket.close?.(1011, "Session expired, please reconnect");
-    } catch {
-      // Best-effort close: the socket may already be closing.
-    }
-    this.removeSocket(socket);
-  }
-
-  private setSocketAttachment(
-    socket: RuntimeWebSocket,
-    attachment: RealtimeSocketAttachment
-  ): void {
-    this.socketStates.set(socket, { attachment });
-    socket.serializeAttachment?.(attachment);
-  }
-
   private sendSocketError(socket: RuntimeWebSocket, error: unknown): void {
     try {
       socket.send(
@@ -1030,9 +817,7 @@ export class RealtimeConnectionDO {
   }
 
   private hasActiveSocketSubscriptions(): boolean {
-    return [...this.socketStates.values()].some(
-      ({ attachment }) => attachment.subscriptions.length > 0
-    );
+    return this.socketRegistry.hasActiveSubscriptions();
   }
 
   private async reconcileActiveSubscriptions(): Promise<void> {
@@ -1149,41 +934,38 @@ export class RealtimeConnectionDO {
         }
       | undefined;
 
-    for (const { attachment } of this.socketStates.values()) {
-      if (attachment.subscriptions.length === 0) {
-        continue;
-      }
-
-      for (const subscription of attachment.subscriptions) {
-        let target: {
-          readonly shardName: string;
-          readonly stub: DurableObjectStub;
+    for (const {
+      attachment,
+      subscription,
+    } of this.socketRegistry.attachedSubscriptions()) {
+      let target: {
+        readonly shardName: string;
+        readonly stub: DurableObjectStub;
+      };
+      if (subscription.subscriptionShardName == null) {
+        defaultTarget ??= await this.subscriptionTarget();
+        target = defaultTarget;
+      } else {
+        target = {
+          shardName: subscription.subscriptionShardName,
+          stub: this.env.REALTIME_SUBSCRIPTIONS.get(
+            this.env.REALTIME_SUBSCRIPTIONS.idFromName(
+              subscription.subscriptionShardName
+            )
+          ),
         };
-        if (subscription.subscriptionShardName == null) {
-          defaultTarget ??= await this.subscriptionTarget();
-          target = defaultTarget;
-        } else {
-          target = {
-            shardName: subscription.subscriptionShardName,
-            stub: this.env.REALTIME_SUBSCRIPTIONS.get(
-              this.env.REALTIME_SUBSCRIPTIONS.idFromName(
-                subscription.subscriptionShardName
-              )
-            ),
-          };
-        }
-
-        const existing = targets.get(target.shardName);
-        const afterSequence = this.minAfterSequence(
-          existing?.afterSequence ?? null,
-          attachment.latestDeliveredOutboxSequence
-        );
-        targets.set(target.shardName, {
-          afterSequence,
-          shardName: target.shardName,
-          stub: target.stub,
-        });
       }
+
+      const existing = targets.get(target.shardName);
+      const afterSequence = this.minAfterSequence(
+        existing?.afterSequence ?? null,
+        attachment.latestDeliveredOutboxSequence
+      );
+      targets.set(target.shardName, {
+        afterSequence,
+        shardName: target.shardName,
+        stub: target.stub,
+      });
     }
 
     if (targets.size === 0) {
@@ -1261,17 +1043,14 @@ export class RealtimeConnectionDO {
     }>
   > {
     const shardNames = new Set<string>();
-    const attachments = socket
-      ? [this.getSocketAttachment(socket)].filter(
-          (attachment): attachment is RealtimeSocketAttachment =>
-            attachment !== undefined
-        )
-      : [...this.socketStates.values()].map(({ attachment }) => attachment);
-    for (const attachment of attachments) {
-      for (const subscription of attachment.subscriptions) {
-        if (subscription.subscriptionShardName) {
-          shardNames.add(subscription.subscriptionShardName);
-        }
+    const subscriptions = socket
+      ? (this.socketRegistry.getAttachment(socket)?.subscriptions ?? [])
+      : this.socketRegistry
+          .attachedSubscriptions()
+          .map(({ subscription }) => subscription);
+    for (const subscription of subscriptions) {
+      if (subscription.subscriptionShardName) {
+        shardNames.add(subscription.subscriptionShardName);
       }
     }
 

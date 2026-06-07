@@ -36,16 +36,12 @@ import { createWorker } from "./create-worker";
 import { createFunctionIndex } from "./function-index";
 import { buildBaseflareManifest } from "./manifest";
 import { RealtimeConnectionDO } from "./realtime/connection-do";
-import { createRealtimeOutboxOperation } from "./realtime/outbox";
 import {
   createRealtimeGlobalSubscriptionRouteTarget,
   createRealtimePartitionSubscriptionRouteTarget,
-  createRealtimeTableSubscriptionRouteTarget,
-  getRealtimeAffectedSubscriptionRouteTargets,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
   getRealtimeSubscriptionShardNames,
-  isZeroRealtimeVersionSnapshot,
 } from "./realtime/routing";
 import {
   evaluateRealtimeAutoscalingForTest,
@@ -58,19 +54,32 @@ import {
   REALTIME_CONFIGURED_RUNTIME_LIMIT,
   resetRealtimeRuntimeStateForTest,
 } from "./realtime/shared";
+import type { RealtimeSocketRegistry } from "./realtime/socket-registry";
 import { RealtimeSubscriptionDO } from "./realtime/subscription-do";
+import type {
+  RealtimeDependencySet,
+  RealtimeSocketAttachment,
+  RealtimeSocketSubscription,
+  RealtimeVersionSnapshot,
+  RuntimeWebSocket,
+  StoredRealtimeRegistration,
+} from "./realtime/types";
 import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
-  REALTIME_CONNECTION_SHARD_COUNT,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   REALTIME_MAX_SUBSCRIPTION_SHARDS,
   REALTIME_OUTBOX_CLEANUP_INTERVAL_MS,
   REALTIME_PENDING_WORK_LIMIT,
-  REALTIME_RUNTIME_EVICTIONS_METRIC,
+  REALTIME_RUNTIME_LIMIT_EXCEEDED_METRIC,
   REALTIME_SCALE_DOWN_WINDOW_MS,
   REALTIME_SCALE_UP_WINDOW_MS,
 } from "./realtime/types";
+import {
+  type AttachedTestWebSocket,
+  FakeDurableObjectNamespace,
+  FakeRealtimeDurableObjectState,
+} from "./realtime.test-helpers";
 import { applyRuntimeSchema } from "./schema-apply";
 import type {
   BaseflareManifest,
@@ -78,9 +87,7 @@ import type {
   D1Database,
   D1DatabaseSession,
   D1PreparedStatement,
-  DurableObjectId,
   DurableObjectNamespace,
-  DurableObjectStub,
 } from "./types";
 
 declare module "cloudflare:test" {
@@ -89,100 +96,6 @@ declare module "cloudflare:test" {
     REALTIME_CONNECTIONS: DurableObjectNamespace;
     REALTIME_SUBSCRIPTIONS: DurableObjectNamespace;
   }
-}
-
-class FakeDurableObjectNamespace implements DurableObjectNamespace {
-  readonly requests: Array<{ name: string; request: Request }> = [];
-  private readonly handler: (
-    name: string,
-    request: Request
-  ) => Promise<Response>;
-
-  constructor(handler?: (name: string, request: Request) => Promise<Response>) {
-    this.handler =
-      handler ?? (() => Promise.resolve(Response.json({ ok: true })));
-  }
-
-  get(id: DurableObjectId): DurableObjectStub {
-    const name = id.name ?? "unknown";
-    return {
-      fetch: async (input, init) => {
-        const request =
-          input instanceof Request ? input : new Request(input, init);
-        this.requests.push({ name, request });
-        return await this.handler(name, request);
-      },
-    };
-  }
-
-  idFromName(name: string): DurableObjectId {
-    return { name };
-  }
-}
-
-type AttachedTestWebSocket = WebSocket & {
-  accept(): void;
-  deserializeAttachment?: () => unknown;
-  serializeAttachment?: (attachment: unknown) => void;
-};
-
-class FakeRealtimeDurableObjectState {
-  readonly acceptedSockets: AttachedTestWebSocket[] = [];
-  readonly attachments = new WeakMap<AttachedTestWebSocket, unknown>();
-  readonly durableStorage = new Map<string, unknown>();
-  private readonly hibernatedSockets: readonly AttachedTestWebSocket[];
-  alarmTime: number | null = null;
-  failedStoragePuts = 0;
-
-  constructor(hibernatedSockets: readonly AttachedTestWebSocket[] = []) {
-    this.hibernatedSockets = hibernatedSockets;
-  }
-
-  acceptWebSocket(socket: AttachedTestWebSocket): void {
-    socket.serializeAttachment = (attachment: unknown) => {
-      this.attachments.set(socket, attachment);
-    };
-    socket.deserializeAttachment = () => this.attachments.get(socket);
-    this.acceptedSockets.push(socket);
-    socket.accept?.();
-  }
-
-  getWebSockets(): AttachedTestWebSocket[] {
-    return [...this.hibernatedSockets, ...this.acceptedSockets];
-  }
-
-  storage = {
-    delete: (key: string) => {
-      this.durableStorage.delete(key);
-      return Promise.resolve();
-    },
-    deleteAlarm: () => {
-      this.alarmTime = null;
-      return Promise.resolve();
-    },
-    get: <T = unknown>(key: string) =>
-      Promise.resolve(this.durableStorage.get(key) as T | undefined),
-    getAlarm: () => Promise.resolve(this.alarmTime),
-    list: <T = unknown>(options?: { readonly prefix?: string }) => {
-      const entries = Array.from(this.durableStorage.entries()).filter(
-        ([key]) => !options?.prefix || key.startsWith(options.prefix)
-      );
-      return Promise.resolve(new Map(entries) as Map<string, T>);
-    },
-    put: <T = unknown>(key: string, value: T) => {
-      if (this.failedStoragePuts > 0) {
-        this.failedStoragePuts -= 1;
-        return Promise.reject(new Error("Storage put failed"));
-      }
-
-      this.durableStorage.set(key, value);
-      return Promise.resolve();
-    },
-    setAlarm: (scheduledTime: number) => {
-      this.alarmTime = scheduledTime;
-      return Promise.resolve();
-    },
-  };
 }
 
 const schema = defineSchema({
@@ -1041,24 +954,98 @@ function realtimeRegistrationKey(
 }
 
 interface RealtimeIndexTestState {
-  readonly registrationKeysByPartition: Map<string, Set<string>>;
-  readonly registrationKeysByTable: Map<string, Set<string>>;
-  readonly registrationKeysWithoutDependencies: Set<string>;
   readonly registrations: Map<
     string,
     {
+      activeQueryKey?: string;
       lastResultJson?: string;
       leaseExpiresAt: number;
       movePending?: boolean;
       reEvaluationRetryAt?: number;
+      dependencies?: RealtimeDependencySet;
+      versionSnapshot?: RealtimeVersionSnapshot;
     }
   >;
+}
+
+interface RealtimeActiveQueryTestState {
+  readonly activeQueries: Map<
+    string,
+    {
+      dependencies?: RealtimeDependencySet;
+      key: string;
+      memberRegistrationKeys: Set<string>;
+      reEvaluationRetryAt?: number;
+      versionSnapshot?: RealtimeVersionSnapshot;
+    }
+  >;
+  readonly activeQueryKeysByPartition: Map<string, Set<string>>;
+  readonly activeQueryKeysByTable: Map<string, Set<string>>;
+  readonly activeQueryKeysWithoutDependencies: Set<string>;
 }
 
 function getRealtimeIndexTestState(
   subscriptionDo: RealtimeSubscriptionDO
 ): RealtimeIndexTestState {
-  return subscriptionDo as unknown as RealtimeIndexTestState;
+  return (
+    subscriptionDo as unknown as {
+      registrationStore: { snapshotForTest(): RealtimeIndexTestState };
+    }
+  ).registrationStore.snapshotForTest();
+}
+
+function getRealtimeActiveQueryTestState(
+  subscriptionDo: RealtimeSubscriptionDO
+): RealtimeActiveQueryTestState {
+  return (
+    subscriptionDo as unknown as {
+      activeQueryStore: {
+        snapshotForTest(): RealtimeActiveQueryTestState;
+      };
+    }
+  ).activeQueryStore.snapshotForTest();
+}
+
+function getRealtimeActiveQueryKeyForRegistration(
+  subscriptionDo: RealtimeSubscriptionDO,
+  registrationKey: string
+): string {
+  const registration =
+    getRealtimeIndexTestState(subscriptionDo).registrations.get(
+      registrationKey
+    );
+  const activeQueryKey = registration?.activeQueryKey;
+  if (!activeQueryKey) {
+    throw new Error("Expected realtime registration to have active query key");
+  }
+  return activeQueryKey;
+}
+
+function getRealtimeSocketRegistry(
+  connectionDo: RealtimeConnectionDO
+): RealtimeSocketRegistry {
+  return (
+    connectionDo as unknown as {
+      socketRegistry: RealtimeSocketRegistry;
+    }
+  ).socketRegistry;
+}
+
+function getRealtimeSocketTestState(connectionDo: RealtimeConnectionDO) {
+  return getRealtimeSocketRegistry(connectionDo).snapshotForTest();
+}
+
+function realtimeSocketAttachment(
+  overrides: Partial<RealtimeSocketAttachment> &
+    Pick<RealtimeSocketAttachment, "connectionKey">
+): RealtimeSocketAttachment {
+  return {
+    connectionName: getRealtimeConnectionShardName(overrides.connectionKey),
+    latestDeliveredOutboxSequence: null,
+    runtimeId: "runtime:1",
+    subscriptions: [],
+    ...overrides,
+  };
 }
 
 async function getRealtimeOutboxSequence(eventId: string): Promise<number> {
@@ -1398,7 +1385,7 @@ describe("worker runtime", () => {
       "baseflare-runtime",
       expect.objectContaining({
         event: "runtime.metric",
-        metric: REALTIME_RUNTIME_EVICTIONS_METRIC,
+        metric: REALTIME_RUNTIME_LIMIT_EXCEEDED_METRIC,
         tags: { result: "limit_exceeded" },
         value: 1,
       })
@@ -1417,25 +1404,6 @@ describe("worker runtime", () => {
     expect(outbox?.sql).toContain("event_id TEXT NOT NULL UNIQUE");
     expect(outbox?.sql).toContain("partitions TEXT NOT NULL");
     expect(createdAtIndex?.name).toBe("_bf_realtime_outbox_created_at");
-  });
-
-  it("uses database time for realtime outbox timestamps", () => {
-    const operation = createRealtimeOutboxOperation(
-      {
-        eventId: "db-time-event",
-        partitions: [],
-        tables: ["todos"],
-      },
-      1
-    );
-
-    expect(operation.params).toEqual([
-      "db-time-event",
-      JSON.stringify(["todos"]),
-      JSON.stringify([]),
-      1,
-    ]);
-    expect(operation.sql).toContain("julianday('now')");
   });
 
   it("applies realtime shard metadata", async () => {
@@ -1529,27 +1497,6 @@ describe("worker runtime", () => {
     }
     expect(snapshot.partitions.get(todoOwnerPartitionId("owner-0"))).toBe(0);
     expect(snapshot.partitions.get(todoOwnerPartitionId("owner-250"))).toBe(11);
-  });
-
-  it("classifies empty realtime version snapshots as unknown, not zero", () => {
-    expect(
-      isZeroRealtimeVersionSnapshot({
-        partitions: new Map(),
-        tables: new Map(),
-      })
-    ).toBe(false);
-    expect(
-      isZeroRealtimeVersionSnapshot({
-        partitions: new Map([[todoOwnerPartitionId("owner-a"), 0]]),
-        tables: new Map(),
-      })
-    ).toBe(true);
-    expect(
-      isZeroRealtimeVersionSnapshot({
-        partitions: new Map(),
-        tables: new Map([["todos", 1]]),
-      })
-    ).toBe(false);
   });
 
   it("scales realtime subscription generations geometrically", async () => {
@@ -1773,6 +1720,38 @@ describe("worker runtime", () => {
       status: "active",
       subscription_shard_count: 2,
     });
+  });
+
+  it("uses active-query pressure for realtime autoscaling decisions", async () => {
+    const startedAt = 2_500_000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeQueryCount: 1000,
+      activeRegistrationCount: 10,
+      now: startedAt,
+    });
+    const scaleUpResult = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeQueryCount: 1000,
+      activeRegistrationCount: 10,
+      now: startedAt + REALTIME_SCALE_UP_WINDOW_MS,
+    });
+
+    expect(scaleUpResult).toBe("scaled_up");
+  });
+
+  it("uses active-query fanout pressure for realtime autoscaling decisions", async () => {
+    const startedAt = 2_600_000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 10,
+      maxFanoutPerActiveQuery: 1000,
+      now: startedAt,
+    });
+    const scaleUpResult = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 10,
+      maxFanoutPerActiveQuery: 1000,
+      now: startedAt + REALTIME_SCALE_UP_WINDOW_MS,
+    });
+
+    expect(scaleUpResult).toBe("scaled_up");
   });
 
   it("starts realtime scale-down evaluation during empty catch-up", async () => {
@@ -2148,82 +2127,6 @@ describe("worker runtime", () => {
     expect(connections.requests.map((request) => request.name)).toEqual([
       getRealtimeConnectionShardName(firstKey ?? ""),
       getRealtimeConnectionShardName(secondKey ?? ""),
-    ]);
-  });
-
-  it("keeps realtime connection shard routing deterministic and bounded", () => {
-    const first = getRealtimeConnectionShardName("client-a");
-    const second = getRealtimeConnectionShardName("client-a");
-    const shardNumber = Number(first.split(":").at(1));
-    const seenShardNames = new Set(
-      Array.from({ length: 5000 }, (_value, index) =>
-        getRealtimeConnectionShardName(`client-${index}`)
-      )
-    );
-
-    expect(first).toBe(second);
-    expect(first).toMatch(/^connection:\d+$/);
-    expect(shardNumber).toBeGreaterThanOrEqual(0);
-    expect(shardNumber).toBeLessThan(REALTIME_CONNECTION_SHARD_COUNT);
-    expect(seenShardNames.size).toBe(REALTIME_CONNECTION_SHARD_COUNT);
-  });
-
-  it("keeps N=1 realtime subscription routes on the default generation shard", () => {
-    expect(
-      getRealtimeSubscriptionShardName(
-        createRealtimeGlobalSubscriptionRouteTarget()
-      )
-    ).toBe("subscription:g1:0");
-    expect(
-      getRealtimeSubscriptionShardName(
-        createRealtimeTableSubscriptionRouteTarget("todos")
-      )
-    ).toBe("subscription:g1:0");
-    expect(
-      getRealtimeSubscriptionShardName(
-        createRealtimePartitionSubscriptionRouteTarget(
-          todoOwnerPartition("owner-a")
-        )
-      )
-    ).toBe("subscription:g1:0");
-  });
-
-  it("keeps future realtime subscription shard routing deterministic and bounded", () => {
-    const shardCount = 32;
-    const partitionRoute = createRealtimePartitionSubscriptionRouteTarget(
-      todoOwnerPartition("owner-a")
-    );
-    const tableRoute = createRealtimeTableSubscriptionRouteTarget("todos");
-    const first = getRealtimeSubscriptionShardName(partitionRoute, shardCount);
-    const second = getRealtimeSubscriptionShardName(partitionRoute, shardCount);
-    const tableShard = getRealtimeSubscriptionShardName(tableRoute, shardCount);
-    const shardNumber = Number(first.split(":").at(2));
-
-    expect(first).toBe(second);
-    expect(first).toMatch(/^subscription:g1:\d+$/);
-    expect(tableShard).toMatch(/^subscription:g1:\d+$/);
-    expect(shardNumber).toBeGreaterThanOrEqual(0);
-    expect(shardNumber).toBeLessThan(shardCount);
-  });
-
-  it("derives realtime subscription routes from affected tables and partitions", () => {
-    const routes = getRealtimeAffectedSubscriptionRouteTargets({
-      partitions: [todoOwnerPartition("owner-a")],
-      tables: ["todos"],
-    });
-
-    expect(routes).toEqual([
-      {
-        type: "global",
-      },
-      {
-        partition: todoOwnerPartition("owner-a"),
-        type: "partition",
-      },
-      {
-        tableName: "todos",
-        type: "table",
-      },
     ]);
   });
 
@@ -2627,7 +2530,7 @@ describe("worker runtime", () => {
     await createRealtimeOutboxEvent("storage-failed-delivery", Date.now(), {
       tables: ["todos"],
     });
-    state.failedStoragePuts = 1;
+    state.failedStoragePuts = 2;
 
     const failedResponse = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {
@@ -3092,14 +2995,129 @@ describe("worker runtime", () => {
     );
   });
 
+  it("does not recreate the source registration after unchanged-result migration", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const ownerToken =
+      ["owner-a", "owner-b", "owner-c", "owner-d"].find(
+        (token) =>
+          getRealtimeSubscriptionShardName(
+            createRealtimePartitionSubscriptionRouteTarget(
+              todoOwnerPartition(token)
+            ),
+            8
+          ) !== globalShardName
+      ) ?? "owner-a";
+    const targetShardName = getRealtimeSubscriptionShardName(
+      createRealtimePartitionSubscriptionRouteTarget(
+        todoOwnerPartition(ownerToken)
+      ),
+      8
+    );
+    expect(targetShardName).not.toBe(globalShardName);
+    await createTodoViaRpc(ownerToken, "unchanged-migration");
+    const queryResponse = await invoke(
+      "/api/query/realtime:dependencyTracking",
+      {
+        body: rpcBody({ mode: "partition-todos", ownerToken }),
+        headers: { authorization: `Bearer ${ownerToken}` },
+        method: "POST",
+      }
+    );
+    const queryBody = (await queryResponse.json()) as { result: unknown };
+    const subscriptionPaths: string[] = [];
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      subscriptionPaths.push(new URL(request.url).pathname);
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ ok: true }))
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken },
+          authorizationHeader: `Bearer ${ownerToken}`,
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          lastResultJson: JSON.stringify(queryBody.result),
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createRealtimeOutboxEvent("unchanged-migration-event", Date.now(), {
+      partitions: [todoOwnerPartition(ownerToken)],
+      tables: ["todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "unchanged-migration-event",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(subscriptionPaths).toEqual([
+      "/adopt-registration",
+      "/activate-registration",
+    ]);
+    expect(
+      getRealtimeIndexTestState(subscriptionDo).registrations.has(
+        realtimeRegistrationKey("client-a", "sub-a")
+      )
+    ).toBe(false);
+  });
+
   it("keeps source realtime registrations active when shard move rollback succeeds", async () => {
-    const { errorLog, registrations, subscriptionPaths } =
+    const { errorLog, registrations, subscriptionDo, subscriptionPaths } =
       await runRealtimeMoveRollbackScenario(() =>
         Promise.resolve(Response.json({ ok: true }))
       );
+    const registrationKey = realtimeRegistrationKey("client:client-a", "sub-a");
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
 
     expect(registrations).toHaveLength(1);
     expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(
+      activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
+    ).toBe(true);
+    expect(
+      activeQueryState.activeQueryKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(activeQueryKey)
+    ).not.toBe(true);
     expect(subscriptionPaths).toContain("/unregister");
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
@@ -3126,12 +3144,27 @@ describe("worker runtime", () => {
   });
 
   it("keeps source realtime registrations active when shard move rollback returns non-ok", async () => {
-    const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
-      () => Promise.resolve(Response.json({ ok: false }, { status: 503 }))
+    const { errorLog, registrations, subscriptionDo } =
+      await runRealtimeMoveRollbackScenario(() =>
+        Promise.resolve(Response.json({ ok: false }, { status: 503 }))
+      );
+    const registrationKey = realtimeRegistrationKey("client:client-a", "sub-a");
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
     );
 
     expect(registrations).toHaveLength(1);
     expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(
+      activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
+    ).toBe(true);
+    expect(
+      activeQueryState.activeQueryKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(activeQueryKey)
+    ).not.toBe(true);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -3161,12 +3194,27 @@ describe("worker runtime", () => {
   });
 
   it("keeps source realtime registrations active when shard move rollback throws", async () => {
-    const { errorLog, registrations } = await runRealtimeMoveRollbackScenario(
-      () => Promise.reject(new Error("rollback unavailable"))
+    const { errorLog, registrations, subscriptionDo } =
+      await runRealtimeMoveRollbackScenario(() =>
+        Promise.reject(new Error("rollback unavailable"))
+      );
+    const registrationKey = realtimeRegistrationKey("client:client-a", "sub-a");
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
     );
 
     expect(registrations).toHaveLength(1);
     expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(
+      activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
+    ).toBe(true);
+    expect(
+      activeQueryState.activeQueryKeysByPartition
+        .get(todoOwnerPartitionId("owner-a"))
+        ?.has(activeQueryKey)
+    ).not.toBe(true);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -3261,9 +3309,11 @@ describe("worker runtime", () => {
     });
     (
       subscriptionDo as unknown as {
-        getRelevantRegistrationKeys: () => Set<string | undefined>;
+        activeQueryStore: {
+          getRelevantKeys: () => Set<string | undefined>;
+        };
       }
-    ).getRelevantRegistrationKeys = () => new Set([undefined]);
+    ).activeQueryStore.getRelevantKeys = () => new Set([undefined]);
     await createRealtimeOutboxEvent("missing-key-event", Date.now(), {
       tables: ["todos"],
     });
@@ -3282,7 +3332,7 @@ describe("worker runtime", () => {
       "baseflare-runtime",
       expect.objectContaining({
         errorName: "InternalRuntimeError",
-        event: "runtime.realtime_registration_re_evaluation_failed",
+        event: "runtime.realtime_active_query_evaluation_failed",
       })
     );
   });
@@ -3840,16 +3890,10 @@ describe("worker runtime", () => {
         sentPayloads.push(payload);
       },
     } as unknown as WebSocket;
-    const internals = connectionDo as unknown as {
-      socketStates: Map<WebSocket, { attachment: { connectionKey: string } }>;
-      sockets: Set<WebSocket>;
-      socketsByConnectionKey: Map<string, Set<WebSocket>>;
-    };
-    internals.sockets.add(socket);
-    internals.socketStates.set(socket, {
-      attachment: { connectionKey: "client-a" },
-    });
-    internals.socketsByConnectionKey.set("client-a", new Set([socket]));
+    getRealtimeSocketRegistry(connectionDo).add(
+      socket as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({ connectionKey: "client-a" })
+    );
 
     const response = await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
@@ -3938,10 +3982,7 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const internals = connectionDo as unknown as {
-      sockets: Set<WebSocket>;
-      socketsByConnectionKey: Map<string, Set<WebSocket>>;
-    };
+    const internals = getRealtimeSocketTestState(connectionDo);
     const [server] = Array.from(internals.sockets);
     if (!server) {
       throw new Error("Expected accepted realtime socket");
@@ -4040,9 +4081,7 @@ describe("worker runtime", () => {
     clientB.addEventListener("message", (event) => {
       clientBMessages.push(JSON.parse(String(event.data)) as unknown);
     });
-    const internals = connectionDo as unknown as {
-      socketStates: Map<WebSocket, { attachment: { connectionKey: string } }>;
-    };
+    const internals = getRealtimeSocketTestState(connectionDo);
     const [clientAKey, clientBKey] = [...internals.socketStates.values()].map(
       ({ attachment }) => attachment.connectionKey
     );
@@ -4562,48 +4601,21 @@ describe("worker runtime", () => {
         deliveredPayloads.push(payload);
       },
     } as unknown as WebSocket;
-    const internals = connectionDo as unknown as {
-      socketStates: Map<
-        WebSocket,
-        {
-          attachment: {
-            authorizationHeader?: string;
-            connectionKey: string;
-            connectionName: string;
-            latestDeliveredOutboxSequence: number | null;
-            runtimeId: string;
-            subscriptions: unknown[];
-          };
-        }
-      >;
-      sockets: Set<WebSocket>;
-      socketsByConnectionKey: Map<string, Set<WebSocket>>;
-    };
-    internals.sockets.add(failedSocket);
-    internals.sockets.add(activeSocket);
-    internals.socketStates.set(failedSocket, {
-      attachment: {
+    const registry = getRealtimeSocketRegistry(connectionDo);
+    registry.add(
+      failedSocket as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-a",
         connectionKey: "client-a",
-        connectionName: "connection:0",
-        latestDeliveredOutboxSequence: null,
-        runtimeId: "runtime:1",
-        subscriptions: [],
-      },
-    });
-    internals.socketStates.set(activeSocket, {
-      attachment: {
-        connectionKey: "client-a",
-        connectionName: "connection:0",
-        latestDeliveredOutboxSequence: null,
-        runtimeId: "runtime:1",
-        subscriptions: [],
-      },
-    });
-    internals.socketsByConnectionKey.set(
-      "client-a",
-      new Set([failedSocket, activeSocket])
+      })
     );
+    registry.add(
+      activeSocket as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
+        connectionKey: "client-a",
+      })
+    );
+    const internals = getRealtimeSocketTestState(connectionDo);
 
     const response = await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
@@ -4632,10 +4644,14 @@ describe("worker runtime", () => {
         type: "delivery",
       },
     ]);
-    expect(internals.sockets.has(failedSocket)).toBe(false);
-    expect(internals.socketStates.has(failedSocket)).toBe(false);
+    expect(
+      internals.sockets.has(failedSocket as unknown as RuntimeWebSocket)
+    ).toBe(false);
+    expect(
+      internals.socketStates.has(failedSocket as unknown as RuntimeWebSocket)
+    ).toBe(false);
     expect(internals.socketsByConnectionKey.get("client-a")).toEqual(
-      new Set([activeSocket])
+      new Set([activeSocket as unknown as RuntimeWebSocket])
     );
   });
 
@@ -4660,12 +4676,8 @@ describe("worker runtime", () => {
     );
     const client = (response as Response & { readonly webSocket?: WebSocket })
       .webSocket as WebSocket & { accept?: () => void };
-    const internals = connectionDo as unknown as {
-      socketStates: Map<WebSocket, unknown>;
-      sockets: Set<WebSocket>;
-      socketsByConnectionKey: Map<string, Set<WebSocket>>;
-    };
     client.accept?.();
+    const internals = getRealtimeSocketTestState(connectionDo);
 
     expect(internals.sockets.size).toBe(1);
     client.close();
@@ -6665,6 +6677,13 @@ describe("worker runtime", () => {
 
     if (failedRegistration) {
       failedRegistration.reEvaluationRetryAt = Date.now() - 1;
+      const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+      const activeQuery = activeQueryState.activeQueries.get(
+        failedRegistration.activeQueryKey ?? ""
+      );
+      if (activeQuery) {
+        activeQuery.reEvaluationRetryAt = Date.now() - 1;
+      }
     }
     await createTodoViaRpc("owner-a", "retries-after-backoff");
     await createRealtimeOutboxEvent("event-3");
@@ -8091,14 +8110,9 @@ describe("worker runtime", () => {
       REALTIME_SUBSCRIPTIONS: subscriptions,
     });
 
-    const internals = connectionDo as unknown as {
-      sockets: Set<WebSocket>;
-      socketStates: Map<WebSocket, { attachment: Record<string, unknown> }>;
-      socketsByConnectionKey: Map<string, Set<WebSocket>>;
-    };
-    internals.sockets.add(socket);
-    internals.socketStates.set(socket, {
-      attachment: {
+    getRealtimeSocketRegistry(connectionDo).add(
+      socket as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
@@ -8113,9 +8127,8 @@ describe("worker runtime", () => {
             subscriptionShardName: getRealtimeSubscriptionShardName(),
           },
         ],
-      },
-    });
-    internals.socketsByConnectionKey.set("client-a", new Set([socket]));
+      })
+    );
 
     await connectionDo.alarm();
 
@@ -8153,9 +8166,6 @@ describe("worker runtime", () => {
     });
     const anchoredSocket = { send: () => undefined } as unknown as WebSocket;
     const freshSocket = { send: () => undefined } as unknown as WebSocket;
-    const internals = connectionDo as unknown as {
-      socketStates: Map<WebSocket, { attachment: Record<string, unknown> }>;
-    };
     const subscription = {
       args: { ownerToken: "owner-a" },
       epoch: 1,
@@ -8163,18 +8173,21 @@ describe("worker runtime", () => {
       subscriptionId: "sub-a",
       subscriptionShardName: getRealtimeSubscriptionShardName(),
     };
-    internals.socketStates.set(anchoredSocket, {
-      attachment: {
+    const registry = getRealtimeSocketRegistry(connectionDo);
+    registry.add(
+      anchoredSocket as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
         latestDeliveredOutboxSequence: 42,
         runtimeId,
         subscriptions: [subscription],
-      },
-    });
-    internals.socketStates.set(freshSocket, {
-      attachment: {
+      })
+    );
+    registry.add(
+      freshSocket as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-b",
         connectionKey: "client-b",
         connectionName: getRealtimeConnectionShardName("client-b"),
@@ -8186,8 +8199,8 @@ describe("worker runtime", () => {
             subscriptionId: "sub-b",
           },
         ],
-      },
-    });
+      })
+    );
 
     await connectionDo.alarm();
 
@@ -8228,49 +8241,50 @@ describe("worker runtime", () => {
     const socketA = { send: () => undefined } as unknown as WebSocket;
     const socketB = { send: () => undefined } as unknown as WebSocket;
     const socketC = { send: () => undefined } as unknown as WebSocket;
-    const internals = connectionDo as unknown as {
-      socketStates: Map<WebSocket, { attachment: Record<string, unknown> }>;
-    };
     const createSubscription = (
       subscriptionId: string,
       subscriptionShardName: string
-    ): Record<string, unknown> => ({
+    ): RealtimeSocketSubscription => ({
       args: { ownerToken: subscriptionId },
       epoch: 1,
       queryName: "todos:list",
       subscriptionId,
       subscriptionShardName,
     });
-    internals.socketStates.set(socketA, {
-      attachment: {
+    const registry = getRealtimeSocketRegistry(connectionDo);
+    registry.add(
+      socketA as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
         latestDeliveredOutboxSequence: 7,
         runtimeId,
         subscriptions: [createSubscription("sub-a", shardA)],
-      },
-    });
-    internals.socketStates.set(socketB, {
-      attachment: {
+      })
+    );
+    registry.add(
+      socketB as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-b",
         connectionKey: "client-b",
         connectionName: getRealtimeConnectionShardName("client-b"),
         latestDeliveredOutboxSequence: 42,
         runtimeId,
         subscriptions: [createSubscription("sub-b", shardB)],
-      },
-    });
-    internals.socketStates.set(socketC, {
-      attachment: {
+      })
+    );
+    registry.add(
+      socketC as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-c",
         connectionKey: "client-c",
         connectionName: getRealtimeConnectionShardName("client-c"),
         latestDeliveredOutboxSequence: null,
         runtimeId,
         subscriptions: [createSubscription("sub-c", shardC)],
-      },
-    });
+      })
+    );
 
     await connectionDo.alarm();
 
@@ -8304,11 +8318,9 @@ describe("worker runtime", () => {
       ),
     });
     const socket = { send: () => undefined } as unknown as WebSocket;
-    const internals = connectionDo as unknown as {
-      socketStates: Map<WebSocket, { attachment: Record<string, unknown> }>;
-    };
-    internals.socketStates.set(socket, {
-      attachment: {
+    getRealtimeSocketRegistry(connectionDo).add(
+      socket as unknown as RuntimeWebSocket,
+      realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
@@ -8323,8 +8335,8 @@ describe("worker runtime", () => {
             subscriptionShardName: getRealtimeSubscriptionShardName(),
           },
         ],
-      },
-    });
+      })
+    );
 
     await connectionDo.alarm();
 
@@ -8413,6 +8425,127 @@ describe("worker runtime", () => {
     expect(deliveries).toHaveLength(2);
   });
 
+  it("shares identical realtime query evaluation within one shard pass", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveredSubscriptionIds: string[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        deliveredSubscriptionIds.push(
+          ...items.map((item) => item.subscriptionId)
+        );
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    for (const subscriptionId of ["sub-a", "sub-b"]) {
+      await subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { mode: "partition-todos", ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "realtime:dependencyTracking",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    }
+    await createTodoViaRpc("owner-a", "shared-evaluation");
+    await createRealtimeOutboxEvent("shared-evaluation-event", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "shared-evaluation-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(await response.json()).toEqual({
+      evaluated: 2,
+      failed: 0,
+      ok: true,
+    });
+    expect(realtimeDependencyTrackingQueryCalls).toBe(1);
+    expect(deliveredSubscriptionIds).toEqual(["sub-a", "sub-b"]);
+  });
+
+  it("does not share realtime query evaluation across authorization contexts", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    for (const [subscriptionId, authorizationHeader] of [
+      ["sub-a", "Bearer owner-a"],
+      ["sub-b", "Bearer owner-b"],
+    ] as const) {
+      await subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { mode: "partition-todos", ownerToken: "owner-a" },
+            authorizationHeader,
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "realtime:dependencyTracking",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    }
+    await createTodoViaRpc("owner-a", "auth-split");
+    await createRealtimeOutboxEvent("auth-split-event", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "auth-split-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(realtimeDependencyTrackingQueryCalls).toBe(2);
+  });
+
   it("batches relevant realtime version-gap reads", async () => {
     const runtimeId = createRealtimeRuntimeId();
     let tableVersionReads = 0;
@@ -8475,8 +8608,10 @@ describe("worker runtime", () => {
     const ownerBPartitionId = todoOwnerPartitionId("owner-b");
     const ownerCPartitionId = todoOwnerPartitionId("owner-c");
     const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
     const registration = indexState.registrations.get(registrationKey) as
       | {
+          activeQueryKey?: string;
           dependencies?: {
             partitions: Set<string>;
             tables: Set<string>;
@@ -8503,22 +8638,35 @@ describe("worker runtime", () => {
       env.APP_DB,
       dependencies
     );
+    const activeQueryKey = registration.activeQueryKey;
+    if (!activeQueryKey) {
+      throw new Error("Missing realtime active query key");
+    }
+    const activeQuery = activeQueryState.activeQueries.get(activeQueryKey);
+    if (!activeQuery) {
+      throw new Error("Missing realtime active query");
+    }
+    activeQuery.dependencies = dependencies;
+    activeQuery.versionSnapshot = registration.versionSnapshot;
     tableVersionReads = 0;
     partitionVersionReads = 0;
-    indexState.registrationKeysByTable.set(
+    activeQueryState.activeQueryKeysByTable.set(
       "labels",
-      new Set([registrationKey])
+      new Set([activeQueryKey])
     );
-    indexState.registrationKeysByTable.set("todos", new Set([registrationKey]));
-    indexState.registrationKeysByPartition.set(
+    activeQueryState.activeQueryKeysByTable.set(
+      "todos",
+      new Set([activeQueryKey])
+    );
+    activeQueryState.activeQueryKeysByPartition.set(
       ownerAPartitionId,
-      new Set([registrationKey])
+      new Set([activeQueryKey])
     );
-    indexState.registrationKeysByPartition.set(
+    activeQueryState.activeQueryKeysByPartition.set(
       ownerBPartitionId,
-      new Set([registrationKey])
+      new Set([activeQueryKey])
     );
-    indexState.registrationKeysWithoutDependencies.delete(registrationKey);
+    activeQueryState.activeQueryKeysWithoutDependencies.delete(activeQueryKey);
     await createRealtimeOutboxEvent("batched-version-gap", Date.now(), {
       bumpVersions: false,
       partitions: [
@@ -8574,10 +8722,14 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    let activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
 
     expect(
-      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+      activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
     ).toBe(true);
 
     await createTodoViaRpc("owner-a", "owner-a-indexed");
@@ -8593,13 +8745,17 @@ describe("worker runtime", () => {
       })
     );
 
+    activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
     expect(
-      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+      activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
     ).toBe(false);
     expect(
-      indexState.registrationKeysByPartition
+      activeQueryState.activeQueryKeysByPartition
         .get(todoOwnerPartitionId("owner-a"))
-        ?.has(registrationKey)
+        ?.has(activeQueryKey)
     ).toBe(true);
   });
 
@@ -8644,15 +8800,19 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
 
     expect(
-      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+      activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
     ).toBe(false);
     expect(
-      indexState.registrationKeysByPartition
+      activeQueryState.activeQueryKeysByPartition
         .get(ownerPartitionId)
-        ?.has(registrationKey)
+        ?.has(activeQueryKey)
     ).toBe(true);
 
     await createRealtimeOutboxEvent("preindexed-unrelated", Date.now(), {
@@ -8723,12 +8883,16 @@ describe("worker runtime", () => {
       })
     );
 
-    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
     expect(
-      indexState.registrationKeysWithoutDependencies.has(registrationKey)
+      activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
     ).toBe(true);
-    expect(indexState.registrationKeysByTable.size).toBe(0);
-    expect(indexState.registrationKeysByPartition.size).toBe(0);
+    expect(activeQueryState.activeQueryKeysByTable.size).toBe(0);
+    expect(activeQueryState.activeQueryKeysByPartition.size).toBe(0);
 
     await createRealtimeOutboxEvent("no-read-follow-up", Date.now(), {
       tables: ["labels"],
@@ -8864,17 +9028,21 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
 
     expect(
-      indexState.registrationKeysByPartition
+      activeQueryState.activeQueryKeysByPartition
         .get(todoOwnerPartitionId("owner-a"))
-        ?.has(registrationKey)
+        ?.has(activeQueryKey)
     ).not.toBe(true);
     expect(
-      indexState.registrationKeysByPartition
+      activeQueryState.activeQueryKeysByPartition
         .get(todoOwnerPartitionId("owner-b"))
-        ?.has(registrationKey)
+        ?.has(activeQueryKey)
     ).toBe(true);
   });
 
@@ -8929,15 +9097,12 @@ describe("worker runtime", () => {
       })
     );
     const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
 
-    expect(
-      indexState.registrationKeysWithoutDependencies.has(registrationKey)
-    ).toBe(false);
-    expect(
-      indexState.registrationKeysByPartition
-        .get(todoOwnerPartitionId("owner-a"))
-        ?.has(registrationKey)
-    ).not.toBe(true);
+    expect(indexState.registrations.has(registrationKey)).toBe(false);
+    expect(activeQueryState.activeQueries.size).toBe(0);
+    expect(activeQueryState.activeQueryKeysWithoutDependencies.size).toBe(0);
+    expect(activeQueryState.activeQueryKeysByPartition.size).toBe(0);
   });
 
   it("keeps realtime dependency indexes after failed re-evaluation", async () => {
@@ -8992,7 +9157,11 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
 
     expect(await response.json()).toEqual({
       evaluated: 0,
@@ -9000,9 +9169,9 @@ describe("worker runtime", () => {
       ok: true,
     });
     expect(
-      indexState.registrationKeysByPartition
+      activeQueryState.activeQueryKeysByPartition
         .get(todoOwnerPartitionId("owner-a"))
-        ?.has(registrationKey)
+        ?.has(activeQueryKey)
     ).toBe(true);
   });
 
@@ -9081,10 +9250,8 @@ describe("worker runtime", () => {
 
     expect(indexState.registrations.has(registrationKey)).toBe(false);
     expect(
-      indexState.registrationKeysByPartition
-        .get(todoOwnerPartitionId("owner-a"))
-        ?.has(registrationKey)
-    ).not.toBe(true);
+      getRealtimeActiveQueryTestState(subscriptionDo).activeQueries.size
+    ).toBe(0);
   });
 
   it("keeps broad table dependencies subscribed to table events", async () => {
@@ -9844,6 +10011,9 @@ describe("worker runtime", () => {
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
+    const warnLog = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
     const runtimeId = createRealtimeRuntimeId();
     await createTodoViaRpc("owner-a", "malformed-notify-recovered");
     await env.APP_DB.prepare(
@@ -9921,6 +10091,14 @@ describe("worker runtime", () => {
         errorName: "SyntaxError",
         event: "runtime.realtime_outbox_event_parse_failed",
         eventId: "malformed-notify",
+      })
+    );
+    expect(warnLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_notify_malformed_outbox_recovered",
+        eventId: "malformed-notify",
+        sequence: malformedSequence,
       })
     );
   });
@@ -10544,6 +10722,77 @@ describe("worker runtime", () => {
     expect(deliveries).toHaveLength(1);
   });
 
+  it("keeps realtime dependency indexes unchanged when dependency persistence fails", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          dependencies: { partitions: [], tables: ["todos"] },
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+          versionSnapshot: { partitions: [], tables: [["todos", 0]] },
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const registration = indexState.registrations.get(registrationKey) as
+      | StoredRealtimeRegistration
+      | undefined;
+    const updateRegistrationDependencies = (
+      subscriptionDo as unknown as {
+        updateRegistrationDependencies(
+          registration: StoredRealtimeRegistration,
+          dependencies: RealtimeDependencySet,
+          versionSnapshot: RealtimeVersionSnapshot
+        ): Promise<void>;
+      }
+    ).updateRegistrationDependencies.bind(subscriptionDo);
+
+    expect(registration).toBeDefined();
+    const activeQueryState = getRealtimeActiveQueryTestState(subscriptionDo);
+    const activeQueryKey = getRealtimeActiveQueryKeyForRegistration(
+      subscriptionDo,
+      registrationKey
+    );
+    expect(
+      activeQueryState.activeQueryKeysByTable.get("todos")?.has(activeQueryKey)
+    ).toBe(true);
+    state.failedStoragePuts = 2;
+
+    await expect(
+      updateRegistrationDependencies(
+        registration as StoredRealtimeRegistration,
+        { partitions: new Set(), tables: new Set(["labels"]) },
+        { partitions: new Map(), tables: new Map([["labels", 0]]) }
+      )
+    ).rejects.toThrow("Storage put failed");
+
+    expect(registration?.dependencies?.tables.has("todos")).toBe(true);
+    expect(registration?.dependencies?.tables.has("labels")).not.toBe(true);
+    expect(
+      activeQueryState.activeQueryKeysByTable.get("todos")?.has(activeQueryKey)
+    ).toBe(true);
+    expect(
+      activeQueryState.activeQueryKeysByTable.get("labels")?.has(activeQueryKey)
+    ).not.toBe(true);
+  });
+
   it("runs realtime delivered registration bookkeeping concurrently", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await env.APP_DB.prepare(
@@ -10741,11 +10990,11 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const register = (subscriptionId: string) =>
+    const register = (subscriptionId: string, ownerToken = "owner-a") =>
       subscriptionDo.fetch(
         new Request("https://baseflare.internal/register", {
           body: JSON.stringify({
-            args: { ownerToken: "owner-a" },
+            args: { ownerToken },
             authorizationHeader: "Bearer owner-a",
             connectionKey: "client-a",
             connectionName: "connection:0",
@@ -10908,11 +11157,11 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const register = (subscriptionId: string) =>
+    const register = (subscriptionId: string, ownerToken = "owner-a") =>
       subscriptionDo.fetch(
         new Request("https://baseflare.internal/register", {
           body: JSON.stringify({
-            args: { ownerToken: "owner-a" },
+            args: { ownerToken },
             authorizationHeader: "Bearer owner-a",
             connectionKey: "client-a",
             connectionName: "connection:0",
@@ -10927,7 +11176,7 @@ describe("worker runtime", () => {
         })
       );
     for (let index = 0; index < REALTIME_DELIVERY_BATCH_SIZE + 1; index += 1) {
-      await register(`sub-${index}`);
+      await register(`sub-${index}`, `owner-${index}`);
     }
     await createTodoViaRpc("owner-a", "bounded-delivery-batches");
     await createRealtimeOutboxEvent("bounded-delivery-batches-event");
@@ -10996,11 +11245,11 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const register = (subscriptionId: string) =>
+    const register = (subscriptionId: string, ownerToken = "owner-a") =>
       subscriptionDo.fetch(
         new Request("https://baseflare.internal/register", {
           body: JSON.stringify({
-            args: { ownerToken: "owner-a" },
+            args: { ownerToken },
             authorizationHeader: "Bearer owner-a",
             connectionKey: "client-a",
             connectionName: "connection:0",
@@ -11015,7 +11264,7 @@ describe("worker runtime", () => {
         })
       );
     for (let index = 0; index < REALTIME_DELIVERY_BATCH_SIZE + 1; index += 1) {
-      await register(`sub-${index}`);
+      await register(`sub-${index}`, `owner-${index}`);
     }
     await createTodoViaRpc("owner-a", "partially-failed-chunked-delivery");
     await createRealtimeOutboxEvent("partially-failed-chunked-delivery-event");
@@ -11076,11 +11325,11 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const register = (subscriptionId: string) =>
+    const register = (subscriptionId: string, ownerToken = "owner-a") =>
       subscriptionDo.fetch(
         new Request("https://baseflare.internal/register", {
           body: JSON.stringify({
-            args: { ownerToken: "owner-a" },
+            args: { ownerToken },
             authorizationHeader: "Bearer owner-a",
             connectionKey: "client-a",
             connectionName: "connection:0",
@@ -11166,11 +11415,11 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const register = (subscriptionId: string) =>
+    const register = (subscriptionId: string, ownerToken = "owner-a") =>
       subscriptionDo.fetch(
         new Request("https://baseflare.internal/register", {
           body: JSON.stringify({
-            args: { ownerToken: "owner-a" },
+            args: { ownerToken },
             authorizationHeader: "Bearer owner-a",
             connectionKey: "client-a",
             connectionName: "connection:0",
@@ -11393,11 +11642,11 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const register = (subscriptionId: string) =>
+    const register = (subscriptionId: string, ownerToken: string) =>
       subscriptionDo.fetch(
         new Request("https://baseflare.internal/register", {
           body: JSON.stringify({
-            args: { ownerToken: "owner-a" },
+            args: { ownerToken },
             authorizationHeader: "Bearer owner-a",
             connectionKey: "client-a",
             connectionName: "connection:0",
@@ -11412,7 +11661,7 @@ describe("worker runtime", () => {
         })
       );
     for (let index = 0; index < 12; index += 1) {
-      await register(`sub-${index}`);
+      await register(`sub-${index}`, `owner-${index}`);
     }
     await createTodoViaRpc("owner-a", "bounded-re-evaluation");
     await createRealtimeOutboxEvent("bounded-re-evaluation-event");
@@ -11824,6 +12073,101 @@ describe("worker runtime", () => {
 
     expect(duplicateBody).toEqual({ evaluated: 1, failed: 0, ok: true });
     expect(deliveries).toHaveLength(1);
+  });
+
+  it("backs off all realtime registrations after batch delivery failure even when one recovery persist fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    const state = new FakeRealtimeDurableObjectState();
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ ok: false }, { status: 500 }))
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "todos:list",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    await register("sub-a");
+    await register("sub-b");
+    await createTodoViaRpc("owner-a", "batch-recovery-failure");
+    await createRealtimeOutboxEvent("batch-recovery-failure-event");
+    state.failedStoragePuts = 1;
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "batch-recovery-failure-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    const indexState = getRealtimeIndexTestState(subscriptionDo);
+    const inMemoryBackoffs = ["sub-a", "sub-b"].map(
+      (subscriptionId) =>
+        indexState.registrations.get(
+          realtimeRegistrationKey("client-a", subscriptionId)
+        )?.reEvaluationRetryAt
+    );
+    const reloadedSubscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationsResponse = await reloadedSubscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const registrationsBody = (await registrationsResponse.json()) as {
+      registrations: Array<{
+        reEvaluationRetryAt?: number;
+        subscriptionId: string;
+      }>;
+    };
+
+    expect(body).toEqual({ evaluated: 0, failed: 2, ok: true });
+    for (const retryAt of inMemoryBackoffs) {
+      expect(retryAt).toBeGreaterThan(Date.now());
+    }
+    expect(
+      registrationsBody.registrations.filter(
+        (registration) =>
+          typeof registration.reEvaluationRetryAt === "number" &&
+          registration.reEvaluationRetryAt > Date.now()
+      )
+    ).toHaveLength(1);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "Error",
+        event: "runtime.realtime_registration_state_update_failed",
+      })
+    );
   });
 
   it("keeps non-expired realtime registrations after non-ok delivery responses", async () => {

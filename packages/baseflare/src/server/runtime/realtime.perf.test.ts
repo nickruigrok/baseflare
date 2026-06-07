@@ -321,6 +321,52 @@ describe("realtime local performance gate", () => {
     expect(realtimeDependencyTrackingQueryCalls).toBe(0);
   });
 
+  it("shares hot partition query evaluation across identical registrations", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveredSubscriptionIds = new Set<string>();
+    const connections = new FakeDurableObjectNamespace(async (request) => {
+      const delivery = (await request.json()) as {
+        deliveries: Array<{ subscriptionId: string }>;
+      };
+      for (const item of delivery.deliveries) {
+        deliveredSubscriptionIds.add(item.subscriptionId);
+      }
+      return Response.json({
+        delivered: delivery.deliveries.length,
+        deliveredSubscriptions: delivery.deliveries.map(
+          (item) => item.subscriptionId
+        ),
+        ok: true,
+      });
+    });
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    for (let index = 0; index < 1000; index += 1) {
+      await registerSubscription(
+        subscriptionDo,
+        runtimeId,
+        `sub-${index}`,
+        "perf:dependency",
+        "owner-a"
+      );
+    }
+    await createRealtimeOutboxEvent("shared-owner-a", "owner-a");
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "shared-owner-a" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(realtimeDependencyTrackingQueryCalls).toBe(1);
+    expect(deliveredSubscriptionIds.size).toBe(1000);
+  });
+
   it("keeps hot re-evaluation concurrency bounded", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const subscriptionDo = new RealtimeSubscriptionDO(null, {
@@ -345,7 +391,7 @@ describe("realtime local performance gate", () => {
         runtimeId,
         `sub-${index}`,
         "perf:slow",
-        "owner-a"
+        `owner-${index}`
       );
     }
     await createRealtimeOutboxEvent("hot-owner-a", "owner-a");
