@@ -213,8 +213,19 @@ export class RealtimeRegistrationStore {
     registration: StoredRealtimeRegistration,
     retryAt = Date.now() + REALTIME_REEVALUATION_FAILURE_RETRY_MS
   ): Promise<void> {
+    const registrationKey = createRegistrationKey(
+      registration.connectionKey,
+      registration.subscriptionId
+    );
     registration.reEvaluationRetryAt = retryAt;
-    await this.persist(registration);
+    const storedRegistration = this.registrations.get(registrationKey);
+    if (storedRegistration && storedRegistration !== registration) {
+      storedRegistration.reEvaluationRetryAt = retryAt;
+    }
+    await this.persistByKey(registrationKey, {
+      ...registration,
+      reEvaluationRetryAt: retryAt,
+    });
   }
 
   async clearBackoff(registration: StoredRealtimeRegistration): Promise<void> {

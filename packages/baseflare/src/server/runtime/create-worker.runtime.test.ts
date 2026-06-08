@@ -3096,6 +3096,151 @@ describe("worker runtime", () => {
     ).toBe(false);
   });
 
+  it("keeps adopted target registrations pending when source delete fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const ownerToken =
+      ["owner-a", "owner-b", "owner-c", "owner-d"].find(
+        (token) =>
+          getRealtimeSubscriptionShardName(
+            createRealtimePartitionSubscriptionRouteTarget(
+              todoOwnerPartition(token)
+            ),
+            8
+          ) !== globalShardName
+      ) ?? "owner-a";
+    const targetShardName = getRealtimeSubscriptionShardName(
+      createRealtimePartitionSubscriptionRouteTarget(
+        todoOwnerPartition(ownerToken)
+      ),
+      8
+    );
+    expect(targetShardName).not.toBe(globalShardName);
+    await createTodoViaRpc(ownerToken, "source-delete-failed");
+    const queryResponse = await invoke(
+      "/api/query/realtime:dependencyTracking",
+      {
+        body: rpcBody({ mode: "partition-todos", ownerToken }),
+        headers: { authorization: `Bearer ${ownerToken}` },
+        method: "POST",
+      }
+    );
+    const queryBody = (await queryResponse.json()) as { result: unknown };
+    const sourceState = new FakeRealtimeDurableObjectState();
+    const targetSubscriptionDo = new RealtimeSubscriptionDO(
+      new FakeRealtimeDurableObjectState(),
+      {
+        APP_DB: env.APP_DB,
+        REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+        REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+      }
+    );
+    let shouldFailSourceDelete = true;
+    const originalSourceDelete = sourceState.storage.delete;
+    sourceState.storage.delete = (key: string) => {
+      if (
+        shouldFailSourceDelete &&
+        key.includes(realtimeRegistrationKey("client-a", "sub-a"))
+      ) {
+        shouldFailSourceDelete = false;
+        return Promise.reject(new Error("Storage delete failed"));
+      }
+      return originalSourceDelete(key);
+    };
+    const subscriptionPaths: string[] = [];
+    const subscriptions = new FakeDurableObjectNamespace((name, request) => {
+      const pathname = new URL(request.url).pathname;
+      subscriptionPaths.push(pathname);
+      if (name === targetShardName) {
+        return targetSubscriptionDo.fetch(request);
+      }
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(Response.json({ ok: true }))
+    );
+    const sourceSubscriptionDo = new RealtimeSubscriptionDO(sourceState, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await sourceSubscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken },
+          authorizationHeader: `Bearer ${ownerToken}`,
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          lastResultJson: JSON.stringify(queryBody.result),
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createRealtimeOutboxEvent("source-delete-failed-event", Date.now(), {
+      partitions: [todoOwnerPartition(ownerToken)],
+      tables: ["todos"],
+    });
+
+    await sourceSubscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "source-delete-failed-event",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    const sourceRegistration =
+      getRealtimeIndexTestState(sourceSubscriptionDo).registrations.get(
+        registrationKey
+      );
+    const targetRegistration =
+      getRealtimeIndexTestState(targetSubscriptionDo).registrations.get(
+        registrationKey
+      );
+
+    expect(subscriptionPaths).toContain("/adopt-registration");
+    expect(subscriptionPaths).not.toContain("/activate-registration");
+    expect(sourceRegistration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(targetRegistration?.movePending).toBe(true);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "Error",
+        event: "runtime.realtime_registration_move_failed",
+        sourceRemoved: false,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "InternalRuntimeError",
+        event: "runtime.realtime_registration_re_evaluation_failed",
+        subscriptionId: "sub-a",
+      })
+    );
+  });
+
   it("keeps source realtime registrations active when shard move rollback succeeds", async () => {
     const { errorLog, registrations, subscriptionDo, subscriptionPaths } =
       await runRealtimeMoveRollbackScenario(() =>

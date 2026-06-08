@@ -1725,6 +1725,23 @@ export class RealtimeSubscriptionDO {
       );
     }
 
+    try {
+      await this.registrationStore.delete(registrationKey);
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
+        connectionKey: registration.connectionKey,
+        errorName: error instanceof Error ? error.name : typeof error,
+        shardName: targetShardName,
+        sourceRemoved: false,
+        subscriptionId: registration.subscriptionId,
+      });
+      throw new InternalRuntimeError(
+        `Realtime registration source delete failed: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`
+      );
+    }
+
     let activationResponse: Response;
     try {
       activationResponse = await targetStub.fetch(
@@ -1746,6 +1763,7 @@ export class RealtimeSubscriptionDO {
         registration
       );
       await this.restoreSourceRegistrationOwner(registration);
+      await this.registrationStore.upsert(registrationKey, registration);
       logRuntimeEvent(
         "error",
         "runtime.realtime_registration_activation_failed",
@@ -1769,6 +1787,7 @@ export class RealtimeSubscriptionDO {
         registration
       );
       await this.restoreSourceRegistrationOwner(registration);
+      await this.registrationStore.upsert(registrationKey, registration);
       logRuntimeEvent(
         "error",
         "runtime.realtime_registration_activation_failed",
@@ -1783,8 +1802,6 @@ export class RealtimeSubscriptionDO {
         `Realtime registration activation failed with status ${activationResponse.status}`
       );
     }
-
-    await this.registrationStore.delete(registrationKey);
   }
 
   private async moveConnectionRegistrationShard(
