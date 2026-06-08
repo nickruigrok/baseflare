@@ -13419,6 +13419,100 @@ describe("worker runtime", () => {
     ).toEqual(["sub-a"]);
   });
 
+  it("logs realtime delivered-state recovery failures", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveries: unknown[] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/deliver") {
+          const delivery = await request.json();
+          deliveries.push(delivery);
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+
+        return Response.json({ connected: true, ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(
+      new FakeRealtimeDurableObjectState(),
+      {
+        APP_DB: env.APP_DB,
+        REALTIME_CONNECTIONS: connections,
+        REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+      }
+    );
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    vi.spyOn(
+      subscriptionDo as unknown as {
+        updateRegistrationDependencies(): Promise<void>;
+      },
+      "updateRegistrationDependencies"
+    ).mockRejectedValueOnce(new Error("Dependency update failed"));
+    const registrationStore = (
+      subscriptionDo as unknown as {
+        registrationStore: {
+          markBackedOff(
+            registration: StoredRealtimeRegistration
+          ): Promise<void>;
+        };
+      }
+    ).registrationStore;
+    vi.spyOn(registrationStore, "markBackedOff").mockRejectedValueOnce(
+      new Error("Recovery persist failed")
+    );
+    await createTodoViaRpc("owner-a", "delivered-state-recovery-log");
+    await createRealtimeOutboxEvent("delivered-state-recovery-log-event");
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "delivered-state-recovery-log-event" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
+    expect(deliveries).toHaveLength(1);
+    const stateUpdateLogs = errorLog.mock.calls.filter(
+      ([label, payload]) =>
+        label === "baseflare-runtime" &&
+        typeof payload === "object" &&
+        payload !== null &&
+        "event" in payload &&
+        payload.event === "runtime.realtime_registration_state_update_failed"
+    );
+    expect(stateUpdateLogs).toHaveLength(2);
+  });
+
   it("keeps non-expired realtime registrations after non-ok delivery responses", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const connections = new FakeDurableObjectNamespace(() =>

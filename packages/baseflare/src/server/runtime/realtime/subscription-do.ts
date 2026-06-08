@@ -1335,12 +1335,19 @@ export class RealtimeSubscriptionDO {
         delivery.versionSnapshot
       );
     } catch (error) {
-      if (
-        !(await this.registrationStore.deleteExpired(delivery.registration))
-      ) {
-        await this.registrationStore.markBackedOff(delivery.registration);
-      }
       this.logRegistrationStateUpdateFailure(delivery.registration, error);
+      try {
+        if (
+          !(await this.registrationStore.deleteExpired(delivery.registration))
+        ) {
+          await this.registrationStore.markBackedOff(delivery.registration);
+        }
+      } catch (recoveryError) {
+        this.logRegistrationStateUpdateFailure(
+          delivery.registration,
+          recoveryError
+        );
+      }
     }
   }
 
