@@ -1187,7 +1187,7 @@ export class RealtimeSubscriptionDO {
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
           failed += 1;
-          await this.handleUndeliveredRegistration(delivery, noTargetSockets);
+          await this.handleUndeliveredRegistration(delivery);
           continue;
         }
 
@@ -1232,14 +1232,13 @@ export class RealtimeSubscriptionDO {
   }
 
   private async handleUndeliveredRegistration(
-    delivery: PendingRealtimeDelivery,
-    noTargetSockets: boolean
+    delivery: PendingRealtimeDelivery
   ): Promise<void> {
     try {
       const deleted = await this.registrationStore.deleteExpired(
         delivery.registration
       );
-      if (!(deleted || noTargetSockets)) {
+      if (!deleted) {
         await this.registrationStore.markBackedOff(delivery.registration);
       }
     } catch (error) {

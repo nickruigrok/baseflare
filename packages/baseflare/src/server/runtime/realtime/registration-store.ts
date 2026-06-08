@@ -217,15 +217,15 @@ export class RealtimeRegistrationStore {
       registration.connectionKey,
       registration.subscriptionId
     );
+    await this.persistByKey(registrationKey, {
+      ...registration,
+      reEvaluationRetryAt: retryAt,
+    });
     registration.reEvaluationRetryAt = retryAt;
     const storedRegistration = this.registrations.get(registrationKey);
     if (storedRegistration && storedRegistration !== registration) {
       storedRegistration.reEvaluationRetryAt = retryAt;
     }
-    await this.persistByKey(registrationKey, {
-      ...registration,
-      reEvaluationRetryAt: retryAt,
-    });
   }
 
   async clearBackoff(registration: StoredRealtimeRegistration): Promise<void> {

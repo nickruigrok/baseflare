@@ -12008,13 +12008,26 @@ describe("worker runtime", () => {
     );
 
     expect(firstBody).toEqual({ evaluated: 0, failed: 2, ok: true });
-    expect(secondBody).toEqual({ evaluated: 0, failed: 2, ok: true });
+    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: true });
     for (const registration of registrations) {
-      expect(registration?.reEvaluationRetryAt).toBeUndefined();
+      expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
     }
-    expect(deliveries).toHaveLength(2);
+    expect(deliveries).toHaveLength(1);
 
-    const retriedResponse = await notify();
+    for (const registration of registrations) {
+      if (registration) {
+        registration.reEvaluationRetryAt = Date.now() - 1;
+      }
+    }
+    await createTodoViaRpc("owner-a", "undelivered-batch-retry");
+    await createRealtimeOutboxEvent("undelivered-batch-event-2");
+    const retriedResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "undelivered-batch-event-2" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
     const retriedBody = (await retriedResponse.json()) as {
       evaluated: number;
       failed: number;
@@ -12022,7 +12035,7 @@ describe("worker runtime", () => {
     };
 
     expect(retriedBody).toEqual({ evaluated: 0, failed: 2, ok: true });
-    expect(deliveries).toHaveLength(3);
+    expect(deliveries).toHaveLength(2);
   });
 
   it("does not scale up from no-target realtime delivery batches", async () => {
@@ -12286,7 +12299,7 @@ describe("worker runtime", () => {
     );
   });
 
-  it("retries realtime delivery when no socket receives the result without backoff", async () => {
+  it("backs off realtime delivery when no socket receives the result", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const connections = new FakeDurableObjectNamespace(() =>
       Promise.resolve(Response.json({ delivered: 0, ok: true }))
@@ -12342,8 +12355,29 @@ describe("worker runtime", () => {
     const registration = indexState.registrations.get(registrationKey);
 
     expect(firstBody).toEqual({ evaluated: 0, failed: 1, ok: true });
-    expect(secondBody).toEqual({ evaluated: 0, failed: 1, ok: true });
-    expect(registration?.reEvaluationRetryAt).toBeUndefined();
+    expect(secondBody).toEqual({ evaluated: 0, failed: 0, ok: true });
+    expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(connections.requests).toHaveLength(1);
+
+    if (registration) {
+      registration.reEvaluationRetryAt = Date.now() - 1;
+    }
+    await createTodoViaRpc("owner-a", "retry-after-no-socket-backoff");
+    await createRealtimeOutboxEvent("no-socket-retry-event-2");
+    const retryResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "no-socket-retry-event-2" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const retryBody = (await retryResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+
+    expect(retryBody).toEqual({ evaluated: 0, failed: 1, ok: true });
     expect(connections.requests).toHaveLength(2);
   });
 
@@ -12616,7 +12650,7 @@ describe("worker runtime", () => {
     expect(deliveries).toHaveLength(1);
   });
 
-  it("backs off all realtime registrations after batch delivery failure even when one recovery persist fails", async () => {
+  it("continues batch delivery recovery when one backoff persist fails", async () => {
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -12692,9 +12726,14 @@ describe("worker runtime", () => {
     };
 
     expect(body).toEqual({ evaluated: 0, failed: 2, ok: true });
-    for (const retryAt of inMemoryBackoffs) {
-      expect(retryAt).toBeGreaterThan(Date.now());
-    }
+    expect(
+      inMemoryBackoffs.filter(
+        (retryAt) => typeof retryAt === "number" && retryAt > Date.now()
+      )
+    ).toHaveLength(1);
+    expect(
+      inMemoryBackoffs.filter((retryAt) => retryAt === undefined)
+    ).toHaveLength(1);
     expect(
       registrationsBody.registrations.filter(
         (registration) =>

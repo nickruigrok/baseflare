@@ -156,4 +156,31 @@ describe("RealtimeRegistrationStore", () => {
 
     expect(storedRegistration.lastResultJson).toBeUndefined();
   });
+
+  it("does not advance backoff memory when backoff persistence fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeRegistrationStore(state);
+    const key = registrationKey("sub-a");
+    const storedRegistration = registration("sub-a");
+    const passedRegistration = { ...storedRegistration };
+    await store.upsert(key, storedRegistration);
+    state.failedStoragePuts = 1;
+
+    await expect(
+      store.markBackedOff(passedRegistration, Date.now() + 10_000)
+    ).rejects.toThrow("Storage put failed");
+
+    expect(passedRegistration.reEvaluationRetryAt).toBeUndefined();
+    expect(store.get(key)?.reEvaluationRetryAt).toBeUndefined();
+
+    const retryAt = Date.now() + 20_000;
+    await store.markBackedOff(passedRegistration, retryAt);
+
+    const reloadedStore = new RealtimeRegistrationStore(state);
+    await reloadedStore.loadOnce();
+
+    expect(passedRegistration.reEvaluationRetryAt).toBe(retryAt);
+    expect(store.get(key)?.reEvaluationRetryAt).toBe(retryAt);
+    expect(reloadedStore.get(key)?.reEvaluationRetryAt).toBe(retryAt);
+  });
 });
