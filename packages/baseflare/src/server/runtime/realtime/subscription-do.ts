@@ -1728,12 +1728,21 @@ export class RealtimeSubscriptionDO {
     try {
       await this.registrationStore.delete(registrationKey);
     } catch (error) {
+      const sourceOwnerRestored =
+        await this.restoreSourceRegistrationOwner(registration);
+      const targetRollbackSucceeded = await this.rollbackAdoptedRegistration(
+        targetStub,
+        targetShardName,
+        registration
+      );
       logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
         connectionKey: registration.connectionKey,
         errorName: error instanceof Error ? error.name : typeof error,
         shardName: targetShardName,
         sourceRemoved: false,
+        sourceOwnerRestored,
         subscriptionId: registration.subscriptionId,
+        targetRollbackSucceeded,
       });
       throw new InternalRuntimeError(
         `Realtime registration source delete failed: ${
@@ -1823,7 +1832,7 @@ export class RealtimeSubscriptionDO {
 
   private async restoreSourceRegistrationOwner(
     registration: StoredRealtimeRegistration
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       const response = await this.moveConnectionRegistrationShard(
         registration,
@@ -1837,7 +1846,9 @@ export class RealtimeSubscriptionDO {
           status: response.status,
           subscriptionId: registration.subscriptionId,
         });
+        return false;
       }
+      return true;
     } catch (error) {
       logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
         connectionKey: registration.connectionKey,
@@ -1846,6 +1857,7 @@ export class RealtimeSubscriptionDO {
         sourceRemoved: false,
         subscriptionId: registration.subscriptionId,
       });
+      return false;
     }
   }
 

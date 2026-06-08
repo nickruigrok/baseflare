@@ -3096,7 +3096,7 @@ describe("worker runtime", () => {
     ).toBe(false);
   });
 
-  it("keeps adopted target registrations pending when source delete fails", async () => {
+  it("rolls back realtime migration ownership when source delete fails", async () => {
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -3165,9 +3165,18 @@ describe("worker runtime", () => {
       }
       return Promise.resolve(Response.json({ ok: true }));
     });
-    const connections = new FakeDurableObjectNamespace(() =>
-      Promise.resolve(Response.json({ ok: true }))
-    );
+    const movedShardNames: string[] = [];
+    const connections = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname === "/subscription-moved") {
+        return request.json().then((body) => {
+          movedShardNames.push(
+            (body as { subscriptionShardName: string }).subscriptionShardName
+          );
+          return Response.json({ ok: true });
+        });
+      }
+      return Promise.resolve(Response.json({ ok: true }));
+    });
     const sourceSubscriptionDo = new RealtimeSubscriptionDO(sourceState, {
       APP_DB: env.APP_DB,
       REALTIME_CONNECTIONS: connections,
@@ -3219,16 +3228,20 @@ describe("worker runtime", () => {
       );
 
     expect(subscriptionPaths).toContain("/adopt-registration");
+    expect(subscriptionPaths).toContain("/unregister");
     expect(subscriptionPaths).not.toContain("/activate-registration");
+    expect(movedShardNames).toEqual([targetShardName, globalShardName]);
     expect(sourceRegistration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
-    expect(targetRegistration?.movePending).toBe(true);
+    expect(targetRegistration).toBeUndefined();
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
         errorName: "Error",
         event: "runtime.realtime_registration_move_failed",
         sourceRemoved: false,
+        sourceOwnerRestored: true,
         subscriptionId: "sub-a",
+        targetRollbackSucceeded: true,
       })
     );
     expect(errorLog).toHaveBeenCalledWith(
@@ -3239,6 +3252,22 @@ describe("worker runtime", () => {
         subscriptionId: "sub-a",
       })
     );
+
+    await sourceSubscriptionDo.fetch(
+      new Request("https://baseflare.internal/unregister", {
+        body: JSON.stringify({
+          connectionKey: "client-a",
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    expect(
+      getRealtimeIndexTestState(sourceSubscriptionDo).registrations.has(
+        registrationKey
+      )
+    ).toBe(false);
   });
 
   it("keeps source realtime registrations active when shard move rollback succeeds", async () => {
@@ -5098,7 +5127,103 @@ describe("worker runtime", () => {
     const generationQueries = prepare.mock.calls.filter(([sql]) =>
       sql.includes("_bf_realtime_shard_generations")
     );
-    expect(generationQueries).toHaveLength(1);
+    expect(generationQueries).toHaveLength(2);
+  });
+
+  it("restores old-generation realtime subscriptions on the active generation", async () => {
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 2, 'active', ?, NULL)"
+    )
+      .bind(Date.now())
+      .run();
+    const activeShardNames = getRealtimeSubscriptionShardNames({
+      generationId: 2,
+      subscriptionShardCount: 2,
+    });
+    const activeGlobalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      { generationId: 2, subscriptionShardCount: 2 }
+    );
+    const attachment = {
+      connectionKey: "client:client-a",
+      connectionName: getRealtimeConnectionShardName("client:client-a"),
+      latestDeliveredOutboxSequence: 5,
+      runtimeId: "runtime:1",
+      subscriptions: [
+        {
+          args: { ownerToken: "owner-a" },
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-a",
+          subscriptionShardName: "subscription:g1:0",
+        },
+      ],
+    };
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      deserializeAttachment() {
+        return attachment;
+      },
+      send() {
+        // Restore catch-up does not send direct client messages in this test.
+      },
+      serializeAttachment(nextAttachment: typeof attachment) {
+        Object.assign(attachment, nextAttachment);
+      },
+    } as unknown as AttachedTestWebSocket;
+    const state = new FakeRealtimeDurableObjectState([socket]);
+    const subscriptionRequests: Array<{
+      body: Record<string, unknown>;
+      name: string;
+      path: string;
+    }> = [];
+    new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (name, request) => {
+          subscriptionRequests.push({
+            body: (await request.json()) as Record<string, unknown>,
+            name,
+            path: new URL(request.url).pathname,
+          });
+          return Response.json({ events: [], ok: true });
+        }
+      ),
+    });
+
+    await waitFor(() =>
+      subscriptionRequests.some(({ path }) => path === "/register")
+    );
+    await waitFor(
+      () =>
+        subscriptionRequests.filter(({ path }) => path === "/catch-up")
+          .length >= activeShardNames.length
+    );
+
+    const registerRequest = subscriptionRequests.find(
+      ({ path }) => path === "/register"
+    );
+    const catchUpShardNames = subscriptionRequests
+      .filter(({ path }) => path === "/catch-up")
+      .map(({ body }) => body.shardName)
+      .sort();
+
+    expect(registerRequest?.name).toBe(activeGlobalShardName);
+    expect(registerRequest?.body).toEqual(
+      expect.objectContaining({ shardName: activeGlobalShardName })
+    );
+    expect(attachment.subscriptions[0]?.subscriptionShardName).toBe(
+      activeGlobalShardName
+    );
+    expect(catchUpShardNames).toEqual([...activeShardNames].sort());
   });
 
   it("passes a realtime outbox bookmark through reconciliation alarm catch-up", async () => {
@@ -5186,6 +5311,74 @@ describe("worker runtime", () => {
         outboxBookmark: "reconciliation-catch-up-bookmark",
       }),
     ]);
+  });
+
+  it("includes every active-generation shard in realtime reconciliation catch-up", async () => {
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 2, 'active', ?, NULL)"
+    )
+      .bind(Date.now())
+      .run();
+    const activeShardNames = getRealtimeSubscriptionShardNames({
+      generationId: 2,
+      subscriptionShardCount: 2,
+    });
+    const state = new FakeRealtimeDurableObjectState();
+    const catchUpShardNames: string[] = [];
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const pathname = new URL(request.url).pathname;
+          if (pathname === "/catch-up") {
+            const body = (await request.json()) as { shardName: string };
+            catchUpShardNames.push(body.shardName);
+          }
+          return Response.json({ events: [], ok: true });
+        }
+      ),
+    });
+    const response = await connectionDo.fetch(
+      new Request(
+        "https://baseflare.internal/api/subscribe?clientId=client-a",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+            "x-baseflare-realtime-runtime-id": "runtime:1",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as AttachedTestWebSocket;
+    client.accept?.();
+    const [socket] = state.acceptedSockets;
+    if (!socket) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    await connectionDo.webSocketMessage(
+      socket,
+      JSON.stringify({
+        args: { ownerToken: "owner-a" },
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        type: "subscribe",
+      })
+    );
+
+    catchUpShardNames.length = 0;
+    await connectionDo.alarm();
+
+    expect(catchUpShardNames.sort()).toEqual([...activeShardNames].sort());
   });
 
   it("logs and counts hibernation subscription restore failures", async () => {
@@ -5519,6 +5712,16 @@ describe("worker runtime", () => {
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 2, 'active', ?, NULL)"
+    )
+      .bind(Date.now())
+      .run();
     const catchUpRequests: Array<{
       afterSequence: number | null;
       shardName: string;
@@ -5674,6 +5877,16 @@ describe("worker runtime", () => {
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 1, 'active', ?, NULL)"
+    )
+      .bind(Date.now())
+      .run();
     const attachment = {
       connectionKey: "client:client-a",
       connectionName: getRealtimeConnectionShardName("client:client-a"),
@@ -6533,6 +6746,16 @@ describe("worker runtime", () => {
   });
 
   it("reports partial realtime restore catch-up failures per shard", async () => {
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
+    )
+      .bind(Date.now() + 60_000)
+      .run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 2, 'active', ?, NULL)"
+    )
+      .bind(Date.now())
+      .run();
     const catchUpShardNames: string[] = [];
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {

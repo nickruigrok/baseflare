@@ -4,7 +4,9 @@ import type { BaseflareRuntimeEnv, DurableObjectStub } from "../types";
 import {
   createRealtimeGlobalSubscriptionRouteTarget,
   getRealtimeConnectionShardName,
+  getRealtimeShardGenerationIdFromName,
   getRealtimeSubscriptionShardName,
+  getRealtimeSubscriptionShardNames,
 } from "./routing";
 import { fetchActiveRealtimeShardGeneration } from "./shards";
 import {
@@ -421,7 +423,10 @@ export class RealtimeConnectionDO {
         "first-unconstrained"
       );
       const outboxBookmark = restoreSession?.getBookmark();
-      const catchUpTargets = await this.subscriptionCatchUpTargets(socket);
+      const catchUpTargets = await this.subscriptionCatchUpTargets(
+        socket,
+        subscriptionGeneration
+      );
       const catchUpResults = await Promise.allSettled(
         catchUpTargets.map(async (catchUpTarget) => {
           try {
@@ -639,7 +644,9 @@ export class RealtimeConnectionDO {
     this.hasPendingHibernationRestoreRetry = rejected > 0;
     let catchUpFailed = false;
     if (options.reconcileAfterRestore && accepted > 0) {
-      const summary = await this.catchUpActiveSubscriptions();
+      const summary = await this.catchUpActiveSubscriptions(
+        subscriptionGeneration
+      );
       catchUpFailed = summary.failed.length > 0;
       this.emitReconciliationSummary(summary);
     }
@@ -688,8 +695,12 @@ export class RealtimeConnectionDO {
     subscription: RealtimeSocketSubscription,
     subscriptionGeneration: RealtimeShardGeneration
   ): Promise<void> {
-    const subscriptionTarget = await this.subscriptionTarget(
+    const subscriptionShardName = this.currentGenerationShardName(
       subscription.subscriptionShardName,
+      subscriptionGeneration
+    );
+    const subscriptionTarget = await this.subscriptionTarget(
+      subscriptionShardName,
       createRealtimeGlobalSubscriptionRouteTarget(),
       subscriptionGeneration
     );
@@ -717,9 +728,32 @@ export class RealtimeConnectionDO {
         `Realtime subscription registration failed with status ${response.status}`
       );
     }
-    this.restoredAttachedSubscriptionKeys.add(
-      this.createAttachedSubscriptionRestoreKey(attachment, subscription)
+    this.socketRegistry.updateSubscriptionShardName(
+      attachment.connectionKey,
+      subscription.subscriptionId,
+      subscriptionTarget.shardName
     );
+    this.restoredAttachedSubscriptionKeys.add(
+      this.createAttachedSubscriptionRestoreKey(attachment, {
+        ...subscription,
+        subscriptionShardName: subscriptionTarget.shardName,
+      })
+    );
+  }
+
+  private currentGenerationShardName(
+    shardName: string | undefined,
+    generation: RealtimeShardGeneration
+  ): string | undefined {
+    if (
+      shardName &&
+      getRealtimeShardGenerationIdFromName(shardName) ===
+        generation.generationId
+    ) {
+      return shardName;
+    }
+
+    return undefined;
   }
 
   private getAttachedSubscriptions(): Array<{
@@ -863,8 +897,10 @@ export class RealtimeConnectionDO {
     await this.scheduleReconciliation();
   }
 
-  private async catchUpActiveSubscriptions(): Promise<RealtimeReconciliationSummary> {
-    const targets = await this.reconciliationCatchUpTargets();
+  private async catchUpActiveSubscriptions(
+    generationOverride?: RealtimeShardGeneration
+  ): Promise<RealtimeReconciliationSummary> {
+    const targets = await this.reconciliationCatchUpTargets(generationOverride);
     const reconciliationSession = this.env.APP_DB.withSession?.(
       "first-unconstrained"
     );
@@ -1024,7 +1060,9 @@ export class RealtimeConnectionDO {
     return summary.succeeded > 0 ? "partial" : "failed";
   }
 
-  private async reconciliationCatchUpTargets(): Promise<
+  private async reconciliationCatchUpTargets(
+    generationOverride?: RealtimeShardGeneration
+  ): Promise<
     Array<{
       readonly afterSequence: number | null;
       readonly shardName: string;
@@ -1091,7 +1129,38 @@ export class RealtimeConnectionDO {
       ];
     }
 
+    const activeGeneration =
+      generationOverride ??
+      (await fetchActiveRealtimeShardGeneration(this.env.APP_DB));
+    const activeAfterSequence = this.getReconciliationAfterSequence();
+    for (const shardName of getRealtimeSubscriptionShardNames(
+      activeGeneration
+    )) {
+      if (targets.has(shardName)) {
+        continue;
+      }
+
+      targets.set(shardName, {
+        afterSequence: activeAfterSequence,
+        shardName,
+        stub: this.env.REALTIME_SUBSCRIPTIONS.get(
+          this.env.REALTIME_SUBSCRIPTIONS.idFromName(shardName)
+        ),
+      });
+    }
+
     return [...targets.values()];
+  }
+
+  private getReconciliationAfterSequence(): number | null {
+    let afterSequence: number | null = null;
+    for (const { attachment } of this.socketRegistry.attachedSubscriptions()) {
+      afterSequence = this.minAfterSequence(
+        afterSequence,
+        attachment.latestDeliveredOutboxSequence
+      );
+    }
+    return afterSequence;
   }
 
   private minAfterSequence(
@@ -1148,13 +1217,19 @@ export class RealtimeConnectionDO {
     };
   }
 
-  private async subscriptionCatchUpTargets(socket?: RuntimeWebSocket): Promise<
+  private async subscriptionCatchUpTargets(
+    socket?: RuntimeWebSocket,
+    generationOverride?: RealtimeShardGeneration
+  ): Promise<
     Array<{
       readonly shardName: string;
       readonly stub: DurableObjectStub;
     }>
   > {
     const shardNames = new Set<string>();
+    const activeGeneration =
+      generationOverride ??
+      (await fetchActiveRealtimeShardGeneration(this.env.APP_DB));
     const subscriptions = socket
       ? (this.socketRegistry.getAttachment(socket)?.subscriptions ?? [])
       : this.socketRegistry
@@ -1165,10 +1240,10 @@ export class RealtimeConnectionDO {
         shardNames.add(subscription.subscriptionShardName);
       }
     }
-
-    if (shardNames.size === 0) {
-      const target = await this.subscriptionTarget();
-      return [target];
+    for (const shardName of getRealtimeSubscriptionShardNames(
+      activeGeneration
+    )) {
+      shardNames.add(shardName);
     }
 
     return [...shardNames].map((shardName) => ({
