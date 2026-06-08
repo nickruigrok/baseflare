@@ -349,7 +349,12 @@ export async function resolveRealtimeConnectionKey(
   }
 ): Promise<string> {
   const clientId = url.searchParams.get("clientId");
-  if (clientId && input.authorizationHeader) {
+  if (clientId) {
+    if (!input.authorizationHeader) {
+      throw new ValidationRuntimeError(
+        "Realtime clientId requires an authorization header to produce a stable connection key"
+      );
+    }
     assertRealtimeStringLength(
       clientId,
       "clientId",
@@ -363,7 +368,12 @@ export async function resolveRealtimeConnectionKey(
   }
 
   const sessionId = url.searchParams.get("sessionId");
-  if (sessionId && input.authorizationHeader) {
+  if (sessionId) {
+    if (!input.authorizationHeader) {
+      throw new ValidationRuntimeError(
+        "Realtime sessionId requires an authorization header to produce a stable connection key"
+      );
+    }
     assertRealtimeStringLength(
       sessionId,
       "sessionId",

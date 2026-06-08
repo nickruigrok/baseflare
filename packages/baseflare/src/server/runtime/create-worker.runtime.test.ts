@@ -1979,6 +1979,42 @@ describe("worker runtime", () => {
     );
   });
 
+  it("rejects explicit realtime client ids without authorization", async () => {
+    const connections = new FakeDurableObjectNamespace();
+
+    await expect(
+      resolveRealtimeConnectionKey(
+        new URL("https://baseflare.internal/api/subscribe?clientId=client-a"),
+        { authorizationHeader: null, runtimeId: "runtime:1" }
+      )
+    ).rejects.toThrow(
+      "Realtime clientId requires an authorization header to produce a stable connection key"
+    );
+    const response = await invoke(
+      "/api/subscribe?clientId=client-a",
+      {
+        headers: { upgrade: "websocket" },
+        method: "GET",
+      },
+      worker,
+      { ...env, REALTIME_CONNECTIONS: connections }
+    );
+
+    expect(response.status).toBe(400);
+    expect(connections.requests).toHaveLength(0);
+  });
+
+  it("rejects explicit realtime session ids without authorization", async () => {
+    await expect(
+      resolveRealtimeConnectionKey(
+        new URL("https://baseflare.internal/api/subscribe?sessionId=session-a"),
+        { authorizationHeader: undefined, runtimeId: "runtime:1" }
+      )
+    ).rejects.toThrow(
+      "Realtime sessionId requires an authorization header to produce a stable connection key"
+    );
+  });
+
   it("delivers realtime updates through configured Durable Object bindings", async () => {
     createRealtimeRuntimeId();
     const response = await SELF.fetch(
@@ -2168,6 +2204,12 @@ describe("worker runtime", () => {
 
   it("routes anonymous realtime connections with generated connection keys", async () => {
     const connections = new FakeDurableObjectNamespace();
+    await expect(
+      resolveRealtimeConnectionKey(
+        new URL("https://baseflare.internal/api/subscribe"),
+        { authorizationHeader: null, runtimeId: "runtime:1" }
+      )
+    ).resolves.toMatch(/^anonymous:/);
     await invoke(
       "/api/subscribe",
       {
@@ -4874,6 +4916,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/api/subscribe", {
         headers: {
           upgrade: "websocket",
+          authorization: "Bearer owner-a",
           "x-baseflare-realtime-runtime-id": "runtime:1",
         },
         method: "GET",
@@ -4883,6 +4926,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/api/subscribe", {
         headers: {
           upgrade: "websocket",
+          authorization: "Bearer owner-a",
           "x-baseflare-realtime-runtime-id": "runtime:1",
         },
         method: "GET",
@@ -6750,6 +6794,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -6834,6 +6879,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -6885,6 +6931,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -6966,6 +7013,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7084,6 +7132,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7190,6 +7239,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7276,6 +7326,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7436,6 +7487,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7619,6 +7671,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7678,6 +7731,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7735,6 +7789,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
@@ -7813,6 +7868,7 @@ describe("worker runtime", () => {
         {
           headers: {
             upgrade: "websocket",
+            authorization: "Bearer owner-a",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
           method: "GET",
