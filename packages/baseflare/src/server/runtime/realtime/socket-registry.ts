@@ -140,6 +140,10 @@ export class RealtimeSocketRegistry {
     const subscription = attachment.subscriptions.find(
       (candidate) => candidate.subscriptionId === subscriptionId
     );
+    if (!subscription) {
+      return undefined;
+    }
+
     this.setAttachment(socket, {
       ...attachment,
       subscriptions: attachment.subscriptions.filter(
@@ -147,7 +151,7 @@ export class RealtimeSocketRegistry {
       ),
     });
 
-    return subscription ? { attachment, subscription } : undefined;
+    return { attachment, subscription };
   }
 
   getSubscription(

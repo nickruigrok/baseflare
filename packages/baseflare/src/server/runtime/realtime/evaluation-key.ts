@@ -50,7 +50,7 @@ function canonicalizeRealtimeValue(
     return canonicalizeRealtimeArray(value, state, depth);
   }
 
-  if (typeof value !== "object" || value === undefined) {
+  if (typeof value !== "object") {
     return null;
   }
 

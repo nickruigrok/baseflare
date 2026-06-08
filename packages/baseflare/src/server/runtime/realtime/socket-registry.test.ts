@@ -223,6 +223,29 @@ describe("RealtimeSocketRegistry", () => {
     expect(registry.hasActiveSubscriptions()).toBe(false);
   });
 
+  it("does not serialize attachments when removing a missing subscription", () => {
+    const registry = new RealtimeSocketRegistry();
+    const socket = createSocket();
+    const subscription = {
+      args: { ownerToken: "owner-a" },
+      epoch: 1,
+      queryName: "todos:list",
+      subscriptionId: "sub-a",
+      subscriptionShardName: "subscription:g1:0",
+    };
+    const socketAttachment = attachment("client:client-a", [subscription]);
+    registry.add(socket, socketAttachment);
+    const writesBeforeRemoval = socket.storedAttachments.length;
+
+    const removed = registry.removeSubscription(socket, "missing-sub");
+
+    expect(removed).toBeUndefined();
+    expect(socket.storedAttachments).toHaveLength(writesBeforeRemoval);
+    expect(registry.getAttachment(socket)?.subscriptions).toEqual([
+      subscription,
+    ]);
+  });
+
   it("updates subscription shard ownership in socket attachments", () => {
     const registry = new RealtimeSocketRegistry();
     const socket = createSocket();
