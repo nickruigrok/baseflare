@@ -217,8 +217,12 @@ describe("RealtimeActiveQueryStore", () => {
       registration("sub-b", { dependencies: partitionDependencies }),
     ]);
 
+    const activeQuery = store.values()[0];
     expect(store.size()).toBe(1);
     expect(store.maxFanout()).toBe(2);
+    expect(activeQuery?.memberRegistrationKeys).toEqual(
+      new Set([registrationKey("sub-a"), registrationKey("sub-b")])
+    );
     expect(
       store.getRelevantKeys(
         createRealtimeAffectedTargets([
@@ -232,5 +236,37 @@ describe("RealtimeActiveQueryStore", () => {
         ])
       ).size
     ).toBe(1);
+  });
+
+  it("removes active queries that have no synced registrations", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeActiveQueryStore(state);
+    await store.upsertFromRegistration(
+      registrationKey("sub-a"),
+      registration("sub-a", {
+        dependencies: dependencies(["todos"]),
+        versionSnapshot: versionSnapshot(["todos"]),
+      })
+    );
+
+    await store.syncRegistrations([]);
+    const reloadedStore = new RealtimeActiveQueryStore(state);
+    await reloadedStore.loadOnce();
+
+    expect(store.size()).toBe(0);
+    expect(reloadedStore.size()).toBe(0);
+    expect(
+      store.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-todos",
+            partitions: [],
+            sequence: 1,
+            tables: ["todos"],
+          },
+        ])
+      ).size
+    ).toBe(0);
   });
 });

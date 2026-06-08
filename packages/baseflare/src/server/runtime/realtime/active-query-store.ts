@@ -100,14 +100,19 @@ export class RealtimeActiveQueryStore {
       }
     }
 
-    for (const [activeQueryKey, activeQuery] of this.activeQueries) {
-      const members = desiredMembers.get(activeQueryKey) ?? new Set<string>();
-      if (members.size === 0) {
-        await this.delete(activeQueryKey);
+    for (const [activeQueryKey, members] of desiredMembers) {
+      const activeQuery = this.activeQueries.get(activeQueryKey);
+      if (!activeQuery) {
         continue;
       }
 
       await this.replaceMembers(activeQueryKey, activeQuery, members);
+    }
+
+    for (const activeQueryKey of Array.from(this.activeQueries.keys())) {
+      if (!desiredMembers.has(activeQueryKey)) {
+        await this.delete(activeQueryKey);
+      }
     }
   }
 
