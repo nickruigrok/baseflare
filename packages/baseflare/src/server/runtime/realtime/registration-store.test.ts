@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { FakeRealtimeDurableObjectState } from "../realtime.test-helpers";
+import { RealtimeActiveQueryStore } from "./active-query-store";
 import { RealtimeRegistrationStore } from "./registration-store";
-import { createRegistrationKey } from "./routing";
+import {
+  createRealtimeAffectedTargets,
+  createRegistrationKey,
+} from "./routing";
 import type { StoredRealtimeRegistration } from "./types";
 
 const leaseExpiresAt = () => Date.now() + 60_000;
@@ -117,6 +121,73 @@ describe("RealtimeRegistrationStore", () => {
 
     expect(storedRegistration.dependencies?.tables.has("todos")).toBe(true);
     expect(storedRegistration.dependencies?.tables.has("labels")).toBe(false);
+  });
+
+  it("does not update active query membership when registration persistence fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    const key = registrationKey("sub-a");
+    state.failedStoragePuts = 1;
+
+    await expect(store.upsert(key, registration("sub-a"))).rejects.toThrow(
+      "Storage put failed"
+    );
+
+    expect(store.size()).toBe(0);
+    expect(activeQueryStore.size()).toBe(0);
+  });
+
+  it("keeps active query indexes unchanged when dependency registration persistence fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    const key = registrationKey("sub-a");
+    const storedRegistration = registration("sub-a", {
+      dependencies: { partitions: new Set(), tables: new Set(["todos"]) },
+    });
+    await store.upsert(key, storedRegistration);
+    const activeQueryKey = storedRegistration.activeQueryKey;
+    if (!activeQueryKey) {
+      throw new Error("Expected active query key");
+    }
+    state.failedStoragePuts = 1;
+
+    await expect(
+      store.updateSameShardDependencies(
+        key,
+        storedRegistration,
+        { partitions: new Set(), tables: new Set(["labels"]) },
+        { partitions: new Map(), tables: new Map([["labels", 1]]) }
+      )
+    ).rejects.toThrow("Storage put failed");
+
+    expect(
+      activeQueryStore.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-todos",
+            partitions: [],
+            sequence: 1,
+            tables: ["todos"],
+          },
+        ])
+      )
+    ).toContain(activeQueryKey);
+    expect(
+      activeQueryStore.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-labels",
+            partitions: [],
+            sequence: 2,
+            tables: ["labels"],
+          },
+        ])
+      )
+    ).not.toContain(activeQueryKey);
   });
 
   it("updates dependency state after persistence succeeds", async () => {

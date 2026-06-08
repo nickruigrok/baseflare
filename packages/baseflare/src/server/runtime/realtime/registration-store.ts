@@ -105,9 +105,9 @@ export class RealtimeRegistrationStore {
     registration: StoredRealtimeRegistration
   ): Promise<void> {
     const existing = this.registrations.get(registrationKey);
-    const activeQueryKey = await this.activeQueryStore?.upsertFromRegistration(
-      registrationKey,
-      registration
+    const activeQueryKey = this.activeQueryStore?.getRegistrationKey(
+      registration,
+      registrationKey
     );
     const nextRegistration =
       activeQueryKey || registration.activeQueryKey
@@ -117,6 +117,12 @@ export class RealtimeRegistrationStore {
           }
         : registration;
     await this.persistByKey(registrationKey, nextRegistration);
+    registration.activeQueryKey = nextRegistration.activeQueryKey;
+    this.registrations.set(registrationKey, nextRegistration);
+    await this.activeQueryStore?.upsertFromRegistration(
+      registrationKey,
+      nextRegistration
+    );
 
     if (
       existing &&
@@ -127,8 +133,6 @@ export class RealtimeRegistrationStore {
         existing.activeQueryKey
       );
     }
-
-    this.registrations.set(registrationKey, nextRegistration);
   }
 
   async delete(registrationKey: string): Promise<void> {
@@ -190,9 +194,9 @@ export class RealtimeRegistrationStore {
       dependencies,
       versionSnapshot,
     };
-    const activeQueryKey = await this.activeQueryStore?.upsertFromRegistration(
-      registrationKey,
+    const activeQueryKey = this.activeQueryStore?.getRegistrationKey(
       nextRegistration,
+      registrationKey,
       { recomputeKey: true }
     );
     if (activeQueryKey) {
@@ -203,6 +207,12 @@ export class RealtimeRegistrationStore {
     registration.dependencies = dependencies;
     registration.versionSnapshot = versionSnapshot;
     registration.activeQueryKey = nextRegistration.activeQueryKey;
+    this.registrations.set(registrationKey, registration);
+    await this.activeQueryStore?.upsertFromRegistration(
+      registrationKey,
+      registration,
+      { recomputeKey: true }
+    );
     if (previousActiveQueryKey !== registration.activeQueryKey) {
       await this.activeQueryStore?.detachRegistration(
         registrationKey,

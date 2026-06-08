@@ -1068,6 +1068,10 @@ export class RealtimeSubscriptionDO {
     readonly failed: number;
     readonly skipped: number;
   }> {
+    const registrationKey = createRegistrationKey(
+      registration.connectionKey,
+      registration.subscriptionId
+    );
     if (registration.leaseExpiresAt > Date.now()) {
       await this.registrationStore.clearBackoff(registration);
       return { active: true, evaluated: 1, failed: 0, skipped: 0 };
@@ -1077,28 +1081,40 @@ export class RealtimeSubscriptionDO {
     try {
       isConnected = await this.hasActiveConnectionSockets(registration);
     } catch (error) {
-      const deleted = await this.registrationStore.deleteExpired(registration);
-      if (!deleted) {
-        await this.registrationStore.markBackedOff(registration);
+      const latestRegistration = this.registrationStore.get(registrationKey);
+      if (!latestRegistration) {
+        return { active: false, evaluated: 0, failed: 0, skipped: 0 };
       }
-      this.logReEvaluationFailure(registration, error);
+
+      const deleted =
+        await this.registrationStore.deleteExpired(latestRegistration);
+      if (!deleted) {
+        await this.registrationStore.markBackedOff(latestRegistration);
+      }
+      this.logReEvaluationFailure(latestRegistration, error);
       return { active: !deleted, evaluated: 0, failed: 1, skipped: 0 };
     }
 
+    const latestRegistration = this.registrationStore.get(registrationKey);
+    if (!latestRegistration) {
+      return { active: false, evaluated: 0, failed: 0, skipped: 0 };
+    }
+
     if (!isConnected) {
-      await this.registrationStore.deleteExpired(registration);
-      return { active: false, evaluated: 1, failed: 0, skipped: 0 };
+      const deleted =
+        await this.registrationStore.deleteExpired(latestRegistration);
+      return { active: !deleted, evaluated: 1, failed: 0, skipped: 0 };
     }
 
     try {
       await this.registrationStore.renewLease(
-        registration,
+        latestRegistration,
         Date.now() + REALTIME_LEASE_MS
       );
       return { active: true, evaluated: 1, failed: 0, skipped: 0 };
     } catch (error) {
-      await this.registrationStore.markBackedOff(registration);
-      this.logReEvaluationFailure(registration, error);
+      await this.registrationStore.markBackedOff(latestRegistration);
+      this.logReEvaluationFailure(latestRegistration, error);
       return { active: true, evaluated: 0, failed: 1, skipped: 0 };
     }
   }

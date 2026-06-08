@@ -144,6 +144,16 @@ export class RealtimeActiveQueryStore {
     return maxFanout;
   }
 
+  getRegistrationKey(
+    registration: StoredRealtimeRegistration,
+    registrationKey: string,
+    options: { readonly recomputeKey?: boolean } = {}
+  ): string {
+    return this.keyForRegistration(registration, registrationKey, {
+      recompute: options.recomputeKey === true,
+    });
+  }
+
   getRelevantKeys(targets: RealtimeAffectedTargets): Set<string> {
     if (targets.all) {
       return new Set(this.activeQueries.keys());
