@@ -76,10 +76,17 @@ export class FakeRealtimeDurableObjectState {
     get: <T = unknown>(key: string) =>
       Promise.resolve(this.durableStorage.get(key) as T | undefined),
     getAlarm: () => Promise.resolve(this.alarmTime),
-    list: <T = unknown>(options?: { readonly prefix?: string }) => {
-      const entries = Array.from(this.durableStorage.entries()).filter(
-        ([key]) => !options?.prefix || key.startsWith(options.prefix)
-      );
+    list: <T = unknown>(options?: {
+      readonly limit?: number;
+      readonly prefix?: string;
+      readonly startAfter?: string;
+    }) => {
+      const limit = options?.limit ?? 128;
+      const entries = Array.from(this.durableStorage.entries())
+        .filter(([key]) => !options?.prefix || key.startsWith(options.prefix))
+        .filter(([key]) => !options?.startAfter || key > options.startAfter)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .slice(0, limit);
       return Promise.resolve(new Map(entries) as Map<string, T>);
     },
     put: <T = unknown>(key: string, value: T) => {

@@ -7,6 +7,7 @@ import {
   serializeRealtimeVersionSnapshot,
 } from "./routing";
 import { getEpoch, getStringField } from "./shared";
+import { listRealtimeStoragePrefix } from "./storage-list";
 import type {
   RealtimeDependencySet,
   RealtimeDurableObjectState,
@@ -68,9 +69,10 @@ export class RealtimeRegistrationStore {
     }
 
     const storedRegistrations =
-      await storage.list<StoredRealtimeRegistrationValue>({
-        prefix: REALTIME_REGISTRATION_STORAGE_PREFIX,
-      });
+      await listRealtimeStoragePrefix<StoredRealtimeRegistrationValue>(
+        storage,
+        REALTIME_REGISTRATION_STORAGE_PREFIX
+      );
     for (const [storageKey, value] of storedRegistrations) {
       const registration = this.parseStoredRegistrationValue(value);
       if (!registration) {

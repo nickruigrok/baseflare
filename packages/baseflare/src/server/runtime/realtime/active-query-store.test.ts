@@ -127,6 +127,40 @@ describe("RealtimeActiveQueryStore", () => {
     ).toBe(1);
   });
 
+  it("loads persisted active queries across storage list pages", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeActiveQueryStore(state);
+    for (let index = 0; index < 150; index += 1) {
+      const subscriptionId = `sub-${index.toString().padStart(3, "0")}`;
+      await store.upsertFromRegistration(
+        registrationKey(subscriptionId),
+        registration(subscriptionId, {
+          args: { ownerToken: `owner-${index}` },
+          dependencies: dependencies(["todos"]),
+          versionSnapshot: versionSnapshot(["todos"]),
+        })
+      );
+    }
+
+    const reloadedStore = new RealtimeActiveQueryStore(state);
+    await reloadedStore.loadOnce();
+
+    expect(reloadedStore.size()).toBe(150);
+    expect(
+      reloadedStore.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-todos",
+            partitions: [],
+            sequence: 1,
+            tables: ["todos"],
+          },
+        ])
+      ).size
+    ).toBe(150);
+  });
+
   it("keeps active query indexes unchanged when dependency persistence fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeActiveQueryStore(state);

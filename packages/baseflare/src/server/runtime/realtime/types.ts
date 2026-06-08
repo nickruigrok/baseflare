@@ -18,7 +18,9 @@ export interface RealtimeDurableObjectState {
     get?<T = unknown>(key: string): Promise<T | undefined>;
     getAlarm?(): Promise<number | null>;
     list?<T = unknown>(options?: {
+      readonly limit?: number;
       readonly prefix?: string;
+      readonly startAfter?: string;
     }): Promise<Map<string, T>>;
     put?<T = unknown>(key: string, value: T): Promise<void>;
     setAlarm?(scheduledTime: number): Promise<void>;

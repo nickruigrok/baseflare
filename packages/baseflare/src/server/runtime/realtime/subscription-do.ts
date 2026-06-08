@@ -253,7 +253,27 @@ export class RealtimeSubscriptionDO {
     }
 
     const activatedRegistration = { ...registration, movePending: false };
-    await this.registrationStore.upsert(registrationKey, activatedRegistration);
+    try {
+      await this.registrationStore.upsert(
+        registrationKey,
+        activatedRegistration
+      );
+    } catch (error) {
+      if (registration.movePending) {
+        try {
+          await this.registrationStore.delete(registrationKey);
+        } catch (cleanupError) {
+          this.logRegistrationMoveCleanupFailure(registration, this.shardName, {
+            errorName:
+              cleanupError instanceof Error
+                ? cleanupError.name
+                : typeof cleanupError,
+            sourceRemoved: false,
+          });
+        }
+      }
+      throw error;
+    }
     await this.maybeEvaluateAutoscaling();
     return jsonResponse({ ok: true });
   }
@@ -1765,12 +1785,13 @@ export class RealtimeSubscriptionDO {
         }
       );
     } catch (error) {
-      await this.rollbackAdoptedRegistration(
+      const targetRollbackSucceeded = await this.rollbackAdoptedRegistration(
         targetStub,
         targetShardName,
         registration
       );
-      await this.restoreSourceRegistrationOwner(registration);
+      const sourceOwnerRestored =
+        await this.restoreSourceRegistrationOwner(registration);
       await this.registrationStore.upsert(registrationKey, registration);
       logRuntimeEvent(
         "error",
@@ -1779,7 +1800,9 @@ export class RealtimeSubscriptionDO {
           connectionKey: registration.connectionKey,
           errorName: error instanceof Error ? error.name : typeof error,
           shardName: targetShardName,
+          sourceOwnerRestored,
           subscriptionId: registration.subscriptionId,
+          targetRollbackSucceeded,
         }
       );
       throw new InternalRuntimeError(
@@ -1789,12 +1812,13 @@ export class RealtimeSubscriptionDO {
       );
     }
     if (!activationResponse.ok) {
-      await this.rollbackAdoptedRegistration(
+      const targetRollbackSucceeded = await this.rollbackAdoptedRegistration(
         targetStub,
         targetShardName,
         registration
       );
-      await this.restoreSourceRegistrationOwner(registration);
+      const sourceOwnerRestored =
+        await this.restoreSourceRegistrationOwner(registration);
       await this.registrationStore.upsert(registrationKey, registration);
       logRuntimeEvent(
         "error",
@@ -1802,8 +1826,10 @@ export class RealtimeSubscriptionDO {
         {
           connectionKey: registration.connectionKey,
           shardName: targetShardName,
+          sourceOwnerRestored,
           status: activationResponse.status,
           subscriptionId: registration.subscriptionId,
+          targetRollbackSucceeded,
         }
       );
       throw new InternalRuntimeError(

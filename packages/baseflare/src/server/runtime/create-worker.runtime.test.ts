@@ -2995,6 +2995,244 @@ describe("worker runtime", () => {
     );
   });
 
+  it("logs rollback failure when target activation returns non-ok", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const subscriptionPaths: string[] = [];
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      const pathname = new URL(request.url).pathname;
+      subscriptionPaths.push(pathname);
+      if (pathname === "/activate-registration") {
+        return Promise.resolve(Response.json({ ok: false }, { status: 503 }));
+      }
+      if (pathname === "/unregister") {
+        return Promise.resolve(Response.json({ ok: false }, { status: 500 }));
+      }
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const connections = new FakeDurableObjectNamespace(() =>
+      Promise.resolve(
+        Response.json({
+          delivered: 1,
+          deliveredSubscriptions: ["sub-a"],
+          ok: true,
+        })
+      )
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc("owner-a", "owner-a-activation-rollback-failed");
+    await createRealtimeOutboxEvent(
+      "owner-a-activation-rollback-failed",
+      Date.now(),
+      {
+        partitions: [todoOwnerPartition("owner-a")],
+        tables: ["todos"],
+      }
+    );
+
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "owner-a-activation-rollback-failed",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+
+    expect(registration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(subscriptionPaths).toContain("/activate-registration");
+    expect(subscriptionPaths).toContain("/unregister");
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_move_cleanup_failed",
+        sourceRemoved: false,
+        status: 500,
+        subscriptionId: "sub-a",
+      })
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_activation_failed",
+        sourceOwnerRestored: true,
+        status: 503,
+        subscriptionId: "sub-a",
+        targetRollbackSucceeded: false,
+      })
+    );
+  });
+
+  it("cleans up pending target registrations when activation persistence fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const globalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      8
+    );
+    const ownerToken =
+      ["owner-a", "owner-b", "owner-c", "owner-d"].find(
+        (token) =>
+          getRealtimeSubscriptionShardName(
+            createRealtimePartitionSubscriptionRouteTarget(
+              todoOwnerPartition(token)
+            ),
+            8
+          ) !== globalShardName
+      ) ?? "owner-a";
+    const targetShardName = getRealtimeSubscriptionShardName(
+      createRealtimePartitionSubscriptionRouteTarget(
+        todoOwnerPartition(ownerToken)
+      ),
+      8
+    );
+    const sourceState = new FakeRealtimeDurableObjectState();
+    const targetState = new FakeRealtimeDurableObjectState();
+    const movedShardNames: string[] = [];
+    const connections = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname === "/subscription-moved") {
+        return request.json().then((body) => {
+          movedShardNames.push(
+            (body as { subscriptionShardName: string }).subscriptionShardName
+          );
+          return Response.json({ ok: true });
+        });
+      }
+      return Promise.resolve(
+        Response.json({
+          delivered: 1,
+          deliveredSubscriptions: ["sub-a"],
+          ok: true,
+        })
+      );
+    });
+    let targetSubscriptionDo!: RealtimeSubscriptionDO;
+    const subscriptions = new FakeDurableObjectNamespace((name, request) => {
+      if (name === targetShardName) {
+        const pathname = new URL(request.url).pathname;
+        return targetSubscriptionDo.fetch(request).then((response) => {
+          if (pathname === "/adopt-registration") {
+            targetState.failedStoragePuts = 1;
+          }
+          return response;
+        });
+      }
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    targetSubscriptionDo = new RealtimeSubscriptionDO(targetState, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    const sourceSubscriptionDo = new RealtimeSubscriptionDO(sourceState, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    await sourceSubscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken },
+          authorizationHeader: `Bearer ${ownerToken}`,
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          shardName: globalShardName,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await createTodoViaRpc(ownerToken, "activation-storage-failed");
+    await createRealtimeOutboxEvent("activation-storage-failed", Date.now(), {
+      partitions: [todoOwnerPartition(ownerToken)],
+      tables: ["todos"],
+    });
+
+    await sourceSubscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({
+          eventId: "activation-storage-failed",
+          shardName: globalShardName,
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const sourceRegistration = getRealtimeIndexTestState(
+      sourceSubscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+    const targetRegistrationsResponse = await targetSubscriptionDo.fetch(
+      new Request("https://baseflare.internal/registrations", {
+        body: "{}",
+        method: "POST",
+      })
+    );
+    const targetRegistrationsBody =
+      (await targetRegistrationsResponse.json()) as {
+        registrations: StoredRealtimeRegistration[];
+      };
+
+    expect(movedShardNames).toEqual([targetShardName, globalShardName]);
+    expect(sourceRegistration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
+    expect(targetRegistrationsBody.registrations).toEqual([]);
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "Error",
+        event: "runtime.realtime_registration_activation_failed",
+        sourceOwnerRestored: true,
+        subscriptionId: "sub-a",
+        targetRollbackSucceeded: true,
+      })
+    );
+  });
+
   it("does not recreate the source registration after unchanged-result migration", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await env.APP_DB.prepare(

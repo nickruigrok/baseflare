@@ -53,6 +53,49 @@ describe("RealtimeRegistrationStore", () => {
     expect(reloadedStore.size()).toBe(1);
   });
 
+  it("loads persisted registrations across storage list pages", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeRegistrationStore(state);
+    for (let index = 0; index < 150; index += 1) {
+      const subscriptionId = `sub-${index.toString().padStart(3, "0")}`;
+      await store.upsert(registrationKey(subscriptionId), {
+        ...registration(subscriptionId),
+        activeQueryKey: `active-query-${index}`,
+      });
+    }
+
+    const reloadedStore = new RealtimeRegistrationStore(state);
+    await reloadedStore.loadOnce();
+
+    expect(reloadedStore.size()).toBe(150);
+    expect(reloadedStore.get(registrationKey("sub-000"))).toMatchObject({
+      subscriptionId: "sub-000",
+    });
+    expect(reloadedStore.get(registrationKey("sub-149"))).toMatchObject({
+      subscriptionId: "sub-149",
+    });
+  });
+
+  it("honors fake storage list limits and startAfter keys", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    await state.storage.put("test:001", 1);
+    await state.storage.put("test:002", 2);
+    await state.storage.put("test:003", 3);
+
+    const firstPage = await state.storage.list<number>({
+      limit: 2,
+      prefix: "test:",
+    });
+    const secondPage = await state.storage.list<number>({
+      limit: 2,
+      prefix: "test:",
+      startAfter: "test:002",
+    });
+
+    expect([...firstPage.keys()]).toEqual(["test:001", "test:002"]);
+    expect([...secondPage.keys()]).toEqual(["test:003"]);
+  });
+
   it("keeps memory unchanged when dependency persistence fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeRegistrationStore(state);

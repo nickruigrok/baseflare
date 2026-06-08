@@ -7,6 +7,7 @@ import {
   serializeRealtimeDependencySet,
   serializeRealtimeVersionSnapshot,
 } from "./routing";
+import { listRealtimeStoragePrefix } from "./storage-list";
 import type {
   RealtimeAffectedTargets,
   RealtimeDurableObjectState,
@@ -63,9 +64,10 @@ export class RealtimeActiveQueryStore {
     }
 
     const storedActiveQueries =
-      await storage.list<StoredRealtimeActiveQueryValue>({
-        prefix: REALTIME_ACTIVE_QUERY_STORAGE_PREFIX,
-      });
+      await listRealtimeStoragePrefix<StoredRealtimeActiveQueryValue>(
+        storage,
+        REALTIME_ACTIVE_QUERY_STORAGE_PREFIX
+      );
     for (const [storageKey, value] of storedActiveQueries) {
       const activeQuery = this.parseStoredActiveQueryValue(value);
       if (!activeQuery) {
