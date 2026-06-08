@@ -113,8 +113,17 @@ describe("RealtimeSocketRegistry", () => {
     const failedSocket = createSocket();
     const healthySocket = createSocket();
     failedSocket.failSends = true;
-    registry.add(failedSocket, attachment("client:client-a"));
-    registry.add(healthySocket, attachment("client:client-a"));
+    const subscriptions = [
+      {
+        args: {},
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        subscriptionShardName: "subscription:g1:0",
+      },
+    ];
+    registry.add(failedSocket, attachment("client:client-a", subscriptions));
+    registry.add(healthySocket, attachment("client:client-a", subscriptions));
 
     const result = registry.deliver("client:client-a", [
       { result: [], sequence: 9, subscriptionId: "sub-a" },
@@ -131,6 +140,53 @@ describe("RealtimeSocketRegistry", () => {
       true
     );
     expect(registry.hasSockets("client:client-a")).toBe(true);
+  });
+
+  it("delivers only to sockets that own the subscription id", () => {
+    const registry = new RealtimeSocketRegistry();
+    const owningSocket = createSocket();
+    const bucketPeerSocket = createSocket();
+    registry.add(
+      owningSocket,
+      attachment("client:client-a", [
+        {
+          args: {},
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-a",
+          subscriptionShardName: "subscription:g1:0",
+        },
+      ])
+    );
+    registry.add(
+      bucketPeerSocket,
+      attachment("client:client-a", [
+        {
+          args: {},
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-b",
+          subscriptionShardName: "subscription:g1:0",
+        },
+      ])
+    );
+
+    const result = registry.deliver("client:client-a", [
+      { result: [{ id: "todo-a" }], sequence: 7, subscriptionId: "sub-a" },
+    ]);
+
+    expect(result).toEqual({
+      delivered: 1,
+      deliveredSubscriptions: ["sub-a"],
+    });
+    expect(owningSocket.sentMessages).toHaveLength(1);
+    expect(bucketPeerSocket.sentMessages).toEqual([]);
+    expect(registry.hasSubscriptionSocket("client:client-a", "sub-a")).toBe(
+      true
+    );
+    expect(registry.hasSubscriptionSocket("client:client-a", "sub-c")).toBe(
+      false
+    );
   });
 
   it("tracks subscriptions and active subscription state in attachments", () => {

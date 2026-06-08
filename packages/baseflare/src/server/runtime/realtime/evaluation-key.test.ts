@@ -20,8 +20,10 @@ function registration(
   };
 }
 
-function activeQueryKey(registration: StoredRealtimeRegistration): string {
-  return createRealtimeActiveQueryKey(
+async function activeQueryKey(
+  registration: StoredRealtimeRegistration
+): Promise<string> {
+  return await createRealtimeActiveQueryKey(
     registration,
     createRegistrationKey(
       registration.connectionKey,
@@ -31,7 +33,7 @@ function activeQueryKey(registration: StoredRealtimeRegistration): string {
 }
 
 describe("realtime evaluation keys", () => {
-  it("canonicalizes object args independent of key insertion order", () => {
+  it("canonicalizes object args independent of key insertion order", async () => {
     const first = registration({
       args: { a: 1, nested: { x: true, y: "yes" } },
     });
@@ -41,10 +43,12 @@ describe("realtime evaluation keys", () => {
       subscriptionId: "sub-b",
     });
 
-    expect(activeQueryKey(first)).toBe(activeQueryKey(second));
+    await expect(activeQueryKey(first)).resolves.toBe(
+      await activeQueryKey(second)
+    );
   });
 
-  it("keeps authorization contexts separate", () => {
+  it("keeps authorization contexts separate", async () => {
     const first = registration({ authorizationHeader: "Bearer owner-a" });
     const second = registration({
       authorizationHeader: "Bearer owner-b",
@@ -52,10 +56,12 @@ describe("realtime evaluation keys", () => {
       subscriptionId: "sub-b",
     });
 
-    expect(activeQueryKey(first)).not.toBe(activeQueryKey(second));
+    await expect(activeQueryKey(first)).resolves.not.toBe(
+      await activeQueryKey(second)
+    );
   });
 
-  it("uses per-registration keys for unsafe args", () => {
+  it("uses per-registration keys for unsafe args", async () => {
     const first = registration();
     const second = registration({
       connectionKey: "client:client-b",
@@ -67,12 +73,18 @@ describe("realtime evaluation keys", () => {
       subscriptionId: "sub-c",
     });
 
-    expect(activeQueryKey(first)).toBe(activeQueryKey(second));
-    expect(activeQueryKey(unsafe)).toBe(
-      JSON.stringify([
-        "registration",
-        createRegistrationKey("client:client-c", "sub-c"),
-      ])
+    await expect(activeQueryKey(first)).resolves.toBe(
+      await activeQueryKey(second)
     );
+    await expect(activeQueryKey(unsafe)).resolves.toMatch(/^aq:[0-9a-f]{64}$/);
+    await expect(activeQueryKey(unsafe)).resolves.not.toContain("client-c");
+  });
+
+  it("does not expose bearer tokens in active query keys", async () => {
+    const key = await activeQueryKey(registration());
+
+    expect(key).toMatch(/^aq:[0-9a-f]{64}$/);
+    expect(key).not.toContain("Bearer");
+    expect(key).not.toContain("owner-a");
   });
 });

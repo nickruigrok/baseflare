@@ -1,3 +1,4 @@
+import { logRuntimeEvent } from "../logging";
 import type { RealtimeActiveQueryStore } from "./active-query-store";
 import {
   createRegistrationKey,
@@ -76,6 +77,13 @@ export class RealtimeRegistrationStore {
     for (const [storageKey, value] of storedRegistrations) {
       const registration = this.parseStoredRegistrationValue(value);
       if (!registration) {
+        logRuntimeEvent(
+          "warn",
+          "runtime.realtime_registration_reload_dropped",
+          {
+            storageKey,
+          }
+        );
         continue;
       }
 
@@ -105,7 +113,7 @@ export class RealtimeRegistrationStore {
     registration: StoredRealtimeRegistration
   ): Promise<void> {
     const existing = this.registrations.get(registrationKey);
-    const activeQueryKey = this.activeQueryStore?.getRegistrationKey(
+    const activeQueryKey = await this.activeQueryStore?.getRegistrationKey(
       registration,
       registrationKey
     );
@@ -175,11 +183,23 @@ export class RealtimeRegistrationStore {
       }
     }
 
-    await Promise.all(
+    const results = await Promise.allSettled(
       expiredRegistrationKeys.map((registrationKey) =>
         this.delete(registrationKey)
       )
     );
+    for (const [index, result] of results.entries()) {
+      if (result.status === "fulfilled") {
+        continue;
+      }
+      logRuntimeEvent("error", "runtime.realtime_registration_cleanup_failed", {
+        errorName:
+          result.reason instanceof Error
+            ? result.reason.name
+            : typeof result.reason,
+        registrationKey: expiredRegistrationKeys[index],
+      });
+    }
   }
 
   async updateSameShardDependencies(
@@ -194,7 +214,7 @@ export class RealtimeRegistrationStore {
       dependencies,
       versionSnapshot,
     };
-    const activeQueryKey = this.activeQueryStore?.getRegistrationKey(
+    const activeQueryKey = await this.activeQueryStore?.getRegistrationKey(
       nextRegistration,
       registrationKey,
       { recomputeKey: true }

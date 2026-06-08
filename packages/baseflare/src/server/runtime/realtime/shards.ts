@@ -40,6 +40,7 @@ import {
 
 // Four bind params per partition; keep chunks below D1's conservative limit.
 export const REALTIME_PARTITION_VERSION_SNAPSHOT_BATCH_SIZE = 24;
+export const REALTIME_TABLE_VERSION_SNAPSHOT_BATCH_SIZE = 500;
 
 async function fetchRealtimeShardGenerations(
   database: Pick<RuntimeDatabase, "prepare">,
@@ -140,15 +141,25 @@ export async function fetchRealtimeVersionSnapshot(
 
   if (dependencies.tables.size > 0) {
     const tableNames = [...dependencies.tables];
-    const placeholders = tableNames.map(() => "?").join(", ");
-    const result = await bindStatement(
-      database,
-      `SELECT table_name, version FROM ${TABLE_VERSION_TABLE_NAME}
-       WHERE table_name IN (${placeholders})`,
-      tableNames
-    ).all<{ table_name: string; version: number }>();
-    for (const row of result.results ?? []) {
-      tables.set(row.table_name, row.version);
+    for (
+      let start = 0;
+      start < tableNames.length;
+      start += REALTIME_TABLE_VERSION_SNAPSHOT_BATCH_SIZE
+    ) {
+      const chunk = tableNames.slice(
+        start,
+        start + REALTIME_TABLE_VERSION_SNAPSHOT_BATCH_SIZE
+      );
+      const placeholders = chunk.map(() => "?").join(", ");
+      const result = await bindStatement(
+        database,
+        `SELECT table_name, version FROM ${TABLE_VERSION_TABLE_NAME}
+         WHERE table_name IN (${placeholders})`,
+        chunk
+      ).all<{ table_name: string; version: number }>();
+      for (const row of result.results ?? []) {
+        tables.set(row.table_name, row.version);
+      }
     }
   }
 

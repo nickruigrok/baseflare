@@ -1,15 +1,40 @@
+import { sha256Hex } from "./hash";
 import { getRealtimeRegistrationHomeRouteTarget } from "./routing";
 import type {
   RealtimeSubscriptionRouteTarget,
   StoredRealtimeRegistration,
 } from "./types";
+import {
+  REALTIME_MAX_JSON_DEPTH,
+  REALTIME_MAX_JSON_NODES,
+  REALTIME_MAX_JSON_STRING_LENGTH,
+} from "./types";
 
-function canonicalizeRealtimeValue(value: unknown): string | null {
+interface CanonicalizationState {
+  nodeCount: number;
+}
+
+function canonicalizeRealtimeValue(
+  value: unknown,
+  state: CanonicalizationState,
+  depth = 0
+): string | null {
+  state.nodeCount += 1;
+  if (state.nodeCount > REALTIME_MAX_JSON_NODES) {
+    return null;
+  }
+  if (depth > REALTIME_MAX_JSON_DEPTH) {
+    return null;
+  }
+
   if (value === null) {
     return "null";
   }
 
   if (typeof value === "string") {
+    if (value.length > REALTIME_MAX_JSON_STRING_LENGTH) {
+      return null;
+    }
     return JSON.stringify(value);
   }
 
@@ -22,7 +47,7 @@ function canonicalizeRealtimeValue(value: unknown): string | null {
   }
 
   if (Array.isArray(value)) {
-    return canonicalizeRealtimeArray(value);
+    return canonicalizeRealtimeArray(value, state, depth);
   }
 
   if (typeof value !== "object" || value === undefined) {
@@ -35,13 +60,17 @@ function canonicalizeRealtimeValue(value: unknown): string | null {
   }
 
   const input = value as Record<string, unknown>;
-  return canonicalizeRealtimeObject(input);
+  return canonicalizeRealtimeObject(input, state, depth);
 }
 
-function canonicalizeRealtimeArray(values: readonly unknown[]): string | null {
+function canonicalizeRealtimeArray(
+  values: readonly unknown[],
+  state: CanonicalizationState,
+  depth: number
+): string | null {
   const items: string[] = [];
   for (const value of values) {
-    const canonicalValue = canonicalizeRealtimeValue(value);
+    const canonicalValue = canonicalizeRealtimeValue(value, state, depth + 1);
     if (canonicalValue === null) {
       return null;
     }
@@ -52,11 +81,20 @@ function canonicalizeRealtimeArray(values: readonly unknown[]): string | null {
 }
 
 function canonicalizeRealtimeObject(
-  input: Record<string, unknown>
+  input: Record<string, unknown>,
+  state: CanonicalizationState,
+  depth: number
 ): string | null {
   const entries: string[] = [];
   for (const key of Object.keys(input).sort()) {
-    const canonicalValue = canonicalizeRealtimeValue(input[key]);
+    if (key.length > REALTIME_MAX_JSON_STRING_LENGTH) {
+      return null;
+    }
+    const canonicalValue = canonicalizeRealtimeValue(
+      input[key],
+      state,
+      depth + 1
+    );
     if (canonicalValue === null) {
       return null;
     }
@@ -78,31 +116,43 @@ function getRouteKey(route: RealtimeSubscriptionRouteTarget): string {
   return `partition:${route.partition.tableName}:${route.partition.partitionKey}:${route.partition.partitionValue}`;
 }
 
-function createRealtimeEvaluationKey(
+async function createRealtimeActiveQueryHash(
   registration: StoredRealtimeRegistration
-): string | null {
-  const args = canonicalizeRealtimeValue(registration.args);
+): Promise<string | null> {
+  const args = canonicalizeRealtimeValue(registration.args, { nodeCount: 0 });
   if (args === null) {
     return null;
   }
 
-  return JSON.stringify([
-    registration.runtimeId,
-    registration.queryName,
-    args,
-    registration.authorizationHeader ?? null,
-    getRouteKey(
-      getRealtimeRegistrationHomeRouteTarget(registration.dependencies)
-    ),
-  ]);
+  const authorizationFingerprint = registration.authorizationHeader
+    ? await sha256Hex(registration.authorizationHeader)
+    : null;
+  return await sha256Hex(
+    JSON.stringify([
+      registration.runtimeId,
+      registration.queryName,
+      args,
+      authorizationFingerprint,
+      getRouteKey(
+        getRealtimeRegistrationHomeRouteTarget(registration.dependencies)
+      ),
+    ])
+  );
 }
 
-export function createRealtimeActiveQueryKey(
+export async function createRealtimeActiveQueryKey(
   registration: StoredRealtimeRegistration,
   registrationKey: string
-): string {
-  return (
-    createRealtimeEvaluationKey(registration) ??
-    JSON.stringify(["registration", registrationKey])
-  );
+): Promise<string> {
+  const evaluationKey = await createRealtimeActiveQueryHash(registration);
+  return `aq:${
+    evaluationKey ??
+    (await sha256Hex(JSON.stringify(["registration", registrationKey])))
+  }`;
+}
+
+export function isRealtimeActiveQueryKey(
+  value: string | undefined
+): value is string {
+  return typeof value === "string" && value.startsWith("aq:");
 }

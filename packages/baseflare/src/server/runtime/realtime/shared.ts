@@ -1,5 +1,6 @@
 import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
 import { emitRuntimeMetric, logRuntimeEvent } from "../logging";
+import { sha256Hex } from "./hash";
 import { getRealtimeConnectionShardName } from "./routing";
 import type {
   PendingRealtimeDelivery,
@@ -14,6 +15,10 @@ import type {
 import {
   JSON_HEADERS,
   REALTIME_DELIVERY_BATCH_SIZE,
+  REALTIME_MAX_IDENTIFIER_LENGTH,
+  REALTIME_MAX_JSON_DEPTH,
+  REALTIME_MAX_JSON_NODES,
+  REALTIME_MAX_JSON_STRING_LENGTH,
   REALTIME_OUTBOX_LAG_METRIC,
   REALTIME_RUNTIME_LIMIT_EXCEEDED_METRIC,
 } from "./types";
@@ -94,6 +99,7 @@ export function getStringField(
       `Realtime field "${fieldName}" must be a non-empty string`
     );
   }
+  assertRealtimeStringLength(value, fieldName, REALTIME_MAX_IDENTIFIER_LENGTH);
 
   return value;
 }
@@ -104,6 +110,84 @@ export function getOptionalStringField(
 ): string | undefined {
   const value = object[fieldName];
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+export function assertRealtimeStringLength(
+  value: string,
+  fieldName: string,
+  maxLength: number
+): void {
+  if (value.length > maxLength) {
+    throw new ValidationRuntimeError(
+      `Realtime field "${fieldName}" must be at most ${maxLength} characters`
+    );
+  }
+}
+
+export function assertRealtimeJsonBounds(value: unknown, label: string): void {
+  let nodeCount = 0;
+  const stack: Array<{ readonly depth: number; readonly value: unknown }> = [
+    { depth: 0, value },
+  ];
+
+  while (stack.length > 0) {
+    const current = stack.pop();
+    if (!current) {
+      continue;
+    }
+
+    nodeCount += 1;
+    if (nodeCount > REALTIME_MAX_JSON_NODES) {
+      throw new ValidationRuntimeError(
+        `${label} must contain at most ${REALTIME_MAX_JSON_NODES} JSON nodes`
+      );
+    }
+
+    if (current.depth > REALTIME_MAX_JSON_DEPTH) {
+      throw new ValidationRuntimeError(
+        `${label} must be at most ${REALTIME_MAX_JSON_DEPTH} levels deep`
+      );
+    }
+
+    pushRealtimeJsonChildren(current.value, current.depth, label, stack);
+  }
+}
+
+function pushRealtimeJsonChildren(
+  value: unknown,
+  depth: number,
+  label: string,
+  stack: Array<{ readonly depth: number; readonly value: unknown }>
+): void {
+  if (typeof value === "string") {
+    assertRealtimeStringLength(value, label, REALTIME_MAX_JSON_STRING_LENGTH);
+    return;
+  }
+
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      stack.push({ depth: depth + 1, value: item });
+    }
+    return;
+  }
+
+  if (typeof value !== "object" || value === null) {
+    return;
+  }
+
+  const prototype = Object.getPrototypeOf(value);
+  if (!(prototype === Object.prototype || prototype === null)) {
+    throw new ValidationRuntimeError(`${label} must be JSON-serializable`);
+  }
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    assertRealtimeStringLength(
+      key,
+      `${label} key`,
+      REALTIME_MAX_JSON_STRING_LENGTH
+    );
+    stack.push({ depth: depth + 1, value: child });
+  }
 }
 
 export function getEpoch(value: unknown): number {
@@ -201,7 +285,6 @@ export function parseRealtimeSocketAttachment(
   if (
     typeof attachment.connectionKey !== "string" ||
     attachment.connectionKey.length === 0 ||
-    typeof attachment.connectionName !== "string" ||
     typeof attachment.runtimeId !== "string" ||
     attachment.runtimeId.length === 0
   ) {
@@ -248,7 +331,7 @@ export function parseRealtimeSocketAttachment(
         ? attachment.authorizationHeader
         : undefined,
     connectionKey: attachment.connectionKey,
-    connectionName: attachment.connectionName,
+    connectionName: getRealtimeConnectionShardName(attachment.connectionKey),
     latestDeliveredOutboxSequence:
       typeof latestDeliveredOutboxSequence === "number"
         ? latestDeliveredOutboxSequence
@@ -258,18 +341,53 @@ export function parseRealtimeSocketAttachment(
   };
 }
 
-export function resolveRealtimeConnectionKey(url: URL): string {
+export async function resolveRealtimeConnectionKey(
+  url: URL,
+  input: {
+    readonly authorizationHeader?: string | null;
+    readonly runtimeId: string;
+  }
+): Promise<string> {
   const clientId = url.searchParams.get("clientId");
-  if (clientId) {
-    return `client:${clientId}`;
+  if (clientId && input.authorizationHeader) {
+    assertRealtimeStringLength(
+      clientId,
+      "clientId",
+      REALTIME_MAX_IDENTIFIER_LENGTH
+    );
+    return `client:${await createAuthBoundConnectionKeyHash(
+      input.runtimeId,
+      input.authorizationHeader,
+      clientId
+    )}`;
   }
 
   const sessionId = url.searchParams.get("sessionId");
-  if (sessionId) {
-    return `session:${sessionId}`;
+  if (sessionId && input.authorizationHeader) {
+    assertRealtimeStringLength(
+      sessionId,
+      "sessionId",
+      REALTIME_MAX_IDENTIFIER_LENGTH
+    );
+    return `session:${await createAuthBoundConnectionKeyHash(
+      input.runtimeId,
+      input.authorizationHeader,
+      sessionId
+    )}`;
   }
 
   return `anonymous:${crypto.randomUUID()}`;
+}
+
+async function createAuthBoundConnectionKeyHash(
+  runtimeId: string,
+  authorizationHeader: string,
+  explicitId: string
+): Promise<string> {
+  const authFingerprint = await sha256Hex(authorizationHeader);
+  return await sha256Hex(
+    JSON.stringify([runtimeId, authFingerprint, explicitId])
+  );
 }
 
 export function emitRealtimeMetric(

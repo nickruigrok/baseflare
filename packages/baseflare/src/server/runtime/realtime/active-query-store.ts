@@ -1,4 +1,8 @@
-import { createRealtimeActiveQueryKey } from "./evaluation-key";
+import { logRuntimeEvent } from "../logging";
+import {
+  createRealtimeActiveQueryKey,
+  isRealtimeActiveQueryKey,
+} from "./evaluation-key";
 import {
   createRegistrationKey,
   getPartitionDependencyTable,
@@ -73,6 +77,13 @@ export class RealtimeActiveQueryStore {
     for (const [storageKey, value] of storedActiveQueries) {
       const activeQuery = this.parseStoredActiveQueryValue(value);
       if (!activeQuery) {
+        logRuntimeEvent(
+          "warn",
+          "runtime.realtime_active_query_reload_dropped",
+          {
+            storageKey,
+          }
+        );
         continue;
       }
 
@@ -91,7 +102,7 @@ export class RealtimeActiveQueryStore {
     const desiredMembers = new Map<string, Set<string>>();
     for (const registration of registrations) {
       const registrationKey = this.registrationKey(registration);
-      const activeQueryKey = this.keyForRegistration(
+      const activeQueryKey = await this.keyForRegistration(
         registration,
         registrationKey
       );
@@ -144,12 +155,12 @@ export class RealtimeActiveQueryStore {
     return maxFanout;
   }
 
-  getRegistrationKey(
+  async getRegistrationKey(
     registration: StoredRealtimeRegistration,
     registrationKey: string,
     options: { readonly recomputeKey?: boolean } = {}
-  ): string {
-    return this.keyForRegistration(registration, registrationKey, {
+  ): Promise<string> {
+    return await this.keyForRegistration(registration, registrationKey, {
       recompute: options.recomputeKey === true,
     });
   }
@@ -186,7 +197,7 @@ export class RealtimeActiveQueryStore {
     registration: StoredRealtimeRegistration,
     options: { readonly recomputeKey?: boolean } = {}
   ): Promise<string> {
-    const activeQueryKey = this.keyForRegistration(
+    const activeQueryKey = await this.keyForRegistration(
       registration,
       registrationKey,
       {
@@ -318,15 +329,20 @@ export class RealtimeActiveQueryStore {
     };
   }
 
-  private keyForRegistration(
+  private async keyForRegistration(
     registration: StoredRealtimeRegistration,
     registrationKey: string,
     options: { readonly recompute?: boolean } = {}
-  ): string {
-    return (
-      (options.recompute ? undefined : registration.activeQueryKey) ??
-      createRealtimeActiveQueryKey(registration, registrationKey)
-    );
+  ): Promise<string> {
+    const activeQueryKey = registration.activeQueryKey;
+    if (
+      options.recompute !== true &&
+      isRealtimeActiveQueryKey(activeQueryKey)
+    ) {
+      return activeQueryKey;
+    }
+
+    return await createRealtimeActiveQueryKey(registration, registrationKey);
   }
 
   private async replaceMembers(

@@ -10,6 +10,7 @@ import {
 } from "./routing";
 import { fetchActiveRealtimeShardGeneration } from "./shards";
 import {
+  assertRealtimeJsonBounds,
   createRealtimeSocketAttachment,
   emitRealtimeMetric,
   getEpoch,
@@ -38,6 +39,8 @@ import {
   JSON_HEADERS,
   REALTIME_CONNECTION_KEY_HEADER,
   REALTIME_LEASE_MS,
+  REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET,
+  REALTIME_MAX_MESSAGE_BYTES,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   REALTIME_RECONCILIATION_INTERVAL_MS,
   REALTIME_RECONCILIATIONS_METRIC,
@@ -85,7 +88,11 @@ export async function routeRealtimeSubscribe(
     );
   }
 
-  const clientKey = resolveRealtimeConnectionKey(url);
+  const authorizationHeader = request.headers.get("authorization");
+  const clientKey = await resolveRealtimeConnectionKey(url, {
+    authorizationHeader,
+    runtimeId,
+  });
   const shardName = getRealtimeConnectionShardName(clientKey);
   const stub = env.REALTIME_CONNECTIONS.get(
     env.REALTIME_CONNECTIONS.idFromName(shardName)
@@ -121,7 +128,7 @@ export class RealtimeConnectionDO {
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     if (request.method === "GET") {
-      return this.acceptWebSocket(request);
+      return await this.acceptWebSocket(request);
     }
 
     if (request.method === "POST" && url.pathname === "/deliver") {
@@ -133,7 +140,16 @@ export class RealtimeConnectionDO {
     if (request.method === "POST" && url.pathname === "/has-sockets") {
       const message = await readJsonObject(request);
       const connectionKey = getStringField(message, "connectionKey");
-      const connected = this.socketRegistry.hasSockets(connectionKey);
+      const subscriptionId =
+        typeof message.subscriptionId === "string"
+          ? getStringField(message, "subscriptionId")
+          : undefined;
+      const connected = subscriptionId
+        ? this.socketRegistry.hasSubscriptionSocket(
+            connectionKey,
+            subscriptionId
+          )
+        : this.socketRegistry.hasSockets(connectionKey);
       return jsonResponse({ connected, ok: true });
     }
 
@@ -146,17 +162,13 @@ export class RealtimeConnectionDO {
     return new Response("Not found", { status: 404 });
   }
 
-  private acceptWebSocket(request: Request): Response {
+  private async acceptWebSocket(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") {
       throw new ValidationRuntimeError(
         "Realtime subscription requests must upgrade to WebSocket"
       );
     }
 
-    const url = new URL(request.url);
-    const clientKey =
-      request.headers.get(REALTIME_CONNECTION_KEY_HEADER) ??
-      resolveRealtimeConnectionKey(url);
     const authorizationHeader = request.headers.get("authorization");
     const runtimeId = request.headers.get(REALTIME_RUNTIME_ID_HEADER);
     if (!runtimeId) {
@@ -164,6 +176,13 @@ export class RealtimeConnectionDO {
         "Realtime subscription requests require a runtime id"
       );
     }
+    const url = new URL(request.url);
+    const clientKey =
+      request.headers.get(REALTIME_CONNECTION_KEY_HEADER) ??
+      (await resolveRealtimeConnectionKey(url, {
+        authorizationHeader,
+        runtimeId,
+      }));
 
     const pair = new WebSocketPair();
     const client = pair[0];
@@ -228,11 +247,19 @@ export class RealtimeConnectionDO {
     if (typeof data !== "string") {
       throw new ValidationRuntimeError("Realtime messages must be text JSON");
     }
+    if (
+      new TextEncoder().encode(data).byteLength > REALTIME_MAX_MESSAGE_BYTES
+    ) {
+      throw new ValidationRuntimeError(
+        `Realtime messages must be at most ${REALTIME_MAX_MESSAGE_BYTES} bytes`
+      );
+    }
 
     const message = parseObject(
       JSON.parse(data) as unknown,
       "Realtime message"
     );
+    assertRealtimeJsonBounds(message, "Realtime message");
     const type = getStringField(message, "type");
     if (type === "subscribe") {
       await this.registerSubscription(message, socket);
@@ -262,6 +289,20 @@ export class RealtimeConnectionDO {
     } = {}
   ): Promise<void> {
     const registration = this.createRegistration(message, socket);
+    const attachment = this.socketRegistry.ensureAttachment(socket);
+    const existingSubscription = this.socketRegistry.getSubscription(
+      socket,
+      registration.subscriptionId
+    );
+    if (
+      !existingSubscription &&
+      attachment.subscriptions.length >=
+        REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET
+    ) {
+      throw new ValidationRuntimeError(
+        `Realtime sockets can have at most ${REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET} active subscriptions`
+      );
+    }
     const subscriptionTarget = await this.subscriptionTarget(
       undefined,
       createRealtimeGlobalSubscriptionRouteTarget(),
@@ -285,7 +326,7 @@ export class RealtimeConnectionDO {
     }
 
     this.socketRegistry.addSubscription(socket, {
-      args: message.args ?? {},
+      args: registration.args,
       epoch: registration.epoch,
       queryName: registration.queryName,
       subscriptionShardName: subscriptionTarget.shardName,
@@ -371,6 +412,7 @@ export class RealtimeConnectionDO {
           subscription,
           "Realtime subscription"
         );
+        assertRealtimeJsonBounds(subscriptionMessage, "Realtime subscription");
         await this.registerSubscription(subscriptionMessage, socket, {
           scheduleReconciliation: false,
           sendAcknowledgement: false,
@@ -447,6 +489,11 @@ export class RealtimeConnectionDO {
                 `Realtime restore catch-up failed for shard ${catchUpTarget.shardName} with status ${catchUpResponse.status}`
               );
             }
+            const latestSequence =
+              await this.readCatchUpLatestSequence(catchUpResponse);
+            if (latestSequence !== null) {
+              this.updateLatestDeliveredOutboxSequence(socket, latestSequence);
+            }
           } catch (error) {
             if (
               error instanceof Error &&
@@ -517,8 +564,10 @@ export class RealtimeConnectionDO {
     const subscriptionId = getStringField(message, "subscriptionId");
     const attachment = this.socketRegistry.ensureAttachment(socket);
     const connectionKey = attachment.connectionKey;
+    const args = message.args ?? {};
+    assertRealtimeJsonBounds(args, "Realtime subscription args");
     return {
-      args: message.args ?? {},
+      args,
       authorizationHeader: attachment.authorizationHeader,
       connectionKey,
       connectionName: attachment.connectionName,
@@ -617,6 +666,11 @@ export class RealtimeConnectionDO {
     const subscriptionGeneration = await fetchActiveRealtimeShardGeneration(
       this.env.APP_DB
     );
+    const staleRestoreAfterSequence =
+      this.staleGenerationAfterSequenceForSubscriptions(
+        subscriptionsToRestore,
+        subscriptionGeneration
+      );
     const results = await Promise.allSettled(
       subscriptionsToRestore.map(({ attachment, subscription }) =>
         this.restoreAttachedSubscription(
@@ -645,7 +699,13 @@ export class RealtimeConnectionDO {
     let catchUpFailed = false;
     if (options.reconcileAfterRestore && accepted > 0) {
       const summary = await this.catchUpActiveSubscriptions(
-        subscriptionGeneration
+        subscriptionGeneration,
+        {
+          activeGenerationFallbackAfterSequence:
+            staleRestoreAfterSequence.afterSequence,
+          includeActiveGenerationFallback:
+            staleRestoreAfterSequence.hasStaleSubscriptions,
+        }
       );
       catchUpFailed = summary.failed.length > 0;
       this.emitReconciliationSummary(summary);
@@ -898,9 +958,16 @@ export class RealtimeConnectionDO {
   }
 
   private async catchUpActiveSubscriptions(
-    generationOverride?: RealtimeShardGeneration
+    generationOverride?: RealtimeShardGeneration,
+    options: {
+      readonly activeGenerationFallbackAfterSequence?: number | null;
+      readonly includeActiveGenerationFallback?: boolean;
+    } = {}
   ): Promise<RealtimeReconciliationSummary> {
-    const targets = await this.reconciliationCatchUpTargets(generationOverride);
+    const targets = await this.reconciliationCatchUpTargets(
+      generationOverride,
+      options
+    );
     const reconciliationSession = this.env.APP_DB.withSession?.(
       "first-unconstrained"
     );
@@ -999,7 +1066,13 @@ export class RealtimeConnectionDO {
     response: Response
   ): Promise<number | null> {
     try {
-      const body = (await response.json()) as { readonly events?: unknown };
+      const body = (await response.json()) as {
+        readonly events?: unknown;
+        readonly latestSequence?: unknown;
+      };
+      if (Number.isSafeInteger(body.latestSequence)) {
+        return body.latestSequence as number;
+      }
       if (!Array.isArray(body.events)) {
         return null;
       }
@@ -1061,7 +1134,11 @@ export class RealtimeConnectionDO {
   }
 
   private async reconciliationCatchUpTargets(
-    generationOverride?: RealtimeShardGeneration
+    generationOverride?: RealtimeShardGeneration,
+    options: {
+      readonly activeGenerationFallbackAfterSequence?: number | null;
+      readonly includeActiveGenerationFallback?: boolean;
+    } = {}
   ): Promise<
     Array<{
       readonly afterSequence: number | null;
@@ -1132,35 +1209,95 @@ export class RealtimeConnectionDO {
     const activeGeneration =
       generationOverride ??
       (await fetchActiveRealtimeShardGeneration(this.env.APP_DB));
-    const activeAfterSequence = this.getReconciliationAfterSequence();
-    for (const shardName of getRealtimeSubscriptionShardNames(
-      activeGeneration
-    )) {
-      if (targets.has(shardName)) {
-        continue;
-      }
+    const staleAfterSequence =
+      this.getStaleGenerationReconciliationAfterSequence(activeGeneration);
+    if (
+      staleAfterSequence.hasStaleSubscriptions ||
+      options.includeActiveGenerationFallback
+    ) {
+      const fallbackAfterSequence =
+        options.activeGenerationFallbackAfterSequence ??
+        staleAfterSequence.afterSequence;
+      for (const shardName of getRealtimeSubscriptionShardNames(
+        activeGeneration
+      )) {
+        if (targets.has(shardName)) {
+          continue;
+        }
 
-      targets.set(shardName, {
-        afterSequence: activeAfterSequence,
-        shardName,
-        stub: this.env.REALTIME_SUBSCRIPTIONS.get(
-          this.env.REALTIME_SUBSCRIPTIONS.idFromName(shardName)
-        ),
-      });
+        targets.set(shardName, {
+          afterSequence: fallbackAfterSequence,
+          shardName,
+          stub: this.env.REALTIME_SUBSCRIPTIONS.get(
+            this.env.REALTIME_SUBSCRIPTIONS.idFromName(shardName)
+          ),
+        });
+      }
     }
 
     return [...targets.values()];
   }
 
-  private getReconciliationAfterSequence(): number | null {
+  private getStaleGenerationReconciliationAfterSequence(
+    activeGeneration: RealtimeShardGeneration
+  ): {
+    readonly afterSequence: number | null;
+    readonly hasStaleSubscriptions: boolean;
+  } {
     let afterSequence: number | null = null;
-    for (const { attachment } of this.socketRegistry.attachedSubscriptions()) {
+    let hasStaleSubscriptions = false;
+    for (const {
+      attachment,
+      subscription,
+    } of this.socketRegistry.attachedSubscriptions()) {
+      const shardName = subscription.subscriptionShardName;
+      if (
+        !shardName ||
+        getRealtimeShardGenerationIdFromName(shardName) ===
+          activeGeneration.generationId
+      ) {
+        continue;
+      }
+
+      hasStaleSubscriptions = true;
       afterSequence = this.minAfterSequence(
         afterSequence,
         attachment.latestDeliveredOutboxSequence
       );
     }
-    return afterSequence;
+    return { afterSequence, hasStaleSubscriptions };
+  }
+
+  private staleGenerationAfterSequenceForSubscriptions(
+    subscriptions: readonly {
+      readonly attachment: RealtimeSocketAttachment;
+      readonly subscription: RealtimeSocketSubscription;
+    }[],
+    activeGeneration: RealtimeShardGeneration
+  ): {
+    readonly afterSequence: number | null;
+    readonly hasStaleSubscriptions: boolean;
+  } {
+    let afterSequence: number | null = null;
+    let hasStaleSubscriptions = false;
+    for (const { attachment, subscription } of subscriptions) {
+      const shardName = subscription.subscriptionShardName;
+      if (
+        !shardName ||
+        getRealtimeShardGenerationIdFromName(shardName) ===
+          activeGeneration.generationId
+      ) {
+        continue;
+      }
+
+      hasStaleSubscriptions = true;
+      afterSequence = this.minAfterSequence(
+        afterSequence,
+        attachment.latestDeliveredOutboxSequence
+      );
+    }
+
+    return { afterSequence, hasStaleSubscriptions };
   }
 
   private minAfterSequence(
@@ -1240,10 +1377,19 @@ export class RealtimeConnectionDO {
         shardNames.add(subscription.subscriptionShardName);
       }
     }
-    for (const shardName of getRealtimeSubscriptionShardNames(
-      activeGeneration
-    )) {
-      shardNames.add(shardName);
+    const hasStaleGenerationSubscription = subscriptions.some(
+      (subscription) =>
+        subscription.subscriptionShardName &&
+        getRealtimeShardGenerationIdFromName(
+          subscription.subscriptionShardName
+        ) !== activeGeneration.generationId
+    );
+    if (hasStaleGenerationSubscription) {
+      for (const shardName of getRealtimeSubscriptionShardNames(
+        activeGeneration
+      )) {
+        shardNames.add(shardName);
+      }
     }
 
     return [...shardNames].map((shardName) => ({

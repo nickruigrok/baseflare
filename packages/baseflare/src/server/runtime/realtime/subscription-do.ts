@@ -96,6 +96,11 @@ interface RealtimeEvaluationResult {
   readonly versionSnapshot: RealtimeVersionSnapshot;
 }
 
+interface RealtimeActiveQueryCandidate {
+  readonly activeQuery: StoredRealtimeActiveQuery;
+  readonly replayStoredResult: boolean;
+}
+
 export class RealtimeSubscriptionDO {
   private readonly database: D1Database;
   private readonly env: RealtimeObjectEnv;
@@ -132,7 +137,13 @@ export class RealtimeSubscriptionDO {
 
   async alarm(): Promise<void> {
     await this.loadRealtimeState();
-    await this.registrationStore.cleanupExpired();
+    try {
+      await this.registrationStore.cleanupExpired();
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_registration_cleanup_failed", {
+        errorName: error instanceof Error ? error.name : typeof error,
+      });
+    }
     const cleanupSucceeded = await this.cleanupRealtimeOutbox();
     if (!cleanupSucceeded || (await this.shouldScheduleOutboxCleanupAlarm())) {
       await this.scheduleOutboxCleanupAlarm({ replace: true });
@@ -168,14 +179,6 @@ export class RealtimeSubscriptionDO {
 
     if (url.pathname === "/catch-up") {
       return await this.handleCatchUp(request);
-    }
-
-    if (url.pathname === "/registrations") {
-      return jsonResponse({
-        lastProcessedOutboxSequence: this.lastProcessedOutboxSequence,
-        registrations: this.registrationStore.values(),
-        shardName: this.shardName,
-      });
     }
 
     return new Response("Not found", { status: 404 });
@@ -455,6 +458,7 @@ export class RealtimeSubscriptionDO {
       return jsonResponse({
         ...result,
         events: [],
+        latestSequence: recoverySequence,
         ok: true,
         recoveredByFullReevaluation: true,
       });
@@ -480,6 +484,7 @@ export class RealtimeSubscriptionDO {
       return jsonResponse({
         ...result,
         events: createRealtimeOutboxResponseEvents(catchUp.events),
+        latestSequence: catchUp.latestReadSequence,
         ok: true,
         recoveredByFullReevaluation: true,
       });
@@ -497,6 +502,7 @@ export class RealtimeSubscriptionDO {
         evaluated: 0,
         events: createRealtimeOutboxResponseEvents(events),
         failed: 0,
+        latestSequence: afterSequence,
         ok: true,
       });
     }
@@ -518,6 +524,7 @@ export class RealtimeSubscriptionDO {
     return jsonResponse({
       ...result,
       events: createRealtimeOutboxResponseEvents(events),
+      latestSequence: events.at(-1)?.sequence ?? null,
       ok: true,
       recoveredByFullReevaluation: false,
     });
@@ -665,7 +672,7 @@ export class RealtimeSubscriptionDO {
     let evaluated = 0;
     let failed = 0;
     let skipped = 0;
-    const candidateActiveQueries: StoredRealtimeActiveQuery[] = [];
+    const candidateActiveQueries: RealtimeActiveQueryCandidate[] = [];
     const pendingDeliveries: PendingRealtimeDelivery[] = [];
     const activeQueryKeys = [...this.activeQueryStore.getRelevantKeys(targets)];
     skipped += Math.max(
@@ -700,7 +707,10 @@ export class RealtimeSubscriptionDO {
         failed += result.failed;
         skipped += result.skipped;
         if (result.activeQuery) {
-          candidateActiveQueries.push(result.activeQuery);
+          candidateActiveQueries.push({
+            activeQuery: result.activeQuery,
+            replayStoredResult: result.replayStoredResult,
+          });
         }
       }
     };
@@ -769,33 +779,56 @@ export class RealtimeSubscriptionDO {
     readonly evaluated: number;
     readonly failed: number;
     readonly activeQuery?: StoredRealtimeActiveQuery;
+    readonly replayStoredResult: boolean;
     readonly skipped: number;
   }> {
     const activeQuery = this.activeQueryStore.get(activeQueryKey);
     if (!activeQuery) {
-      return { evaluated: 0, failed: 0, skipped: 0 };
+      return { evaluated: 0, failed: 0, replayStoredResult: false, skipped: 0 };
     }
 
     if (this.isActiveQueryReEvaluationBackedOff(activeQuery)) {
-      return { evaluated: 0, failed: 0, skipped: 1 };
+      return { evaluated: 0, failed: 0, replayStoredResult: false, skipped: 1 };
     }
 
     if (this.reEvaluatingActiveQueries.has(activeQueryKey)) {
-      return { evaluated: 0, failed: 0, skipped: 1 };
+      return { evaluated: 0, failed: 0, replayStoredResult: false, skipped: 1 };
     }
 
     this.reEvaluatingActiveQueries.add(activeQueryKey);
     let shouldRelease = true;
     try {
       if (!(await this.hasRelevantVersionGap(activeQuery, targets, database))) {
-        return { evaluated: 0, failed: 0, skipped: 1 };
+        if (this.hasUndeliveredActiveQueryMembers(activeQuery)) {
+          shouldRelease = false;
+          return {
+            activeQuery,
+            evaluated: 0,
+            failed: 0,
+            replayStoredResult: true,
+            skipped: 0,
+          };
+        }
+
+        return {
+          evaluated: 0,
+          failed: 0,
+          replayStoredResult: false,
+          skipped: 1,
+        };
       }
 
       shouldRelease = false;
-      return { activeQuery, evaluated: 0, failed: 0, skipped: 0 };
+      return {
+        activeQuery,
+        evaluated: 0,
+        failed: 0,
+        replayStoredResult: false,
+        skipped: 0,
+      };
     } catch {
       await this.recoverFailedActiveQueryEvaluation(activeQuery);
-      return { evaluated: 0, failed: 1, skipped: 0 };
+      return { evaluated: 0, failed: 1, replayStoredResult: false, skipped: 0 };
     } finally {
       if (shouldRelease) {
         this.reEvaluatingActiveQueries.delete(activeQueryKey);
@@ -804,7 +837,7 @@ export class RealtimeSubscriptionDO {
   }
 
   private async evaluateActiveQueries(
-    activeQueries: readonly StoredRealtimeActiveQuery[],
+    candidates: readonly RealtimeActiveQueryCandidate[],
     sequence: number | null,
     database: RuntimeDatabase
   ): Promise<{
@@ -817,18 +850,20 @@ export class RealtimeSubscriptionDO {
     let evaluated = 0;
     let failed = 0;
     const evaluateNextGroup = async (): Promise<void> => {
-      while (nextGroupIndex < activeQueries.length) {
-        const activeQuery = activeQueries[nextGroupIndex];
+      while (nextGroupIndex < candidates.length) {
+        const candidate = candidates[nextGroupIndex];
         nextGroupIndex += 1;
-        if (!activeQuery) {
+        if (!candidate) {
           continue;
         }
 
-        const result = await this.evaluateActiveQuery(
-          activeQuery,
-          sequence,
-          database
-        );
+        const result = candidate.replayStoredResult
+          ? await this.replayActiveQueryResult(candidate.activeQuery, sequence)
+          : await this.evaluateActiveQuery(
+              candidate.activeQuery,
+              sequence,
+              database
+            );
         evaluated += result.evaluated;
         failed += result.failed;
         deliveries.push(...result.deliveries);
@@ -843,7 +878,7 @@ export class RealtimeSubscriptionDO {
         {
           length: Math.min(
             REALTIME_REEVALUATION_CONCURRENCY,
-            activeQueries.length
+            candidates.length
           ),
         },
         () => evaluateNextGroup()
@@ -904,6 +939,74 @@ export class RealtimeSubscriptionDO {
         evaluated: 0,
         failed: registrations.length,
       };
+    }
+  }
+
+  private async replayActiveQueryResult(
+    activeQuery: StoredRealtimeActiveQuery,
+    sequence: number | null
+  ): Promise<{
+    readonly deliveries: PendingRealtimeDelivery[];
+    readonly evaluated: number;
+    readonly failed: number;
+  }> {
+    const registrations = this.getActiveQueryRegistrations(activeQuery);
+    if (registrations.length === 0) {
+      this.releaseActiveQueryEvaluation(activeQuery);
+      return { deliveries: [], evaluated: 0, failed: 0 };
+    }
+
+    try {
+      const evaluation = this.storedActiveQueryEvaluation(activeQuery);
+      return await this.createActiveQueryDeliveries(
+        activeQuery,
+        registrations,
+        sequence,
+        evaluation
+      );
+    } catch (error) {
+      await this.recoverFailedActiveQueryEvaluation(activeQuery);
+      await Promise.allSettled(
+        registrations.map((registration) =>
+          this.recoverFailedEvaluationRegistration(registration, error)
+        )
+      );
+      this.releaseActiveQueryEvaluation(activeQuery);
+      return { deliveries: [], evaluated: 0, failed: registrations.length };
+    }
+  }
+
+  private storedActiveQueryEvaluation(
+    activeQuery: StoredRealtimeActiveQuery
+  ): RealtimeEvaluationResult {
+    if (
+      !(
+        activeQuery.lastResultJson &&
+        activeQuery.dependencies &&
+        activeQuery.versionSnapshot
+      )
+    ) {
+      throw new InternalRuntimeError(
+        "Realtime active query cannot replay without evaluated state"
+      );
+    }
+
+    try {
+      return {
+        dependencies: activeQuery.dependencies,
+        result: JSON.parse(activeQuery.lastResultJson) as unknown,
+        resultJson: activeQuery.lastResultJson,
+        versionSnapshot: activeQuery.versionSnapshot,
+      };
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_active_query_replay_failed", {
+        activeQueryKey: activeQuery.key,
+        errorName: error instanceof Error ? error.name : typeof error,
+        queryName: activeQuery.queryName,
+      });
+      throw new InternalRuntimeError(
+        "Realtime active query stored result is malformed"
+      );
     }
   }
 
@@ -975,6 +1078,25 @@ export class RealtimeSubscriptionDO {
     }
 
     return registrations;
+  }
+
+  private hasUndeliveredActiveQueryMembers(
+    activeQuery: StoredRealtimeActiveQuery
+  ): boolean {
+    if (
+      !(
+        activeQuery.lastResultJson &&
+        activeQuery.dependencies &&
+        activeQuery.versionSnapshot
+      )
+    ) {
+      return false;
+    }
+
+    return this.getActiveQueryRegistrations(activeQuery).some(
+      (registration) =>
+        registration.lastResultJson !== activeQuery.lastResultJson
+    );
   }
 
   private async recoverFailedEvaluationRegistration(
@@ -1125,7 +1247,10 @@ export class RealtimeSubscriptionDO {
     const response = await this.env.REALTIME_CONNECTIONS.get(
       this.env.REALTIME_CONNECTIONS.idFromName(registration.connectionName)
     ).fetch("https://baseflare.internal/has-sockets", {
-      body: JSON.stringify({ connectionKey: registration.connectionKey }),
+      body: JSON.stringify({
+        connectionKey: registration.connectionKey,
+        subscriptionId: registration.subscriptionId,
+      }),
       headers: JSON_HEADERS,
       method: "POST",
     });

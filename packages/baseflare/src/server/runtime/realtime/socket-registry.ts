@@ -238,7 +238,11 @@ export class RealtimeSocketRegistry {
     const deliveredSubscriptions = new Set<string>();
     for (const message of messages) {
       const subscriptionId = getStringField(message, "subscriptionId");
-      const sent = this.deliverMessageToSockets(sockets, message);
+      const sent = this.deliverMessageToSockets(
+        sockets,
+        subscriptionId,
+        message
+      );
       delivered += sent;
       if (sent > 0) {
         deliveredSubscriptions.add(subscriptionId);
@@ -253,6 +257,23 @@ export class RealtimeSocketRegistry {
 
   hasSockets(connectionKey: string): boolean {
     return (this.socketsByConnectionKey.get(connectionKey)?.size ?? 0) > 0;
+  }
+
+  hasSubscriptionSocket(
+    connectionKey: string,
+    subscriptionId: string
+  ): boolean {
+    const sockets = this.socketsByConnectionKey.get(connectionKey);
+    if (!sockets) {
+      return false;
+    }
+
+    for (const socket of sockets) {
+      if (this.getSubscription(socket, subscriptionId)) {
+        return true;
+      }
+    }
+    return false;
   }
 
   hasActiveSubscriptions(): boolean {
@@ -319,6 +340,7 @@ export class RealtimeSocketRegistry {
 
   private deliverMessageToSockets(
     sockets: Set<RuntimeWebSocket>,
+    subscriptionId: string,
     message: Record<string, unknown>
   ): number {
     const payload = JSON.stringify({
@@ -327,6 +349,9 @@ export class RealtimeSocketRegistry {
     });
     let delivered = 0;
     for (const socket of [...sockets]) {
+      if (!this.getSubscription(socket, subscriptionId)) {
+        continue;
+      }
       try {
         socket.send(payload);
         this.updateDeliveredSequence(socket, message.sequence);

@@ -864,7 +864,8 @@ drain. It never increments by `+1` and never downscales below one shard.
 - Each internal registration is keyed by `{ connectionKey, subscriptionId }`,
   so client-local subscription ids cannot collide across sockets.
 - Anonymous sockets get server-generated connection keys. Explicit `clientId`
-  or `sessionId` values still group intentional multi-tab sessions.
+  or `sessionId` values group intentional multi-tab sessions only after being
+  hashed with the runtime id and authorization fingerprint.
 - Identical safe subscriptions share one active query per subscription shard.
   Active query keys include runtime id, query name, canonical args,
   authorization header, and current home route, so different auth contexts never
@@ -899,8 +900,8 @@ drain. It never increments by `+1` and never downscales below one shard.
    out one pending delivery per member registration whose subscriber should
    receive the new result.
 8. Changed results are batched per `{ connectionName, connectionKey }` and sent
-   to `RealtimeConnectionDO` through item-acknowledged internal `/deliver`
-   calls.
+   to `RealtimeConnectionDO` through subscription-aware, item-acknowledged
+   internal `/deliver` calls.
 9. Connection DOs deliver individual `{ type: "delivery", message }` WebSocket
    frames. Delivery messages include internal outbox `sequence` metadata.
 

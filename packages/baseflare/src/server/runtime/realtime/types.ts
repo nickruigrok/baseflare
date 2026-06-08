@@ -226,6 +226,18 @@ export const REALTIME_DELIVERY_BATCH_SIZE = 100;
 // Bounds restore-time D1 work and connection DO memory for a single restore frame.
 export const REALTIME_MAX_RESTORE_SUBSCRIPTIONS = 100;
 
+export const REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET = 100;
+
+export const REALTIME_MAX_IDENTIFIER_LENGTH = 256;
+
+export const REALTIME_MAX_JSON_DEPTH = 32;
+
+export const REALTIME_MAX_JSON_NODES = 10_000;
+
+export const REALTIME_MAX_JSON_STRING_LENGTH = 16 * 1024;
+
+export const REALTIME_MAX_MESSAGE_BYTES = 1024 * 1024;
+
 export const REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS = 3;
 
 export const REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS = 50;
@@ -318,7 +330,6 @@ export type RealtimeMetricResult =
   | "delivered"
   | "empty"
   | "evaluated"
-  | "evicted"
   | "failed"
   | "fanout"
   | "limited"

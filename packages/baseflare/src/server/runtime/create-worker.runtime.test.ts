@@ -53,6 +53,7 @@ import {
   configureRealtimeRuntime,
   REALTIME_CONFIGURED_RUNTIME_LIMIT,
   resetRealtimeRuntimeStateForTest,
+  resolveRealtimeConnectionKey,
 } from "./realtime/shared";
 import type { RealtimeSocketRegistry } from "./realtime/socket-registry";
 import { RealtimeSubscriptionDO } from "./realtime/subscription-do";
@@ -68,6 +69,7 @@ import type {
 import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
   REALTIME_DELIVERY_BATCH_SIZE,
+  REALTIME_MAX_MESSAGE_BYTES,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
   REALTIME_MAX_SUBSCRIPTION_SHARDS,
   REALTIME_OUTBOX_CLEANUP_INTERVAL_MS,
@@ -1007,6 +1009,31 @@ function getRealtimeActiveQueryTestState(
   ).activeQueryStore.snapshotForTest();
 }
 
+async function fetchRealtimeRegistrations(
+  subscriptionDo: RealtimeSubscriptionDO
+): Promise<Response> {
+  await (
+    subscriptionDo as unknown as {
+      loadRealtimeState(): Promise<void>;
+    }
+  ).loadRealtimeState();
+  return Response.json({
+    lastProcessedOutboxSequence: (
+      subscriptionDo as unknown as {
+        lastProcessedOutboxSequence: number | null;
+      }
+    ).lastProcessedOutboxSequence,
+    registrations: [
+      ...getRealtimeIndexTestState(subscriptionDo).registrations.values(),
+    ],
+    shardName: (
+      subscriptionDo as unknown as {
+        shardName: string;
+      }
+    ).shardName,
+  });
+}
+
 function getRealtimeActiveQueryKeyForRegistration(
   subscriptionDo: RealtimeSubscriptionDO,
   registrationKey: string
@@ -1047,6 +1074,36 @@ function realtimeSocketAttachment(
     subscriptions: [],
     ...overrides,
   };
+}
+
+function realtimeSocketSubscription(
+  subscriptionId: string
+): RealtimeSocketSubscription {
+  return {
+    args: { ownerToken: "owner-a" },
+    epoch: 1,
+    queryName: "todos:list",
+    subscriptionId,
+    subscriptionShardName: getRealtimeSubscriptionShardName(),
+  };
+}
+
+function addRealtimeTestSubscription(
+  connectionDo: RealtimeConnectionDO,
+  connectionKey: string,
+  subscriptionId: string
+): void {
+  const registry = getRealtimeSocketRegistry(connectionDo);
+  const sockets =
+    getRealtimeSocketTestState(connectionDo).socketsByConnectionKey.get(
+      connectionKey
+    ) ?? new Set<RuntimeWebSocket>();
+  for (const socket of sockets) {
+    registry.addSubscription(
+      socket,
+      realtimeSocketSubscription(subscriptionId)
+    );
+  }
 }
 
 async function getRealtimeOutboxSequence(eventId: string): Promise<number> {
@@ -1142,10 +1199,20 @@ async function waitFor(
   }
 }
 
-function realtimeConnectionStub(clientId: string) {
+async function realtimeConnectionStub(
+  clientId: string,
+  ownerToken = "owner-a"
+) {
+  const connectionKey = await resolveRealtimeConnectionKey(
+    new URL(`http://example.com/api/subscribe?clientId=${clientId}`),
+    {
+      authorizationHeader: `Bearer ${ownerToken}`,
+      runtimeId: "runtime:1",
+    }
+  );
   return env.REALTIME_CONNECTIONS.get(
     env.REALTIME_CONNECTIONS.idFromName(
-      getRealtimeConnectionShardName(`client:${clientId}`)
+      getRealtimeConnectionShardName(connectionKey)
     )
   );
 }
@@ -1891,7 +1958,7 @@ describe("worker runtime", () => {
     const response = await invoke(
       "/api/subscribe?clientId=client-a",
       {
-        headers: { upgrade: "websocket" },
+        headers: { authorization: "Bearer owner-a", upgrade: "websocket" },
         method: "GET",
       },
       worker,
@@ -1900,8 +1967,12 @@ describe("worker runtime", () => {
 
     expect(response.status).toBe(200);
     expect(connections.requests).toHaveLength(1);
+    const connectionKey = connections.requests[0]?.request.headers.get(
+      "x-baseflare-realtime-connection-key"
+    );
+    expect(connectionKey).toMatch(/^client:[0-9a-f]{64}$/);
     expect(connections.requests[0]?.name).toBe(
-      getRealtimeConnectionShardName("client:client-a")
+      getRealtimeConnectionShardName(connectionKey ?? "")
     );
     expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
       "/api/subscribe"
@@ -2025,7 +2096,7 @@ describe("worker runtime", () => {
     // The notify fast path does not auto-deliver in the test env, so the only
     // way this reaches the socket is the real scheduled state.storage alarm.
     const ran = await runDurableObjectAlarm(
-      realtimeConnectionStub("alarm-client")
+      await realtimeConnectionStub("alarm-client")
     );
     expect(ran).toBe(true);
 
@@ -2051,7 +2122,9 @@ describe("worker runtime", () => {
       subscriptionId: "sub-hib",
     });
     await createTodoViaSelf("owner-a", "hibernation-delivered");
-    await runDurableObjectAlarm(realtimeConnectionStub("hibernation-client"));
+    await runDurableObjectAlarm(
+      await realtimeConnectionStub("hibernation-client")
+    );
     await waitFor(() =>
       messages.some((message) => message.type === "delivery")
     );
@@ -2064,7 +2137,7 @@ describe("worker runtime", () => {
     // attachment must round-trip through serialize/deserialize with its
     // subscriptions and the latest delivered outbox sequence persisted.
     await runInDurableObject(
-      realtimeConnectionStub("hibernation-client"),
+      await realtimeConnectionStub("hibernation-client"),
       (_instance, state) => {
         interface StoredAttachment {
           connectionKey: string;
@@ -2078,9 +2151,7 @@ describe("worker runtime", () => {
         }>;
         const attachment = sockets
           .map((socket) => socket.deserializeAttachment() as StoredAttachment)
-          .find(
-            (value) => value?.connectionKey === "client:hibernation-client"
-          );
+          .find((value) => value?.connectionKey.startsWith("client:"));
         expect(attachment).toBeDefined();
         expect(attachment?.subscriptions).toEqual([
           expect.objectContaining({
@@ -2219,12 +2290,8 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: subscriptions,
     });
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: Array<{ reEvaluationRetryAt?: number }>;
     };
@@ -2309,12 +2376,8 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: unknown[];
     };
@@ -2566,11 +2629,8 @@ describe("worker runtime", () => {
       );
     expect(restoredRegistration).toBeUndefined();
 
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: Array<{
         lastResultJson?: string;
@@ -2657,11 +2717,8 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const body = (await registrationsResponse.json()) as {
       registrations: unknown[];
     };
@@ -2705,11 +2762,8 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const body = (await registrationsResponse.json()) as {
       registrations: Array<{ subscriptionId: string }>;
     };
@@ -2868,12 +2922,8 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: Array<{ reEvaluationRetryAt?: number }>;
     };
@@ -3208,12 +3258,8 @@ describe("worker runtime", () => {
     const sourceRegistration = getRealtimeIndexTestState(
       sourceSubscriptionDo
     ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
-    const targetRegistrationsResponse = await targetSubscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const targetRegistrationsResponse =
+      await fetchRealtimeRegistrations(targetSubscriptionDo);
     const targetRegistrationsBody =
       (await targetRegistrationsResponse.json()) as {
         registrations: StoredRealtimeRegistration[];
@@ -3857,12 +3903,8 @@ describe("worker runtime", () => {
     expect(deliveredIds.filter((id) => id === "sub-a")).toHaveLength(1);
     expect(deliveredIds.filter((id) => id === "sub-expired")).toHaveLength(1);
 
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: Array<{ subscriptionId: string }>;
     };
@@ -4397,12 +4439,8 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const body = (await registrationsResponse.json()) as {
       registrations: Array<{ lastResultJson?: string; subscriptionId: string }>;
     };
@@ -4425,6 +4463,7 @@ describe("worker runtime", () => {
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
           headers: {
+            authorization: "Bearer owner-a",
             upgrade: "websocket",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
@@ -4437,6 +4476,7 @@ describe("worker runtime", () => {
         "https://baseflare.internal/api/subscribe?clientId=client-b",
         {
           headers: {
+            authorization: "Bearer owner-b",
             upgrade: "websocket",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
@@ -4456,11 +4496,19 @@ describe("worker runtime", () => {
     clientB.addEventListener("message", (event) => {
       clientBMessages.push(JSON.parse(String(event.data)) as unknown);
     });
+    const [clientAKey, clientBKey] = [
+      ...getRealtimeSocketTestState(connectionDo).socketStates.values(),
+    ].map(({ attachment }) => attachment.connectionKey);
+    if (!(clientAKey && clientBKey)) {
+      throw new Error("Expected accepted realtime sockets");
+    }
+    addRealtimeTestSubscription(connectionDo, clientAKey, "sub-a");
+    addRealtimeTestSubscription(connectionDo, clientBKey, "sub-b");
 
     const response = await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
-          connectionKey: "client:client-a",
+          connectionKey: clientAKey,
           deliveries: [
             {
               result: [{ text: "only-a" }],
@@ -4531,6 +4579,7 @@ describe("worker runtime", () => {
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
           headers: {
+            authorization: "Bearer owner-a",
             upgrade: "websocket",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
@@ -4544,11 +4593,19 @@ describe("worker runtime", () => {
     client.addEventListener("message", (event) => {
       clientMessages.push(JSON.parse(String(event.data)) as unknown);
     });
+    const [connectionKey] = [
+      ...getRealtimeSocketTestState(connectionDo).socketStates.values(),
+    ].map(({ attachment }) => attachment.connectionKey);
+    if (!connectionKey) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    addRealtimeTestSubscription(connectionDo, connectionKey, "sub-a");
+    addRealtimeTestSubscription(connectionDo, connectionKey, "sub-b");
 
     const batchResponse = await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
-          connectionKey: "client:client-a",
+          connectionKey,
           deliveries: [
             {
               result: [{ text: "first" }],
@@ -4615,7 +4672,13 @@ describe("worker runtime", () => {
     } as unknown as WebSocket;
     getRealtimeSocketRegistry(connectionDo).add(
       socket as unknown as RuntimeWebSocket,
-      realtimeSocketAttachment({ connectionKey: "client-a" })
+      realtimeSocketAttachment({
+        connectionKey: "client-a",
+        subscriptions: [
+          realtimeSocketSubscription("sub-a"),
+          realtimeSocketSubscription("sub-b"),
+        ],
+      })
     );
 
     const response = await connectionDo.fetch(
@@ -4687,6 +4750,7 @@ describe("worker runtime", () => {
         "https://baseflare.internal/api/subscribe?clientId=client-a",
         {
           headers: {
+            authorization: "Bearer owner-a",
             upgrade: "websocket",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
@@ -4697,15 +4761,21 @@ describe("worker runtime", () => {
     const client = (response as Response & { readonly webSocket?: WebSocket })
       .webSocket as WebSocket & { accept?: () => void };
     client.accept?.();
+    const internals = getRealtimeSocketTestState(connectionDo);
+    const [connectionKey] = [...internals.socketStates.values()].map(
+      ({ attachment }) => attachment.connectionKey
+    );
+    if (!connectionKey) {
+      throw new Error("Expected accepted realtime socket");
+    }
 
     const connectedResponse = await connectionDo.fetch(
       new Request("https://baseflare.internal/has-sockets", {
-        body: JSON.stringify({ connectionKey: "client:client-a" }),
+        body: JSON.stringify({ connectionKey }),
         headers: { "content-type": "application/json" },
         method: "POST",
       })
     );
-    const internals = getRealtimeSocketTestState(connectionDo);
     const [server] = Array.from(internals.sockets);
     if (!server) {
       throw new Error("Expected accepted realtime socket");
@@ -4715,7 +4785,7 @@ describe("worker runtime", () => {
 
     const disconnectedResponse = await connectionDo.fetch(
       new Request("https://baseflare.internal/has-sockets", {
-        body: JSON.stringify({ connectionKey: "client:client-a" }),
+        body: JSON.stringify({ connectionKey }),
         headers: { "content-type": "application/json" },
         method: "POST",
       })
@@ -4730,7 +4800,7 @@ describe("worker runtime", () => {
     expect(connectedBody.connected).toBe(true);
     expect(disconnectedBody.connected).toBe(false);
     expect(internals.sockets.size).toBe(0);
-    expect(internals.socketsByConnectionKey.has("client:client-a")).toBe(false);
+    expect(internals.socketsByConnectionKey.has(connectionKey)).toBe(false);
   });
 
   it("does not expose placeholder realtime reconcile behavior", async () => {
@@ -4764,6 +4834,32 @@ describe("worker runtime", () => {
       )
     ).rejects.toThrow("runtime id");
     expect(state.acceptedSockets).toHaveLength(0);
+  });
+
+  it("rejects oversized realtime WebSocket frames before parsing", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const sentMessages: unknown[] = [];
+    const socket = {
+      send(payload: string) {
+        sentMessages.push(JSON.parse(payload) as unknown);
+      },
+    } as unknown as RuntimeWebSocket;
+
+    await connectionDo.webSocketMessage(
+      socket,
+      "x".repeat(REALTIME_MAX_MESSAGE_BYTES + 1)
+    );
+
+    expect(sentMessages).toEqual([
+      {
+        error: `Realtime messages must be at most ${REALTIME_MAX_MESSAGE_BYTES} bytes`,
+        type: "error",
+      },
+    ]);
   });
 
   it("isolates anonymous realtime sockets from each other", async () => {
@@ -4812,6 +4908,10 @@ describe("worker runtime", () => {
     expect(clientAKey).toMatch(/^anonymous:/);
     expect(clientBKey).toMatch(/^anonymous:/);
     expect(clientAKey).not.toBe(clientBKey);
+    if (!clientAKey) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    addRealtimeTestSubscription(connectionDo, clientAKey, "sub-a");
 
     const response = await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
@@ -5184,6 +5284,7 @@ describe("worker runtime", () => {
           "https://baseflare.internal/api/subscribe?clientId=shared-client",
           {
             headers: {
+              authorization: "Bearer owner-a",
               upgrade: "websocket",
               "x-baseflare-realtime-runtime-id": "runtime:1",
             },
@@ -5205,11 +5306,18 @@ describe("worker runtime", () => {
     clientB.addEventListener("message", (event) => {
       clientBMessages.push(JSON.parse(String(event.data)) as unknown);
     });
+    const [connectionKey] = [
+      ...getRealtimeSocketTestState(connectionDo).socketStates.values(),
+    ].map(({ attachment }) => attachment.connectionKey);
+    if (!connectionKey) {
+      throw new Error("Expected accepted realtime socket");
+    }
+    addRealtimeTestSubscription(connectionDo, connectionKey, "sub-shared");
 
     const response = await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
-          connectionKey: "client:shared-client",
+          connectionKey,
           deliveries: [
             { result: [{ text: "shared" }], subscriptionId: "sub-shared" },
           ],
@@ -5226,6 +5334,69 @@ describe("worker runtime", () => {
     expect(clientBMessages).toHaveLength(1);
   });
 
+  it("isolates the same realtime client id across authorization contexts", async () => {
+    const connectionDo = new RealtimeConnectionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const ownerAMessages: unknown[] = [];
+    const ownerBMessages: unknown[] = [];
+    const openSocket = async (ownerToken: string) => {
+      const response = await connectionDo.fetch(
+        new Request(
+          "https://baseflare.internal/api/subscribe?clientId=shared-client",
+          {
+            headers: {
+              authorization: `Bearer ${ownerToken}`,
+              upgrade: "websocket",
+              "x-baseflare-realtime-runtime-id": "runtime:1",
+            },
+            method: "GET",
+          }
+        )
+      );
+      const client = (response as Response & { readonly webSocket?: WebSocket })
+        .webSocket as WebSocket & { accept?: () => void };
+      client.accept?.();
+      return client;
+    };
+    const ownerA = await openSocket("owner-a");
+    const ownerB = await openSocket("owner-b");
+    ownerA.addEventListener("message", (event) => {
+      ownerAMessages.push(JSON.parse(String(event.data)) as unknown);
+    });
+    ownerB.addEventListener("message", (event) => {
+      ownerBMessages.push(JSON.parse(String(event.data)) as unknown);
+    });
+    const [ownerAKey, ownerBKey] = [
+      ...getRealtimeSocketTestState(connectionDo).socketStates.values(),
+    ].map(({ attachment }) => attachment.connectionKey);
+    if (!(ownerAKey && ownerBKey)) {
+      throw new Error("Expected accepted realtime sockets");
+    }
+    expect(ownerAKey).not.toBe(ownerBKey);
+    addRealtimeTestSubscription(connectionDo, ownerAKey, "sub-a");
+    addRealtimeTestSubscription(connectionDo, ownerBKey, "sub-a");
+
+    await connectionDo.fetch(
+      new Request("https://baseflare.internal/deliver", {
+        body: JSON.stringify({
+          connectionKey: ownerAKey,
+          deliveries: [
+            { result: [{ text: "owner-a-only" }], subscriptionId: "sub-a" },
+          ],
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(ownerAMessages).toHaveLength(1);
+    expect(ownerBMessages).toEqual([]);
+  });
+
   it("keeps realtime client and session identifiers in separate connection namespaces", async () => {
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
@@ -5238,6 +5409,7 @@ describe("worker runtime", () => {
       const response = await connectionDo.fetch(
         new Request(`https://baseflare.internal/api/subscribe?${query}`, {
           headers: {
+            authorization: "Bearer owner-a",
             upgrade: "websocket",
             "x-baseflare-realtime-runtime-id": "runtime:1",
           },
@@ -5257,11 +5429,21 @@ describe("worker runtime", () => {
     sessionIdSocket.addEventListener("message", (event) => {
       sessionIdMessages.push(JSON.parse(String(event.data)) as unknown);
     });
+    const [clientKey, sessionKey] = [
+      ...getRealtimeSocketTestState(connectionDo).socketStates.values(),
+    ].map(({ attachment }) => attachment.connectionKey);
+    if (!(clientKey && sessionKey)) {
+      throw new Error("Expected accepted realtime sockets");
+    }
+    expect(clientKey).toMatch(/^client:[0-9a-f]{64}$/);
+    expect(sessionKey).toMatch(/^session:[0-9a-f]{64}$/);
+    addRealtimeTestSubscription(connectionDo, clientKey, "sub-client");
+    addRealtimeTestSubscription(connectionDo, sessionKey, "sub-session");
 
     await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
-          connectionKey: "client:same",
+          connectionKey: clientKey,
           deliveries: [
             { result: [{ text: "client-only" }], subscriptionId: "sub-client" },
           ],
@@ -5273,7 +5455,7 @@ describe("worker runtime", () => {
     await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
-          connectionKey: "session:same",
+          connectionKey: sessionKey,
           deliveries: [
             {
               result: [{ text: "session-only" }],
@@ -5330,12 +5512,14 @@ describe("worker runtime", () => {
       realtimeSocketAttachment({
         authorizationHeader: "Bearer owner-a",
         connectionKey: "client-a",
+        subscriptions: [realtimeSocketSubscription("sub-a")],
       })
     );
     registry.add(
       activeSocket as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
         connectionKey: "client-a",
+        subscriptions: [realtimeSocketSubscription("sub-a")],
       })
     );
     const internals = getRealtimeSocketTestState(connectionDo);
@@ -5464,11 +5648,16 @@ describe("worker runtime", () => {
 
     expect(registerRequests).toHaveLength(1);
     expect(state.alarmTime).toBeTypeOf("number");
-    expect(state.attachments.get(socket)).toEqual(
+    const attachment = state.attachments.get(
+      socket
+    ) as RealtimeSocketAttachment;
+    expect(attachment.connectionKey).toMatch(/^client:[0-9a-f]{64}$/);
+    expect(attachment.connectionName).toBe(
+      getRealtimeConnectionShardName(attachment.connectionKey)
+    );
+    expect(attachment).toEqual(
       expect.objectContaining({
         authorizationHeader: "Bearer owner-a",
-        connectionKey: "client:client-a",
-        connectionName: getRealtimeConnectionShardName("client:client-a"),
         latestDeliveredOutboxSequence: null,
         runtimeId: "runtime:1",
         subscriptions: [
@@ -5609,10 +5798,13 @@ describe("worker runtime", () => {
         type: "subscribe",
       })
     );
+    const restoredAttachment = state.attachments.get(
+      socket
+    ) as RealtimeSocketAttachment;
     await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
-          connectionKey: "client:client-a",
+          connectionKey: restoredAttachment.connectionKey,
           deliveries: [{ result: [], sequence: 42, subscriptionId: "sub-a" }],
         }),
         headers: { "content-type": "application/json" },
@@ -5649,7 +5841,7 @@ describe("worker runtime", () => {
       expect.arrayContaining([
         expect.objectContaining({
           body: expect.objectContaining({
-            connectionKey: "client:client-a",
+            connectionKey: restoredAttachment.connectionKey,
             epoch: 2,
             queryName: "todos:list",
             runtimeId: "runtime:1",
@@ -5659,7 +5851,7 @@ describe("worker runtime", () => {
         }),
         expect.objectContaining({
           body: expect.objectContaining({
-            connectionKey: "client:client-a",
+            connectionKey: restoredAttachment.connectionKey,
             epoch: 3,
             queryName: "todos:list",
             runtimeId: "runtime:1",
@@ -5840,10 +6032,13 @@ describe("worker runtime", () => {
         type: "subscribe",
       })
     );
+    const attachment = state.attachments.get(
+      socket
+    ) as RealtimeSocketAttachment;
     await connectionDo.fetch(
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
-          connectionKey: "client:client-a",
+          connectionKey: attachment.connectionKey,
           deliveries: [{ result: [], sequence: 42, subscriptionId: "sub-a" }],
         }),
         headers: { "content-type": "application/json" },
@@ -5862,7 +6057,7 @@ describe("worker runtime", () => {
     ]);
   });
 
-  it("includes every active-generation shard in realtime reconciliation catch-up", async () => {
+  it("does not fan out reconciliation catch-up to unrelated active-generation shards", async () => {
     await env.APP_DB.prepare(
       "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
     )
@@ -5873,10 +6068,14 @@ describe("worker runtime", () => {
     )
       .bind(Date.now())
       .run();
-    const activeShardNames = getRealtimeSubscriptionShardNames({
+    const activeGeneration = {
       generationId: 2,
       subscriptionShardCount: 2,
-    });
+    };
+    const activeGlobalShardName = getRealtimeSubscriptionShardName(
+      createRealtimeGlobalSubscriptionRouteTarget(),
+      activeGeneration
+    );
     const state = new FakeRealtimeDurableObjectState();
     const catchUpShardNames: string[] = [];
     const connectionDo = new RealtimeConnectionDO(state, {
@@ -5927,7 +6126,7 @@ describe("worker runtime", () => {
     catchUpShardNames.length = 0;
     await connectionDo.alarm();
 
-    expect(catchUpShardNames.sort()).toEqual([...activeShardNames].sort());
+    expect(catchUpShardNames.sort()).toEqual([activeGlobalShardName]);
   });
 
   it("logs and counts hibernation subscription restore failures", async () => {
@@ -7567,11 +7766,17 @@ describe("worker runtime", () => {
     for (let attempt = 0; attempt < 20 && messages.length < 1; attempt += 1) {
       await new Promise((resolve) => setTimeout(resolve, 5));
     }
+    const [connectionKey] = [
+      ...getRealtimeSocketTestState(connectionDo).socketStates.values(),
+    ].map(({ attachment }) => attachment.connectionKey);
+    if (!connectionKey) {
+      throw new Error("Expected accepted realtime socket");
+    }
 
     await connectionDo.fetch(
       new Request("https://baseflare.internal/subscription-moved", {
         body: JSON.stringify({
-          connectionKey: "client:client-a",
+          connectionKey,
           subscriptionId: "sub-a",
           subscriptionShardName: "subscription:g2:7",
         }),
@@ -7804,12 +8009,8 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: unknown[];
     };
@@ -8201,12 +8402,8 @@ describe("worker runtime", () => {
     expect(body.events[0]?.sequence).toBeTypeOf("number");
     expect(body.events[0]?.tables).toEqual(["todos"]);
 
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -8366,7 +8563,13 @@ describe("worker runtime", () => {
       ok: boolean;
     };
 
-    expect(body).toEqual({ evaluated: 0, events: [], failed: 0, ok: true });
+    expect(body).toEqual({
+      evaluated: 0,
+      events: [],
+      failed: 0,
+      latestSequence: null,
+      ok: true,
+    });
     expect(connections.requests).toHaveLength(0);
   });
 
@@ -8453,12 +8656,8 @@ describe("worker runtime", () => {
       latestSequence
     );
 
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -9068,12 +9267,8 @@ describe("worker runtime", () => {
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
         if (new URL(request.url).pathname === "/deliver") {
-          const registrationsResponse = await subscriptionDo.fetch(
-            new Request("https://baseflare.internal/registrations", {
-              body: "{}",
-              method: "POST",
-            })
-          );
+          const registrationsResponse =
+            await fetchRealtimeRegistrations(subscriptionDo);
           const registrationsBody = (await registrationsResponse.json()) as {
             lastProcessedOutboxSequence: number | null;
           };
@@ -9119,12 +9314,8 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -9639,6 +9830,95 @@ describe("worker runtime", () => {
 
     expect(await response.json()).toEqual({
       evaluated: 2,
+      failed: 0,
+      ok: true,
+    });
+    expect(realtimeDependencyTrackingQueryCalls).toBe(1);
+    expect(deliveredSubscriptionIds).toEqual(["sub-a", "sub-b"]);
+  });
+
+  it("replays stored active-query results to stale subscribers without rerunning the query", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const deliveredSubscriptionIds: string[] = [];
+    let deliveryAttempt = 0;
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliveryAttempt += 1;
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        const deliveredSubscriptions =
+          deliveryAttempt === 1
+            ? items
+                .map((item) => item.subscriptionId)
+                .filter((subscriptionId) => subscriptionId === "sub-a")
+            : items.map((item) => item.subscriptionId);
+        deliveredSubscriptionIds.push(...deliveredSubscriptions);
+        return Response.json({
+          delivered: deliveredSubscriptions.length,
+          deliveredSubscriptions,
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    for (const subscriptionId of ["sub-a", "sub-b"]) {
+      await subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { mode: "partition-todos", ownerToken: "owner-a" },
+            authorizationHeader: "Bearer owner-a",
+            connectionKey: "client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt: Date.now() + 60_000,
+            queryName: "realtime:dependencyTracking",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    }
+    await createTodoViaRpc("owner-a", "stored-replay");
+    await createRealtimeOutboxEvent("stored-replay-first", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "stored-replay-first" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const subB = getRealtimeIndexTestState(subscriptionDo).registrations.get(
+      realtimeRegistrationKey("client-a", "sub-b")
+    );
+    if (!subB) {
+      throw new Error("Expected sub-b registration");
+    }
+    subB.reEvaluationRetryAt = Date.now() - 1;
+    await createRealtimeOutboxEvent("stored-replay-second", Date.now(), {
+      bumpVersions: false,
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    const replayResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "stored-replay-second" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(await replayResponse.json()).toEqual({
+      evaluated: 1,
       failed: 0,
       ok: true,
     });
@@ -10835,12 +11115,8 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const body = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -10868,12 +11144,8 @@ describe("worker runtime", () => {
     const connections = new FakeDurableObjectNamespace(
       async (_name, request) => {
         if (new URL(request.url).pathname === "/deliver") {
-          const registrationsResponse = await subscriptionDo.fetch(
-            new Request("https://baseflare.internal/registrations", {
-              body: "{}",
-              method: "POST",
-            })
-          );
+          const registrationsResponse =
+            await fetchRealtimeRegistrations(subscriptionDo);
           const registrationsBody = (await registrationsResponse.json()) as {
             lastProcessedOutboxSequence: number | null;
           };
@@ -10919,12 +11191,8 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -11169,12 +11437,8 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -11253,12 +11517,8 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -11346,12 +11606,8 @@ describe("worker runtime", () => {
       failed: number;
       recoveredByFullReevaluation: boolean;
     };
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -11416,12 +11672,8 @@ describe("worker runtime", () => {
     await notify("newer-event");
     await notify("older-event");
 
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const body = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -11475,12 +11727,8 @@ describe("worker runtime", () => {
       })
     );
 
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const body = (await registrationsResponse.json()) as {
       lastProcessedOutboxSequence: number | null;
     };
@@ -11519,12 +11767,7 @@ describe("worker runtime", () => {
 
     await register(2, "todos:new", Date.now() + 60_000);
     await register(1, "todos:stale", Date.now() + 60_000);
-    let response = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    let response = await fetchRealtimeRegistrations(subscriptionDo);
     let body = (await response.json()) as {
       registrations: Array<{ queryName: string }>;
     };
@@ -11534,12 +11777,7 @@ describe("worker runtime", () => {
     ).toEqual(["todos:new"]);
 
     await register(3, "todos:expired", Date.now() - 1);
-    response = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    response = await fetchRealtimeRegistrations(subscriptionDo);
     body = (await response.json()) as {
       registrations: Array<{ queryName: string }>;
     };
@@ -11577,12 +11815,7 @@ describe("worker runtime", () => {
     await register("client-a", "todos:a");
     await register("client-b", "todos:b");
 
-    let response = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    let response = await fetchRealtimeRegistrations(subscriptionDo);
     let body = (await response.json()) as {
       registrations: Array<{ connectionKey: string; queryName: string }>;
     };
@@ -11609,12 +11842,7 @@ describe("worker runtime", () => {
     );
     expect(response.status).toBe(200);
 
-    response = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    response = await fetchRealtimeRegistrations(subscriptionDo);
     body = (await response.json()) as {
       registrations: Array<{ connectionKey: string; queryName: string }>;
     };
@@ -12992,12 +13220,8 @@ describe("worker runtime", () => {
     };
 
     expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: Array<{ leaseExpiresAt: number }>;
     };
@@ -13134,12 +13358,8 @@ describe("worker runtime", () => {
     };
 
     expect(body).toEqual({ evaluated: 0, failed: 1, ok: true });
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: unknown[];
     };
@@ -13437,11 +13657,8 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    const registrationsResponse = await reloadedSubscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
+    const registrationsResponse = await fetchRealtimeRegistrations(
+      reloadedSubscriptionDo
     );
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: Array<{
@@ -13583,12 +13800,7 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    await reloadedSubscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    await fetchRealtimeRegistrations(reloadedSubscriptionDo);
     const reloadedState = getRealtimeIndexTestState(reloadedSubscriptionDo);
     const reloadedSubA = reloadedState.registrations.get(
       realtimeRegistrationKey("client-a", "sub-a")
@@ -13750,12 +13962,8 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: Array<{
         reEvaluationRetryAt?: number;
@@ -13823,12 +14031,8 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: unknown[];
     };
@@ -13879,12 +14083,8 @@ describe("worker runtime", () => {
       failed: number;
       ok: boolean;
     };
-    const registrationsResponse = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/registrations", {
-        body: "{}",
-        method: "POST",
-      })
-    );
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
     const registrationsBody = (await registrationsResponse.json()) as {
       registrations: unknown[];
     };

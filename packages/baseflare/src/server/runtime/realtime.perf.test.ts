@@ -131,6 +131,18 @@ function createRealtimeRuntimeId(): string {
   });
 }
 
+function getRealtimeRegistrationCount(
+  subscriptionDo: RealtimeSubscriptionDO
+): number {
+  return (
+    subscriptionDo as unknown as {
+      registrationStore: {
+        snapshotForTest(): { registrations: Map<string, unknown> };
+      };
+    }
+  ).registrationStore.snapshotForTest().registrations.size;
+}
+
 async function createRealtimeOutboxEvent(
   eventId: string,
   ownerToken: string
@@ -245,16 +257,9 @@ describe("realtime local performance gate", () => {
     }
 
     const registrationCounts = await Promise.all(
-      subscriptionDos.map(async (subscriptionDo) => {
-        const response = await subscriptionDo.fetch(
-          new Request("https://baseflare.internal/registrations", {
-            body: "{}",
-            method: "POST",
-          })
-        );
-        const body = (await response.json()) as { registrations: unknown[] };
-        return body.registrations.length;
-      })
+      subscriptionDos.map((subscriptionDo) =>
+        getRealtimeRegistrationCount(subscriptionDo)
+      )
     );
 
     expect(registrationCounts.reduce((total, count) => total + count, 0)).toBe(
