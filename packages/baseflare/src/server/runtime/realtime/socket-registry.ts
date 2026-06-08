@@ -261,6 +261,37 @@ export class RealtimeSocketRegistry {
     );
   }
 
+  updateDeliveredSequencesForReconciledShards(
+    latestSequencesByShard: ReadonlyMap<string, number>,
+    failedShards: ReadonlySet<string>
+  ): void {
+    for (const socket of this.sockets) {
+      const attachment = this.getAttachment(socket);
+      if (!attachment) {
+        continue;
+      }
+
+      const subscribedShards = new Set(
+        attachment.subscriptions
+          .map((subscription) => subscription.subscriptionShardName)
+          .filter((shardName): shardName is string => Boolean(shardName))
+      );
+      if (
+        subscribedShards.size === 0 ||
+        [...subscribedShards].some((shardName) => failedShards.has(shardName))
+      ) {
+        continue;
+      }
+
+      const sequences = [...subscribedShards]
+        .map((shardName) => latestSequencesByShard.get(shardName))
+        .filter((sequence): sequence is number => typeof sequence === "number");
+      if (sequences.length > 0) {
+        this.updateDeliveredSequence(socket, Math.min(...sequences));
+      }
+    }
+  }
+
   attachedSubscriptions(): Array<{
     readonly attachment: RealtimeSocketAttachment;
     readonly subscription: RealtimeSocketSubscription;

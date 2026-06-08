@@ -47,6 +47,20 @@ declare const WebSocketPair: {
   new (): { readonly 0: WebSocket; readonly 1: RuntimeWebSocket };
 };
 
+interface RealtimeReconciliationFailure {
+  readonly errorName: string;
+  readonly message?: string;
+  readonly shardName: string;
+  readonly status?: number;
+}
+
+interface RealtimeReconciliationSummary {
+  readonly attempted: number;
+  readonly failed: readonly RealtimeReconciliationFailure[];
+  readonly latestSequencesByShard: ReadonlyMap<string, number>;
+  readonly succeeded: number;
+}
+
 export async function routeRealtimeSubscribe(
   request: Request,
   env: BaseflareRuntimeEnv,
@@ -625,17 +639,9 @@ export class RealtimeConnectionDO {
     this.hasPendingHibernationRestoreRetry = rejected > 0;
     let catchUpFailed = false;
     if (options.reconcileAfterRestore && accepted > 0) {
-      try {
-        await this.catchUpActiveSubscriptions();
-      } catch (error) {
-        catchUpFailed = true;
-        logRuntimeEvent("error", "runtime.realtime_reconciliation_failed", {
-          errorName: error instanceof Error ? error.name : typeof error,
-        });
-        emitRealtimeMetric(REALTIME_RECONCILIATIONS_METRIC, 1, {
-          result: "failed",
-        });
-      }
+      const summary = await this.catchUpActiveSubscriptions();
+      catchUpFailed = summary.failed.length > 0;
+      this.emitReconciliationSummary(summary);
     }
     if (rejected > 0 || catchUpFailed) {
       await this.scheduleReconciliation();
@@ -836,16 +842,15 @@ export class RealtimeConnectionDO {
         });
         if (restoreResult.rejected > 0) {
           if (restoreResult.accepted > 0) {
-            await this.catchUpActiveSubscriptions();
+            const summary = await this.catchUpActiveSubscriptions();
+            this.emitReconciliationSummary(summary);
           }
           await this.scheduleReconciliation();
           return;
         }
       }
-      await this.catchUpActiveSubscriptions();
-      emitRealtimeMetric(REALTIME_RECONCILIATIONS_METRIC, 1, {
-        result: "reconciled",
-      });
+      const summary = await this.catchUpActiveSubscriptions();
+      this.emitReconciliationSummary(summary);
     } catch (error) {
       logRuntimeEvent("error", "runtime.realtime_reconciliation_failed", {
         errorName: error instanceof Error ? error.name : typeof error,
@@ -858,7 +863,7 @@ export class RealtimeConnectionDO {
     await this.scheduleReconciliation();
   }
 
-  private async catchUpActiveSubscriptions(): Promise<void> {
+  private async catchUpActiveSubscriptions(): Promise<RealtimeReconciliationSummary> {
     const targets = await this.reconciliationCatchUpTargets();
     const reconciliationSession = this.env.APP_DB.withSession?.(
       "first-unconstrained"
@@ -880,36 +885,143 @@ export class RealtimeConnectionDO {
             }
           );
           if (!response.ok) {
-            throw new InternalRuntimeError(
-              `Realtime reconciliation failed for shard ${target.shardName} with status ${response.status}`
-            );
+            return {
+              failed: {
+                errorName: "InternalRuntimeError",
+                message: `Realtime reconciliation failed for shard ${target.shardName} with status ${response.status}`,
+                shardName: target.shardName,
+                status: response.status,
+              },
+            };
           }
+          return {
+            latestSequence: await this.readCatchUpLatestSequence(response),
+            shardName: target.shardName,
+          };
         } catch (error) {
-          if (
-            error instanceof Error &&
-            error.message.includes(target.shardName)
-          ) {
-            throw error;
-          }
-
-          throw new InternalRuntimeError(
-            `Realtime reconciliation failed for shard ${target.shardName}: ${
-              error instanceof Error ? error.message : "unknown error"
-            }`
-          );
+          return {
+            failed: {
+              errorName: error instanceof Error ? error.name : typeof error,
+              message: `Realtime reconciliation failed for shard ${
+                target.shardName
+              }: ${error instanceof Error ? error.message : "unknown error"}`,
+              shardName: target.shardName,
+            },
+          };
         }
       })
     );
-    const failedCount = results.filter(
-      (result) => result.status === "rejected"
-    ).length;
-    if (failedCount > 0) {
-      throw new InternalRuntimeError(
-        `Realtime reconciliation failed for ${failedCount} shard${
-          failedCount === 1 ? "" : "s"
-        }`
-      );
+    const failed: RealtimeReconciliationFailure[] = [];
+    const latestSequencesByShard = new Map<string, number>();
+    for (const [index, result] of results.entries()) {
+      const target = targets.at(index);
+      if (!target) {
+        continue;
+      }
+
+      if (result.status === "rejected") {
+        failed.push({
+          errorName:
+            result.reason instanceof Error ? result.reason.name : "unknown",
+          message: `Realtime reconciliation failed for shard ${
+            target.shardName
+          }: ${
+            result.reason instanceof Error
+              ? result.reason.message
+              : "unknown error"
+          }`,
+          shardName: target.shardName,
+        });
+        continue;
+      }
+
+      if ("failed" in result.value) {
+        const failure = result.value.failed;
+        if (failure) {
+          failed.push(failure);
+        }
+        continue;
+      }
+
+      if (result.value.latestSequence !== null) {
+        latestSequencesByShard.set(
+          result.value.shardName,
+          result.value.latestSequence
+        );
+      }
     }
+
+    return {
+      attempted: targets.length,
+      failed,
+      latestSequencesByShard,
+      succeeded: targets.length - failed.length,
+    };
+  }
+
+  private async readCatchUpLatestSequence(
+    response: Response
+  ): Promise<number | null> {
+    try {
+      const body = (await response.json()) as { readonly events?: unknown };
+      if (!Array.isArray(body.events)) {
+        return null;
+      }
+
+      let latestSequence: number | null = null;
+      for (const event of body.events) {
+        if (
+          typeof event === "object" &&
+          event !== null &&
+          "sequence" in event &&
+          Number.isSafeInteger(event.sequence)
+        ) {
+          latestSequence =
+            latestSequence === null
+              ? (event.sequence as number)
+              : Math.max(latestSequence, event.sequence as number);
+        }
+      }
+      return latestSequence;
+    } catch {
+      return null;
+    }
+  }
+
+  private emitReconciliationSummary(
+    summary: RealtimeReconciliationSummary
+  ): void {
+    this.socketRegistry.updateDeliveredSequencesForReconciledShards(
+      summary.latestSequencesByShard,
+      new Set(summary.failed.map((failure) => failure.shardName))
+    );
+
+    if (summary.failed.length > 0) {
+      logRuntimeEvent("error", "runtime.realtime_reconciliation_failed", {
+        attempted: summary.attempted,
+        failedCount: summary.failed.length,
+        failedShards: summary.failed.map((failure) => failure.shardName),
+        statuses: summary.failed
+          .map((failure) => failure.status)
+          .filter((status): status is number => typeof status === "number"),
+        succeeded: summary.succeeded,
+      });
+    }
+
+    const metricResult = this.reconciliationMetricResult(summary);
+    emitRealtimeMetric(REALTIME_RECONCILIATIONS_METRIC, 1, {
+      result: metricResult,
+    });
+  }
+
+  private reconciliationMetricResult(
+    summary: RealtimeReconciliationSummary
+  ): "failed" | "partial" | "reconciled" {
+    if (summary.failed.length === 0) {
+      return "reconciled";
+    }
+
+    return summary.succeeded > 0 ? "partial" : "failed";
   }
 
   private async reconciliationCatchUpTargets(): Promise<

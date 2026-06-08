@@ -1152,8 +1152,21 @@ export class RealtimeSubscriptionDO {
   }> {
     const startedAt = Date.now();
     this.deliveryBatchAttemptsSinceAutoscale += 1;
+    let result: RealtimeDeliveryResult;
     try {
-      const result = await this.deliverPendingGroup(group);
+      result = await this.deliverPendingGroup(group);
+    } catch (error) {
+      this.deliveryBatchFailuresSinceAutoscale += 1;
+      await Promise.allSettled(
+        group.deliveries.map((delivery) =>
+          this.recoverFailedDeliveryRegistration(delivery, error)
+        )
+      );
+      this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
+      return { evaluated: 0, failed: group.deliveries.length };
+    }
+
+    try {
       const groupSubscriptionIds = new Set(
         group.deliveries.map((delivery) => delivery.registration.subscriptionId)
       );
@@ -1169,40 +1182,34 @@ export class RealtimeSubscriptionDO {
       if (!(deliveredAll || noTargetSockets)) {
         this.deliveryBatchFailuresSinceAutoscale += 1;
       }
+
+      let evaluated = 0;
+      let failed = 0;
       const stateUpdates: Promise<void>[] = [];
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
-          const deleted = await this.registrationStore.deleteExpired(
-            delivery.registration
-          );
-          if (!(deleted || noTargetSockets)) {
-            await this.registrationStore.markBackedOff(delivery.registration);
-          }
+          failed += 1;
+          await this.handleUndeliveredRegistration(delivery, noTargetSockets);
           continue;
         }
 
-        await this.registrationStore.markDelivered(
-          delivery.registration,
-          delivery.resultJson,
-          leaseExpiresAt
-        );
-        stateUpdates.push(this.updateDeliveredRegistrationState(delivery));
+        try {
+          await this.registrationStore.markDelivered(
+            delivery.registration,
+            delivery.resultJson,
+            leaseExpiresAt
+          );
+          evaluated += 1;
+          stateUpdates.push(this.updateDeliveredRegistrationState(delivery));
+        } catch (error) {
+          failed += 1;
+          await this.recoverFailedDeliveryRegistration(delivery, error);
+          this.logRegistrationStateUpdateFailure(delivery.registration, error);
+        }
       }
       await Promise.allSettled(stateUpdates);
       this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
-      return {
-        evaluated: deliveredSubscriptions.size,
-        failed: group.deliveries.length - deliveredSubscriptions.size,
-      };
-    } catch (error) {
-      this.deliveryBatchFailuresSinceAutoscale += 1;
-      await Promise.allSettled(
-        group.deliveries.map((delivery) =>
-          this.recoverFailedDeliveryRegistration(delivery, error)
-        )
-      );
-      this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
-      return { evaluated: 0, failed: group.deliveries.length };
+      return { evaluated, failed };
     } finally {
       for (const delivery of group.deliveries) {
         this.reEvaluatingRegistrations.delete(
@@ -1212,6 +1219,22 @@ export class RealtimeSubscriptionDO {
           )
         );
       }
+    }
+  }
+
+  private async handleUndeliveredRegistration(
+    delivery: PendingRealtimeDelivery,
+    noTargetSockets: boolean
+  ): Promise<void> {
+    try {
+      const deleted = await this.registrationStore.deleteExpired(
+        delivery.registration
+      );
+      if (!(deleted || noTargetSockets)) {
+        await this.registrationStore.markBackedOff(delivery.registration);
+      }
+    } catch (error) {
+      this.logRegistrationStateUpdateFailure(delivery.registration, error);
     }
   }
 
@@ -1259,17 +1282,24 @@ export class RealtimeSubscriptionDO {
       ) {
         await this.registrationStore.markBackedOff(delivery.registration);
       }
-      logRuntimeEvent(
-        "error",
-        "runtime.realtime_registration_state_update_failed",
-        {
-          connectionKey: delivery.registration.connectionKey,
-          errorName: error instanceof Error ? error.name : typeof error,
-          queryName: delivery.registration.queryName,
-          subscriptionId: delivery.registration.subscriptionId,
-        }
-      );
+      this.logRegistrationStateUpdateFailure(delivery.registration, error);
     }
+  }
+
+  private logRegistrationStateUpdateFailure(
+    registration: StoredRealtimeRegistration,
+    error: unknown
+  ): void {
+    logRuntimeEvent(
+      "error",
+      "runtime.realtime_registration_state_update_failed",
+      {
+        connectionKey: registration.connectionKey,
+        errorName: error instanceof Error ? error.name : typeof error,
+        queryName: registration.queryName,
+        subscriptionId: registration.subscriptionId,
+      }
+    );
   }
 
   private async deliverPendingGroup(
