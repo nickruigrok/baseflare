@@ -3524,12 +3524,12 @@ describe("worker runtime", () => {
     expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
     expect(
       activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
-    ).toBe(true);
+    ).toBe(false);
     expect(
       activeQueryState.activeQueryKeysByPartition
         .get(todoOwnerPartitionId("owner-a"))
         ?.has(activeQueryKey)
-    ).not.toBe(true);
+    ).toBe(true);
     expect(subscriptionPaths).toContain("/unregister");
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
@@ -3571,12 +3571,12 @@ describe("worker runtime", () => {
     expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
     expect(
       activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
-    ).toBe(true);
+    ).toBe(false);
     expect(
       activeQueryState.activeQueryKeysByPartition
         .get(todoOwnerPartitionId("owner-a"))
         ?.has(activeQueryKey)
-    ).not.toBe(true);
+    ).toBe(true);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -3621,12 +3621,12 @@ describe("worker runtime", () => {
     expect(registrations[0]?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
     expect(
       activeQueryState.activeQueryKeysWithoutDependencies.has(activeQueryKey)
-    ).toBe(true);
+    ).toBe(false);
     expect(
       activeQueryState.activeQueryKeysByPartition
         .get(todoOwnerPartitionId("owner-a"))
         ?.has(activeQueryKey)
-    ).not.toBe(true);
+    ).toBe(true);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -4057,6 +4057,121 @@ describe("worker runtime", () => {
         realtimeRegistrationKey("client-a", "sub-a")
       )
     ).toBe(false);
+  });
+
+  it("backs off expired unchanged realtime registrations when live lease renewal fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "stable-renewal-failure");
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/deliver") {
+          const body = (await request.json()) as {
+            deliveries: Array<{ subscriptionId: string }>;
+          };
+          return Response.json({
+            delivered: body.deliveries.length,
+            deliveredSubscriptions: body.deliveries.map(
+              (item) => item.subscriptionId
+            ),
+            ok: true,
+          });
+        }
+        if (path === "/has-sockets") {
+          return Response.json({ connected: true, ok: true });
+        }
+        return Response.json({ ok: true });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await createRealtimeOutboxEvent("stable-renewal-prime", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await notify("stable-renewal-prime");
+    const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
+    const registration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+    if (!registration) {
+      throw new Error("Expected realtime registration");
+    }
+    registration.leaseExpiresAt = Date.now() - 1;
+    const registrationStore = (
+      subscriptionDo as unknown as {
+        registrationStore: {
+          renewLease(): Promise<void>;
+        };
+      }
+    ).registrationStore;
+    const renewLease = vi
+      .spyOn(registrationStore, "renewLease")
+      .mockRejectedValueOnce(new Error("Storage put failed"));
+
+    await createRealtimeOutboxEvent("stable-renewal-failure", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    const failedResponse = await notify("stable-renewal-failure");
+    const failedBody = (await failedResponse.json()) as {
+      evaluated: number;
+      failed: number;
+      ok: boolean;
+    };
+    const retainedRegistration =
+      getRealtimeIndexTestState(subscriptionDo).registrations.get(
+        registrationKey
+      );
+
+    expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(renewLease).toHaveBeenCalledTimes(1);
+    expect(retainedRegistration).toBeDefined();
+    expect(retainedRegistration?.reEvaluationRetryAt).toBeGreaterThan(
+      Date.now()
+    );
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "Error",
+        event: "runtime.realtime_registration_re_evaluation_failed",
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+      })
+    );
   });
 
   it("preserves lastResultJson when adopting a migrated registration", async () => {
@@ -12924,7 +13039,23 @@ describe("worker runtime", () => {
     await register("sub-b");
     await createTodoViaRpc("owner-a", "batch-recovery-failure");
     await createRealtimeOutboxEvent("batch-recovery-failure-event");
-    state.failedStoragePuts = 1;
+    const registrationStore = (
+      subscriptionDo as unknown as {
+        registrationStore: {
+          markBackedOff(
+            registration: StoredRealtimeRegistration,
+            retryAt?: number
+          ): Promise<void>;
+        };
+      }
+    ).registrationStore;
+    const markBackedOff =
+      registrationStore.markBackedOff.bind(registrationStore);
+    vi.spyOn(registrationStore, "markBackedOff")
+      .mockRejectedValueOnce(new Error("Storage put failed"))
+      .mockImplementation((registration, retryAt) =>
+        markBackedOff(registration, retryAt)
+      );
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {
@@ -13038,7 +13169,24 @@ describe("worker runtime", () => {
     await register("sub-b");
     await createTodoViaRpc("owner-a", "delivered-state-isolated");
     await createRealtimeOutboxEvent("delivered-state-isolated-event");
-    state.failedStoragePuts = 1;
+    const registrationStore = (
+      subscriptionDo as unknown as {
+        registrationStore: {
+          markDelivered(
+            registration: StoredRealtimeRegistration,
+            lastResultJson: string,
+            leaseExpiresAt: number
+          ): Promise<void>;
+        };
+      }
+    ).registrationStore;
+    const markDelivered =
+      registrationStore.markDelivered.bind(registrationStore);
+    vi.spyOn(registrationStore, "markDelivered")
+      .mockRejectedValueOnce(new Error("Storage put failed"))
+      .mockImplementation((registration, lastResultJson, leaseExpiresAt) =>
+        markDelivered(registration, lastResultJson, leaseExpiresAt)
+      );
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/notify", {

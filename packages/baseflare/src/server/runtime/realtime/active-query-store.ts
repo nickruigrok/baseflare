@@ -10,7 +10,9 @@ import {
 import { listRealtimeStoragePrefix } from "./storage-list";
 import type {
   RealtimeAffectedTargets,
+  RealtimeDependencySet,
   RealtimeDurableObjectState,
+  RealtimeVersionSnapshot,
   StoredRealtimeActiveQuery,
   StoredRealtimeRegistration,
 } from "./types";
@@ -259,6 +261,28 @@ export class RealtimeActiveQueryStore {
     const nextActiveQuery = { ...activeQuery, reEvaluationRetryAt: retryAt };
     await this.persistByKey(activeQuery.key, nextActiveQuery);
     activeQuery.reEvaluationRetryAt = retryAt;
+  }
+
+  async markEvaluated(
+    activeQuery: StoredRealtimeActiveQuery,
+    resultJson: string,
+    dependencies: RealtimeDependencySet,
+    versionSnapshot: RealtimeVersionSnapshot
+  ): Promise<void> {
+    const nextActiveQuery = {
+      ...activeQuery,
+      dependencies,
+      lastResultJson: resultJson,
+      reEvaluationRetryAt: undefined,
+      versionSnapshot,
+    };
+    await this.persistByKey(activeQuery.key, nextActiveQuery);
+    this.removeFromIndexes(activeQuery.key, activeQuery);
+    activeQuery.dependencies = dependencies;
+    activeQuery.lastResultJson = resultJson;
+    activeQuery.reEvaluationRetryAt = undefined;
+    activeQuery.versionSnapshot = versionSnapshot;
+    this.addToIndexes(activeQuery.key, activeQuery);
   }
 
   async clearBackoff(activeQuery: StoredRealtimeActiveQuery): Promise<void> {

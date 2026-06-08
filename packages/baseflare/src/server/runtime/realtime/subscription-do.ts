@@ -870,6 +870,12 @@ export class RealtimeSubscriptionDO {
         activeQuery,
         database
       );
+      await this.activeQueryStore.markEvaluated(
+        activeQuery,
+        evaluation.resultJson,
+        evaluation.dependencies,
+        evaluation.versionSnapshot
+      );
       const result = await this.createActiveQueryDeliveries(
         activeQuery,
         registrations,
@@ -1064,17 +1070,9 @@ export class RealtimeSubscriptionDO {
       return { active: true, evaluated: 1, failed: 0, skipped: 0 };
     }
 
+    let isConnected: boolean;
     try {
-      if (await this.hasActiveConnectionSockets(registration)) {
-        await this.registrationStore.renewLease(
-          registration,
-          Date.now() + REALTIME_LEASE_MS
-        );
-        return { active: true, evaluated: 1, failed: 0, skipped: 0 };
-      }
-
-      await this.registrationStore.deleteExpired(registration);
-      return { active: false, evaluated: 1, failed: 0, skipped: 0 };
+      isConnected = await this.hasActiveConnectionSockets(registration);
     } catch (error) {
       const deleted = await this.registrationStore.deleteExpired(registration);
       if (!deleted) {
@@ -1082,6 +1080,23 @@ export class RealtimeSubscriptionDO {
       }
       this.logReEvaluationFailure(registration, error);
       return { active: !deleted, evaluated: 0, failed: 1, skipped: 0 };
+    }
+
+    if (!isConnected) {
+      await this.registrationStore.deleteExpired(registration);
+      return { active: false, evaluated: 1, failed: 0, skipped: 0 };
+    }
+
+    try {
+      await this.registrationStore.renewLease(
+        registration,
+        Date.now() + REALTIME_LEASE_MS
+      );
+      return { active: true, evaluated: 1, failed: 0, skipped: 0 };
+    } catch (error) {
+      await this.registrationStore.markBackedOff(registration);
+      this.logReEvaluationFailure(registration, error);
+      return { active: true, evaluated: 0, failed: 1, skipped: 0 };
     }
   }
 

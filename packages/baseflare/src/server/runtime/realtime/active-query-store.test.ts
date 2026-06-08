@@ -221,6 +221,115 @@ describe("RealtimeActiveQueryStore", () => {
     expect(activeQuery.lastResultJson).toBeUndefined();
   });
 
+  it("keeps evaluated state unchanged when evaluation persistence fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeActiveQueryStore(state);
+    await store.upsertFromRegistration(
+      registrationKey("sub-a"),
+      registration("sub-a", {
+        dependencies: dependencies(["todos"]),
+        lastResultJson: JSON.stringify([{ id: "old" }]),
+        versionSnapshot: versionSnapshot(["todos"]),
+      })
+    );
+    const activeQuery = store.values()[0];
+    if (!activeQuery) {
+      throw new Error("Expected active query");
+    }
+    state.failedStoragePuts = 1;
+
+    await expect(
+      store.markEvaluated(
+        activeQuery,
+        JSON.stringify([{ id: "new" }]),
+        dependencies(["labels"]),
+        versionSnapshot(["labels"])
+      )
+    ).rejects.toThrow("Storage put failed");
+
+    expect(activeQuery.lastResultJson).toBe(JSON.stringify([{ id: "old" }]));
+    expect(activeQuery.dependencies?.tables).toEqual(new Set(["todos"]));
+    expect(activeQuery.versionSnapshot?.tables).toEqual(
+      new Map([["todos", 1]])
+    );
+    expect(
+      store.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-todos",
+            partitions: [],
+            sequence: 1,
+            tables: ["todos"],
+          },
+        ])
+      )
+    ).toContain(activeQuery.key);
+    expect(
+      store.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-labels",
+            partitions: [],
+            sequence: 2,
+            tables: ["labels"],
+          },
+        ])
+      )
+    ).not.toContain(activeQuery.key);
+  });
+
+  it("persists evaluated state before updating memory and indexes", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeActiveQueryStore(state);
+    await store.upsertFromRegistration(
+      registrationKey("sub-a"),
+      registration("sub-a", {
+        dependencies: dependencies(["todos"]),
+        lastResultJson: JSON.stringify([{ id: "old" }]),
+        versionSnapshot: versionSnapshot(["todos"]),
+      })
+    );
+    const activeQuery = store.values()[0];
+    if (!activeQuery) {
+      throw new Error("Expected active query");
+    }
+
+    await store.markEvaluated(
+      activeQuery,
+      JSON.stringify([{ id: "new" }]),
+      dependencies(["labels"]),
+      versionSnapshot(["labels"])
+    );
+
+    const reloadedStore = new RealtimeActiveQueryStore(state);
+    await reloadedStore.loadOnce();
+    const reloadedActiveQuery = reloadedStore.get(activeQuery.key);
+
+    expect(activeQuery.lastResultJson).toBe(JSON.stringify([{ id: "new" }]));
+    expect(activeQuery.dependencies?.tables).toEqual(new Set(["labels"]));
+    expect(reloadedActiveQuery?.lastResultJson).toBe(
+      JSON.stringify([{ id: "new" }])
+    );
+    expect(reloadedActiveQuery?.dependencies?.tables).toEqual(
+      new Set(["labels"])
+    );
+    expect(
+      store.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-labels",
+            partitions: [],
+            sequence: 2,
+            tables: ["labels"],
+          },
+        ])
+      )
+    ).toContain(activeQuery.key);
+  });
+
   it("deletes empty active queries after the last member detaches", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeActiveQueryStore(state);
