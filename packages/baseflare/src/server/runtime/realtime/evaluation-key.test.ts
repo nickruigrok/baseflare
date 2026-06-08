@@ -8,7 +8,7 @@ function registration(
 ): StoredRealtimeRegistration {
   return {
     args: { filter: { done: false, ownerToken: "owner-a" } },
-    authorizationHeader: "Bearer owner-a",
+    authorizationFingerprint: "auth-owner-a",
     connectionKey: "client:client-a",
     connectionName: "connection:0",
     epoch: 1,
@@ -49,9 +49,9 @@ describe("realtime evaluation keys", () => {
   });
 
   it("keeps authorization contexts separate", async () => {
-    const first = registration({ authorizationHeader: "Bearer owner-a" });
+    const first = registration({ authorizationFingerprint: "auth-owner-a" });
     const second = registration({
-      authorizationHeader: "Bearer owner-b",
+      authorizationFingerprint: "auth-owner-b",
       connectionKey: "client:client-b",
       subscriptionId: "sub-b",
     });
@@ -81,7 +81,9 @@ describe("realtime evaluation keys", () => {
   });
 
   it("does not expose bearer tokens in active query keys", async () => {
-    const key = await activeQueryKey(registration());
+    const key = await activeQueryKey(
+      registration({ authorizationFingerprint: "Bearer owner-a" })
+    );
 
     expect(key).toMatch(/^aq:[0-9a-f]{64}$/);
     expect(key).not.toContain("Bearer");

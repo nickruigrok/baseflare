@@ -24,7 +24,7 @@ import { getRequestLogFields, logRuntimeEvent } from "./logging";
 import { routeRealtimeSubscribe } from "./realtime/connection-do";
 import { createRealtimeMutationNotifier } from "./realtime/outbox";
 import { configureRealtimeRuntime } from "./realtime/shared";
-import { readRequestBodyText } from "./request-body";
+import { assertRpcJsonBounds, readRequestBodyText } from "./request-body";
 import type {
   BaseflareExecutionContext,
   BaseflareManifest,
@@ -85,6 +85,7 @@ async function parseRpcBodyArgs(request: Request): Promise<unknown> {
         : "Invalid RPC request JSON"
     );
   }
+  assertRpcJsonBounds(parsed, "RPC request body");
 
   if (
     typeof parsed !== "object" ||
@@ -99,6 +100,83 @@ async function parseRpcBodyArgs(request: Request): Promise<unknown> {
   }
 
   return parsed.args;
+}
+
+function corsHeadersForRequest(
+  request: Request,
+  manifest: BaseflareManifest
+): Headers | null {
+  const cors = manifest.config?.cors;
+  if (!cors) {
+    return null;
+  }
+
+  const origin = request.headers.get("origin");
+  if (!(origin && cors.origins.includes(origin))) {
+    return null;
+  }
+
+  const headers = new Headers({
+    "Access-Control-Allow-Origin": origin,
+  });
+  const requestedMethods = request.headers.get("access-control-request-method");
+  if (requestedMethods) {
+    headers.set("Access-Control-Allow-Methods", requestedMethods);
+  }
+  const requestedHeaders = request.headers.get(
+    "access-control-request-headers"
+  );
+  if (requestedHeaders) {
+    headers.set("Access-Control-Allow-Headers", requestedHeaders);
+  }
+  if (cors.maxAge !== undefined) {
+    headers.set("Access-Control-Max-Age", String(cors.maxAge));
+  }
+
+  return headers;
+}
+
+function withCorsHeaders(
+  response: Response,
+  request: Request,
+  manifest: BaseflareManifest
+): Response {
+  const corsHeaders = corsHeadersForRequest(request, manifest);
+  if (!corsHeaders) {
+    return response;
+  }
+
+  const headers = new Headers(response.headers);
+  for (const [key, value] of corsHeaders) {
+    headers.set(key, value);
+  }
+
+  return new Response(response.body, {
+    headers,
+    status: response.status,
+    statusText: response.statusText,
+  });
+}
+
+function handleCorsPreflight(
+  request: Request,
+  manifest: BaseflareManifest
+): Response | null {
+  if (request.method !== "OPTIONS" || !manifest.config?.cors) {
+    return null;
+  }
+
+  const headers = corsHeadersForRequest(request, manifest);
+  if (!headers) {
+    throw new NotFoundRuntimeError(
+      `Route "${request.method} ${new URL(request.url).pathname}" was not found`
+    );
+  }
+
+  return new Response(null, {
+    headers,
+    status: 204,
+  });
 }
 
 function createInvocationOptions(
@@ -316,7 +394,12 @@ export function createWorker<
   return {
     async fetch(request, env, ctx) {
       try {
-        return await routeRequest(
+        const preflightResponse = handleCorsPreflight(request, manifest);
+        if (preflightResponse) {
+          return preflightResponse;
+        }
+
+        const response = await routeRequest(
           request,
           env,
           ctx,
@@ -324,6 +407,7 @@ export function createWorker<
           functionIndex,
           realtimeRuntimeId
         );
+        return withCorsHeaders(response, request, manifest);
       } catch (error) {
         if (
           !(
@@ -339,7 +423,7 @@ export function createWorker<
           });
         }
 
-        return toErrorResponse(error);
+        return withCorsHeaders(toErrorResponse(error), request, manifest);
       }
     },
   };

@@ -11,18 +11,6 @@ import { buildBaseflareManifest } from "./manifest";
 export { RealtimeConnectionDO } from "./realtime/connection-do";
 export { RealtimeSubscriptionDO } from "./realtime/subscription-do";
 
-async function getToken(ctx: unknown): Promise<string | null> {
-  const identity = await (
-    ctx as {
-      auth: {
-        getUserIdentity(): Promise<{ token: string } | null>;
-      };
-    }
-  ).auth.getUserIdentity();
-
-  return identity?.token ?? null;
-}
-
 const schema = defineSchema({
   todos: defineTable({
     completed: v.boolean().default(false),
@@ -33,9 +21,8 @@ const schema = defineSchema({
 
 const rules = defineRules({
   todos: {
-    insert: async ({ ctx, value }) =>
-      (await getToken(ctx)) === value.ownerToken,
-    read: async ({ ctx, doc }) => (await getToken(ctx)) === doc.ownerToken,
+    insert: () => true,
+    read: () => true,
   },
 });
 

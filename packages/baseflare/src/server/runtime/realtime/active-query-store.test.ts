@@ -20,7 +20,7 @@ function registration(
 ): StoredRealtimeRegistration {
   return {
     args: { ownerToken: "owner-a" },
-    authorizationHeader: "Bearer owner-a",
+    authorizationFingerprint: "auth-owner-a",
     connectionKey: "client:client-a",
     connectionName: "connection:0",
     epoch: 1,
@@ -84,7 +84,7 @@ describe("RealtimeActiveQueryStore", () => {
     );
     await store.upsertFromRegistration(
       registrationKey("sub-c"),
-      registration("sub-c", { authorizationHeader: "Bearer owner-b" })
+      registration("sub-c", { authorizationFingerprint: "auth-owner-b" })
     );
 
     expect(store.size()).toBe(2);

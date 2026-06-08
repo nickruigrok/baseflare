@@ -64,12 +64,20 @@ export class HttpRouter {
     const matchingPrefixes = this.prefixRoutes
       .filter(
         (route) =>
-          route.method === normalizedMethod && path.startsWith(route.pathPrefix)
+          route.method === normalizedMethod &&
+          matchesPathPrefix(path, route.pathPrefix)
       )
       .sort((left, right) => right.pathPrefix.length - left.pathPrefix.length);
 
     return matchingPrefixes[0]?.handler ?? null;
   }
+}
+
+function matchesPathPrefix(path: string, prefix: string): boolean {
+  return (
+    path === prefix ||
+    path.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)
+  );
 }
 
 export function httpRouter(): HttpRouter {

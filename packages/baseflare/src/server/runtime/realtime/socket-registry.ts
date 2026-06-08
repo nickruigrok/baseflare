@@ -231,6 +231,7 @@ export class RealtimeSocketRegistry {
 
   deliver(
     connectionKey: string,
+    shardName: string,
     messages: readonly Record<string, unknown>[]
   ): RealtimeDeliveryResult {
     const sockets = this.socketsByConnectionKey.get(connectionKey);
@@ -244,6 +245,7 @@ export class RealtimeSocketRegistry {
       const subscriptionId = getStringField(message, "subscriptionId");
       const sent = this.deliverMessageToSockets(
         sockets,
+        shardName,
         subscriptionId,
         message
       );
@@ -344,6 +346,7 @@ export class RealtimeSocketRegistry {
 
   private deliverMessageToSockets(
     sockets: Set<RuntimeWebSocket>,
+    shardName: string,
     subscriptionId: string,
     message: Record<string, unknown>
   ): number {
@@ -353,7 +356,8 @@ export class RealtimeSocketRegistry {
     });
     let delivered = 0;
     for (const socket of [...sockets]) {
-      if (!this.getSubscription(socket, subscriptionId)) {
+      const subscription = this.getSubscription(socket, subscriptionId);
+      if (!subscription || subscription.subscriptionShardName !== shardName) {
         continue;
       }
       try {

@@ -57,6 +57,24 @@ describe("RealtimeRegistrationStore", () => {
     expect(reloadedStore.size()).toBe(1);
   });
 
+  it("sanitizes legacy raw authorization headers when registrations reload", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const key = registrationKey("sub-a");
+    await state.storage.put(`realtime:registration:${key}`, {
+      ...registration("sub-a"),
+      authorizationHeader: "Bearer owner-a",
+    });
+
+    const reloadedStore = new RealtimeRegistrationStore(state);
+    await reloadedStore.loadOnce();
+
+    const reloaded = reloadedStore.get(key);
+    expect(reloaded?.authorizationFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify([...state.durableStorage.values()])).not.toContain(
+      "Bearer owner-a"
+    );
+  });
+
   it("loads persisted registrations across storage list pages", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeRegistrationStore(state);

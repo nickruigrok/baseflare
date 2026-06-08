@@ -45,7 +45,7 @@ function attachment(
 ): RealtimeSocketAttachment {
   return {
     ...createRealtimeSocketAttachment({
-      authorizationHeader: undefined,
+      authorizationFingerprint: undefined,
       connectionKey,
       runtimeId: "runtime:1",
     }),
@@ -93,7 +93,7 @@ describe("RealtimeSocketRegistry", () => {
     );
     registry.add(otherSocket, attachment("client:client-b"));
 
-    const result = registry.deliver("client:client-a", [
+    const result = registry.deliver("client:client-a", "subscription:g1:0", [
       { result: [{ id: "todo-a" }], sequence: 7, subscriptionId: "sub-a" },
     ]);
 
@@ -125,7 +125,7 @@ describe("RealtimeSocketRegistry", () => {
     registry.add(failedSocket, attachment("client:client-a", subscriptions));
     registry.add(healthySocket, attachment("client:client-a", subscriptions));
 
-    const result = registry.deliver("client:client-a", [
+    const result = registry.deliver("client:client-a", "subscription:g1:0", [
       { result: [], sequence: 9, subscriptionId: "sub-a" },
     ]);
 
@@ -171,7 +171,7 @@ describe("RealtimeSocketRegistry", () => {
       ])
     );
 
-    const result = registry.deliver("client:client-a", [
+    const result = registry.deliver("client:client-a", "subscription:g1:0", [
       { result: [{ id: "todo-a" }], sequence: 7, subscriptionId: "sub-a" },
     ]);
 
@@ -187,6 +187,33 @@ describe("RealtimeSocketRegistry", () => {
     expect(registry.hasSubscriptionSocket("client:client-a", "sub-c")).toBe(
       false
     );
+  });
+
+  it("does not deliver from a shard that no longer owns the subscription", () => {
+    const registry = new RealtimeSocketRegistry();
+    const socket = createSocket();
+    registry.add(
+      socket,
+      attachment("client:client-a", [
+        {
+          args: {},
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-a",
+          subscriptionShardName: "subscription:g1:2",
+        },
+      ])
+    );
+
+    const result = registry.deliver("client:client-a", "subscription:g1:0", [
+      { result: [{ id: "todo-a" }], sequence: 7, subscriptionId: "sub-a" },
+    ]);
+
+    expect(result).toEqual({
+      delivered: 0,
+      deliveredSubscriptions: [],
+    });
+    expect(socket.sentMessages).toEqual([]);
   });
 
   it("tracks subscriptions and active subscription state in attachments", () => {

@@ -62,7 +62,7 @@ export interface RealtimeOutboxOperation {
 
 export interface RealtimeRegistration {
   readonly args: unknown;
-  readonly authorizationHeader?: string;
+  readonly authorizationFingerprint?: string;
   readonly connectionKey: string;
   readonly connectionName: string;
   readonly epoch: number;
@@ -98,7 +98,7 @@ export type StoredRealtimeRegistration = Omit<
 
 export interface StoredRealtimeActiveQuery {
   readonly args: unknown;
-  readonly authorizationHeader?: string;
+  readonly authorizationFingerprint?: string;
   dependencies?: RealtimeDependencySet;
   readonly key: string;
   lastResultJson?: string;
@@ -170,7 +170,7 @@ export interface RealtimeSocketSubscription {
 }
 
 export interface RealtimeSocketAttachment {
-  readonly authorizationHeader?: string;
+  readonly authorizationFingerprint?: string;
   readonly connectionKey: string;
   readonly connectionName: string;
   readonly latestDeliveredOutboxSequence: number | null;

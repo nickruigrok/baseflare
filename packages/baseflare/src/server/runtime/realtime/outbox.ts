@@ -46,10 +46,12 @@ type RealtimeOutboxDatabase = Pick<RuntimeDatabase, "prepare"> & {
 };
 
 class RealtimeNotifyFailure extends InternalRuntimeError {
+  readonly responseStatus?: number;
   readonly retryable: boolean;
 
-  constructor(message: string, retryable: boolean) {
+  constructor(message: string, retryable: boolean, status?: number) {
     super(message);
+    this.responseStatus = status;
     this.retryable = retryable;
   }
 }
@@ -167,6 +169,7 @@ async function notifyRealtimeSubscriptionShards(
             eventId: event.eventId,
             generationId: generation.generationId,
             shardName,
+            status: getRealtimeNotifyErrorStatus(error),
           });
           throw error;
         }
@@ -188,6 +191,7 @@ async function notifyRealtimeSubscriptionShards(
             eventId: event.eventId,
             generationId: generation.generationId,
             shardName,
+            status: getRealtimeNotifyErrorStatus(catchUpError),
           });
           throw catchUpError;
         }
@@ -200,8 +204,41 @@ async function notifyRealtimeSubscriptionShards(
   }
 
   if (failures.length > 0) {
+    const failureDetails = results.flatMap((result, index) => {
+      if (result.status === "fulfilled") {
+        return [];
+      }
+      const stub = stubs[index];
+      if (!stub) {
+        return [];
+      }
+      const detail = {
+        errorMessage:
+          result.reason instanceof Error ? result.reason.message : undefined,
+        errorName:
+          result.reason instanceof Error
+            ? result.reason.name
+            : typeof result.reason,
+        generationId: stub.generation.generationId,
+        shardName: stub.shardName,
+        status: getRealtimeNotifyErrorStatus(result.reason),
+      };
+      logRuntimeEvent("error", "runtime.realtime_notify_failed", {
+        ...detail,
+        eventId: event.eventId,
+      });
+      return [detail];
+    });
+    const reasons = failureDetails
+      .map(
+        (failure) =>
+          `${failure.shardName}:${failure.errorName}${
+            failure.status ? `:${failure.status}` : ""
+          }${failure.errorMessage ? `:${failure.errorMessage}` : ""}`
+      )
+      .join(", ");
     throw new InternalRuntimeError(
-      `Realtime notify failed for ${failures.length} shards`
+      `Realtime notify failed for ${failures.length} shards: ${reasons}`
     );
   }
 }
@@ -259,7 +296,8 @@ async function notifyRealtimeSubscriptionShard(
 
       throw new RealtimeNotifyFailure(
         `Realtime notify failed for ${shardName} with status ${response.status}`,
-        isRetryableRealtimeNotifyStatus(response.status)
+        isRetryableRealtimeNotifyStatus(response.status),
+        response.status
       );
     } catch (error) {
       if (attempt >= 2 || !isRetryableRealtimeNotifyError(error)) {
@@ -276,6 +314,12 @@ function isRetryableRealtimeNotifyError(error: unknown): boolean {
   }
 
   return true;
+}
+
+function getRealtimeNotifyErrorStatus(error: unknown): number | undefined {
+  return error instanceof RealtimeNotifyFailure
+    ? error.responseStatus
+    : undefined;
 }
 
 function isRetryableRealtimeNotifyStatus(status: number): boolean {

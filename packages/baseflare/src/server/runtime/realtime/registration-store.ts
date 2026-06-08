@@ -7,7 +7,11 @@ import {
   serializeRealtimeDependencySet,
   serializeRealtimeVersionSnapshot,
 } from "./routing";
-import { getEpoch, getStringField } from "./shared";
+import {
+  createRealtimeAuthorizationFingerprint,
+  getEpoch,
+  getStringField,
+} from "./shared";
 import { listRealtimeStoragePrefix } from "./storage-list";
 import type {
   RealtimeDependencySet,
@@ -75,7 +79,7 @@ export class RealtimeRegistrationStore {
         REALTIME_REGISTRATION_STORAGE_PREFIX
       );
     for (const [storageKey, value] of storedRegistrations) {
-      const registration = this.parseStoredRegistrationValue(value);
+      const registration = await this.parseStoredRegistrationValue(value);
       if (!registration) {
         logRuntimeEvent(
           "warn",
@@ -91,6 +95,12 @@ export class RealtimeRegistrationStore {
         REALTIME_REGISTRATION_STORAGE_PREFIX.length
       );
       this.registrations.set(registrationKey, registration);
+      if (
+        typeof (value as { readonly authorizationHeader?: unknown })
+          .authorizationHeader === "string"
+      ) {
+        await this.persistByKey(registrationKey, registration);
+      }
     }
     await this.activeQueryStore?.syncRegistrations(this.values());
     this.loaded = true;
@@ -179,10 +189,26 @@ export class RealtimeRegistrationStore {
 
     await this.deleteStoredByKey(registrationKey);
     this.registrations.delete(registrationKey);
-    await this.activeQueryStore?.detachRegistration(
-      registrationKey,
-      registration.activeQueryKey
-    );
+    try {
+      await this.activeQueryStore?.detachRegistration(
+        registrationKey,
+        registration.activeQueryKey
+      );
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_registration_detach_failed", {
+        errorName: error instanceof Error ? error.name : typeof error,
+        registrationKey,
+      });
+      try {
+        await this.activeQueryStore?.syncRegistrations(this.values());
+      } catch (syncError) {
+        logRuntimeEvent("error", "runtime.realtime_active_query_sync_failed", {
+          errorName:
+            syncError instanceof Error ? syncError.name : typeof syncError,
+          registrationKey,
+        });
+      }
+    }
   }
 
   async deleteExpired(
@@ -393,9 +419,9 @@ export class RealtimeRegistrationStore {
     return `${REALTIME_REGISTRATION_STORAGE_PREFIX}${registrationKey}`;
   }
 
-  private parseStoredRegistrationValue(
+  private async parseStoredRegistrationValue(
     value: unknown
-  ): StoredRealtimeRegistration | undefined {
+  ): Promise<StoredRealtimeRegistration | undefined> {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
       return undefined;
     }
@@ -403,7 +429,7 @@ export class RealtimeRegistrationStore {
     try {
       const input = value as Record<string, unknown>;
       return {
-        ...this.parseRegistration(input),
+        ...(await this.parseRegistration(input)),
         dependencies: parseRealtimeDependencySetValue(input.dependencies),
         lastResultJson:
           typeof input.lastResultJson === "string"
@@ -427,15 +453,28 @@ export class RealtimeRegistrationStore {
     }
   }
 
-  private parseRegistration(
+  private async parseAuthorizationFingerprint(
     body: Record<string, unknown>
-  ): RealtimeRegistration {
+  ): Promise<string | undefined> {
+    if (typeof body.authorizationFingerprint === "string") {
+      return body.authorizationFingerprint;
+    }
+
+    if (typeof body.authorizationHeader === "string") {
+      return await createRealtimeAuthorizationFingerprint(
+        body.authorizationHeader
+      );
+    }
+
+    return undefined;
+  }
+
+  private async parseRegistration(
+    body: Record<string, unknown>
+  ): Promise<RealtimeRegistration> {
     return {
       args: body.args ?? {},
-      authorizationHeader:
-        typeof body.authorizationHeader === "string"
-          ? body.authorizationHeader
-          : undefined,
+      authorizationFingerprint: await this.parseAuthorizationFingerprint(body),
       connectionKey: getStringField(body, "connectionKey"),
       connectionName: getStringField(body, "connectionName"),
       epoch: getEpoch(body.epoch),

@@ -767,7 +767,7 @@ const createdAt = getCreatedAtFromId(id)
 4. Internal function routing — `internalQuery`/`internalMutation`/`internalAction` not exposed via RPC, only callable via `ctx.runQuery()`/`ctx.runMutation()`/`ctx.runAction()`
 5. Action context — `ActionCtx` with `runQuery`, `runMutation`, `runAction`, `scheduler`, `storage`, `auth`
 6. Mutation context — `MutationCtx` with `db`, `auth`, `storage`, `scheduler`, `runQuery`
-7. Auth token extraction from headers, `ctx.auth` population
+7. `ctx.auth` hook is present but returns `null` until Phase 5 installs a verified Better Auth-backed identity provider; raw bearer headers are not treated as trusted identity
 8. Permission enforcement on every operation
 9. Collection table/index creation in D1 on deploy (document tables with `_id`, `_data`, `_rev` columns + `json_extract()` indexes); schema application is deploy-owned and never runs inside `createWorker()`
 10. Transaction support via `env.APP_DB.batch()`
@@ -1171,7 +1171,7 @@ npx baseflare dashboard
    - Auth table names: `_auth_user`, `_auth_session`, `_auth_account`, `_auth_verification`
    - Auth table migrations run on deploy alongside developer table migrations
 3. Route mounting at `/api/auth/*` on environment Worker
-4. `ctx.auth` population from session token in every query/mutation/action
+4. `ctx.auth` population from verified Better Auth session token in every query/mutation/action
 5. Per-request auth instance (D1 bindings only available in fetch handler)
 6. Uses D1 `batch()` for atomicity
 7. better-auth provider configuration passed through from `defineAuth()` (Google, GitHub, email/password, etc.)

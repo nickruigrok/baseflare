@@ -231,7 +231,7 @@ export class RealtimeActiveQueryStore {
         }
       : {
           args: registration.args,
-          authorizationHeader: registration.authorizationHeader,
+          authorizationFingerprint: registration.authorizationFingerprint,
           dependencies: registration.dependencies,
           key: activeQueryKey,
           lastResultJson: registration.lastResultJson,
@@ -406,9 +406,9 @@ export class RealtimeActiveQueryStore {
 
     return {
       args: input.args ?? {},
-      authorizationHeader:
-        typeof input.authorizationHeader === "string"
-          ? input.authorizationHeader
+      authorizationFingerprint:
+        typeof input.authorizationFingerprint === "string"
+          ? input.authorizationFingerprint
           : undefined,
       dependencies: parseRealtimeDependencySetValue(input.dependencies),
       key: input.key,

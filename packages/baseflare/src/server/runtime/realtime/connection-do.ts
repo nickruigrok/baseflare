@@ -11,6 +11,7 @@ import {
 import { fetchActiveRealtimeShardGeneration } from "./shards";
 import {
   assertRealtimeJsonBounds,
+  createRealtimeAuthorizationFingerprint,
   createRealtimeSocketAttachment,
   emitRealtimeMetric,
   getEpoch,
@@ -170,6 +171,9 @@ export class RealtimeConnectionDO {
     }
 
     const authorizationHeader = request.headers.get("authorization");
+    const authorizationFingerprint = authorizationHeader
+      ? await createRealtimeAuthorizationFingerprint(authorizationHeader)
+      : undefined;
     const runtimeId = request.headers.get(REALTIME_RUNTIME_ID_HEADER);
     if (!runtimeId) {
       throw new ValidationRuntimeError(
@@ -188,7 +192,7 @@ export class RealtimeConnectionDO {
     const client = pair[0];
     const server = pair[1];
     const attachment = createRealtimeSocketAttachment({
-      authorizationHeader,
+      authorizationFingerprint,
       connectionKey: clientKey,
       runtimeId,
     });
@@ -568,7 +572,7 @@ export class RealtimeConnectionDO {
     assertRealtimeJsonBounds(args, "Realtime subscription args");
     return {
       args,
-      authorizationHeader: attachment.authorizationHeader,
+      authorizationFingerprint: attachment.authorizationFingerprint,
       connectionKey,
       connectionName: attachment.connectionName,
       epoch: getEpoch(message.epoch),
@@ -581,6 +585,7 @@ export class RealtimeConnectionDO {
 
   private deliver(message: Record<string, unknown>): RealtimeDeliveryResult {
     const connectionKey = getStringField(message, "connectionKey");
+    const shardName = getStringField(message, "shardName");
     const deliveries = message.deliveries;
     if (!Array.isArray(deliveries)) {
       throw new ValidationRuntimeError(
@@ -590,6 +595,7 @@ export class RealtimeConnectionDO {
 
     return this.socketRegistry.deliver(
       connectionKey,
+      shardName,
       deliveries.map((delivery) => parseObject(delivery, "Realtime delivery"))
     );
   }
@@ -769,7 +775,7 @@ export class RealtimeConnectionDO {
       {
         body: JSON.stringify({
           args: subscription.args,
-          authorizationHeader: attachment.authorizationHeader,
+          authorizationFingerprint: attachment.authorizationFingerprint,
           connectionKey: attachment.connectionKey,
           connectionName: attachment.connectionName,
           epoch: subscription.epoch,

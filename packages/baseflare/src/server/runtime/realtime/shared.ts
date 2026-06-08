@@ -228,14 +228,14 @@ export function isRealtimeDurableObjectState(
 }
 
 export function createRealtimeSocketAttachment(input: {
-  readonly authorizationHeader: string | null | undefined;
+  readonly authorizationFingerprint?: string;
   readonly connectionKey: string;
   readonly latestDeliveredOutboxSequence?: number | null;
   readonly runtimeId: string;
   readonly subscriptions?: readonly RealtimeSocketSubscription[];
 }): RealtimeSocketAttachment {
   return {
-    authorizationHeader: input.authorizationHeader ?? undefined,
+    authorizationFingerprint: input.authorizationFingerprint,
     connectionKey: input.connectionKey,
     connectionName: getRealtimeConnectionShardName(input.connectionKey),
     latestDeliveredOutboxSequence: input.latestDeliveredOutboxSequence ?? null,
@@ -326,9 +326,9 @@ export function parseRealtimeSocketAttachment(
   }
 
   return {
-    authorizationHeader:
-      typeof attachment.authorizationHeader === "string"
-        ? attachment.authorizationHeader
+    authorizationFingerprint:
+      typeof attachment.authorizationFingerprint === "string"
+        ? attachment.authorizationFingerprint
         : undefined,
     connectionKey: attachment.connectionKey,
     connectionName: getRealtimeConnectionShardName(attachment.connectionKey),
@@ -389,12 +389,19 @@ export async function resolveRealtimeConnectionKey(
   return `anonymous:${crypto.randomUUID()}`;
 }
 
+export async function createRealtimeAuthorizationFingerprint(
+  authorizationHeader: string
+): Promise<string> {
+  return await sha256Hex(authorizationHeader);
+}
+
 async function createAuthBoundConnectionKeyHash(
   runtimeId: string,
   authorizationHeader: string,
   explicitId: string
 ): Promise<string> {
-  const authFingerprint = await sha256Hex(authorizationHeader);
+  const authFingerprint =
+    await createRealtimeAuthorizationFingerprint(authorizationHeader);
   return await sha256Hex(
     JSON.stringify([runtimeId, authFingerprint, explicitId])
   );

@@ -39,6 +39,7 @@ import {
 import {
   chunkRealtimeDeliveries,
   configuredRealtimeRuntimes,
+  createRealtimeAuthorizationFingerprint,
   emitOutboxLagMetric,
   emitRealtimeMetric,
   getEpoch,
@@ -193,7 +194,7 @@ export class RealtimeSubscriptionDO {
     const body = await readJsonObject(request);
     this.setCurrentShardName(getOptionalStringField(body, "shardName"));
     await this.scheduleOutboxCleanupAlarm();
-    const registration = this.parseRegistration(body);
+    const registration = await this.parseRegistration(body);
     const registrationKey = createRegistrationKey(
       registration.connectionKey,
       registration.subscriptionId
@@ -219,7 +220,7 @@ export class RealtimeSubscriptionDO {
     const body = await readJsonObject(request);
     this.setCurrentShardName(getOptionalStringField(body, "shardName"));
     await this.scheduleOutboxCleanupAlarm();
-    const registration = this.parseRegistration(body);
+    const registration = await this.parseRegistration(body);
     const storedRegistration: StoredRealtimeRegistration = {
       ...registration,
       dependencies: parseRealtimeDependencySetValue(body.dependencies),
@@ -236,6 +237,13 @@ export class RealtimeSubscriptionDO {
     );
     const existing = this.registrationStore.get(registrationKey);
     if (existing && storedRegistration.epoch < existing.epoch) {
+      return jsonResponse({ ok: true });
+    }
+    if (
+      existing &&
+      existing.epoch === storedRegistration.epoch &&
+      existing.movePending !== true
+    ) {
       return jsonResponse({ ok: true });
     }
 
@@ -256,6 +264,9 @@ export class RealtimeSubscriptionDO {
     const registration = this.registrationStore.get(registrationKey);
     if (!registration) {
       return jsonResponse({ ok: false }, { status: 404 });
+    }
+    if (registration.movePending !== true) {
+      return jsonResponse({ ok: true });
     }
 
     const activatedRegistration = { ...registration, movePending: false };
@@ -636,15 +647,12 @@ export class RealtimeSubscriptionDO {
     };
   }
 
-  private parseRegistration(
+  private async parseRegistration(
     body: Record<string, unknown>
-  ): RealtimeRegistration {
+  ): Promise<RealtimeRegistration> {
     return {
       args: body.args ?? {},
-      authorizationHeader:
-        typeof body.authorizationHeader === "string"
-          ? body.authorizationHeader
-          : undefined,
+      authorizationFingerprint: await this.parseAuthorizationFingerprint(body),
       connectionKey: getStringField(body, "connectionKey"),
       connectionName: getStringField(body, "connectionName"),
       epoch: getEpoch(body.epoch),
@@ -656,6 +664,22 @@ export class RealtimeSubscriptionDO {
       runtimeId: getStringField(body, "runtimeId"),
       subscriptionId: getStringField(body, "subscriptionId"),
     };
+  }
+
+  private async parseAuthorizationFingerprint(
+    body: Record<string, unknown>
+  ): Promise<string | undefined> {
+    if (typeof body.authorizationFingerprint === "string") {
+      return body.authorizationFingerprint;
+    }
+
+    if (typeof body.authorizationHeader === "string") {
+      return await createRealtimeAuthorizationFingerprint(
+        body.authorizationHeader
+      );
+    }
+
+    return undefined;
   }
 
   private async reEvaluateActiveRegistrations(
@@ -1519,6 +1543,7 @@ export class RealtimeSubscriptionDO {
       body: JSON.stringify({
         connectionKey: group.connectionKey,
         deliveries: group.deliveries.map((delivery) => delivery.message),
+        shardName: this.shardName,
       }),
       headers: JSON_HEADERS,
       method: "POST",
@@ -1653,14 +1678,7 @@ export class RealtimeSubscriptionDO {
       );
     }
 
-    const headers = new Headers();
-    const authorizationHeader = this.resolveActiveQueryAuthorizationHeader(
-      activeQuery,
-      registrations
-    );
-    if (authorizationHeader) {
-      headers.set("authorization", authorizationHeader);
-    }
+    this.assertActiveQueryAuthFingerprintHasMember(activeQuery, registrations);
 
     const { dependencies, readObserver } = createRealtimeDependencySet();
     const result = await executeQueryDefinition(
@@ -1674,7 +1692,7 @@ export class RealtimeSubscriptionDO {
         },
         functionIndex: runtime.functionIndex,
         readObserver,
-        requestHeaders: headers,
+        requestHeaders: new Headers(),
         rules: runtime.rules,
         schema: runtime.schema,
       },
@@ -1689,28 +1707,26 @@ export class RealtimeSubscriptionDO {
     return { dependencies, result, resultJson, versionSnapshot };
   }
 
-  private resolveActiveQueryAuthorizationHeader(
+  private assertActiveQueryAuthFingerprintHasMember(
     activeQuery: StoredRealtimeActiveQuery,
     registrations: readonly StoredRealtimeRegistration[]
-  ): string | undefined {
-    if (!activeQuery.authorizationHeader) {
-      return undefined;
+  ): void {
+    if (!activeQuery.authorizationFingerprint) {
+      return;
     }
 
-    // Phase 3 treats Authorization as an opaque app credential. Token
-    // validation, revocation, and refresh belong to the auth/client phases; the
-    // realtime runtime only ensures stored auth is still backed by live members.
+    // Phase 3 treats Authorization as an opaque app credential fingerprint.
+    // Better Auth validation, revocation, and refresh are Phase 5 concerns.
     const hasMatchingMember = registrations.some(
       (registration) =>
-        registration.authorizationHeader === activeQuery.authorizationHeader
+        registration.authorizationFingerprint ===
+        activeQuery.authorizationFingerprint
     );
     if (!hasMatchingMember) {
       throw new InternalRuntimeError(
         "Realtime active query authorization is no longer attached to a live registration"
       );
     }
-
-    return activeQuery.authorizationHeader;
   }
 
   private createPendingDelivery(
@@ -1970,32 +1986,6 @@ export class RealtimeSubscriptionDO {
       );
     }
 
-    try {
-      await this.registrationStore.delete(registrationKey);
-    } catch (error) {
-      const sourceOwnerRestored =
-        await this.restoreSourceRegistrationOwner(registration);
-      const targetRollbackSucceeded = await this.rollbackAdoptedRegistration(
-        targetStub,
-        targetShardName,
-        registration
-      );
-      logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
-        connectionKey: registration.connectionKey,
-        errorName: error instanceof Error ? error.name : typeof error,
-        shardName: targetShardName,
-        sourceRemoved: false,
-        sourceOwnerRestored,
-        subscriptionId: registration.subscriptionId,
-        targetRollbackSucceeded,
-      });
-      throw new InternalRuntimeError(
-        `Realtime registration source delete failed: ${
-          error instanceof Error ? error.message : "unknown error"
-        }`
-      );
-    }
-
     let activationResponse: Response;
     try {
       activationResponse = await targetStub.fetch(
@@ -2018,7 +2008,6 @@ export class RealtimeSubscriptionDO {
       );
       const sourceOwnerRestored =
         await this.restoreSourceRegistrationOwner(registration);
-      await this.registrationStore.upsert(registrationKey, registration);
       logRuntimeEvent(
         "error",
         "runtime.realtime_registration_activation_failed",
@@ -2045,7 +2034,6 @@ export class RealtimeSubscriptionDO {
       );
       const sourceOwnerRestored =
         await this.restoreSourceRegistrationOwner(registration);
-      await this.registrationStore.upsert(registrationKey, registration);
       logRuntimeEvent(
         "error",
         "runtime.realtime_registration_activation_failed",
@@ -2060,6 +2048,26 @@ export class RealtimeSubscriptionDO {
       );
       throw new InternalRuntimeError(
         `Realtime registration activation failed with status ${activationResponse.status}`
+      );
+    }
+
+    try {
+      await this.registrationStore.delete(registrationKey);
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_registration_move_failed", {
+        connectionKey: registration.connectionKey,
+        errorName: error instanceof Error ? error.name : typeof error,
+        shardName: targetShardName,
+        sourceRemoved: false,
+        sourceOwnerRestored: false,
+        subscriptionId: registration.subscriptionId,
+        targetActivated: true,
+        targetRollbackSucceeded: false,
+      });
+      throw new InternalRuntimeError(
+        `Realtime registration source delete failed after target activation: ${
+          error instanceof Error ? error.message : "unknown error"
+        }`
       );
     }
   }

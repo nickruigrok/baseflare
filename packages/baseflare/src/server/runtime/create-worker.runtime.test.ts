@@ -39,6 +39,7 @@ import { RealtimeConnectionDO } from "./realtime/connection-do";
 import {
   createRealtimeGlobalSubscriptionRouteTarget,
   createRealtimePartitionSubscriptionRouteTarget,
+  createRealtimeTableSubscriptionRouteTarget,
   createRegistrationKey,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
@@ -142,36 +143,18 @@ let maxActiveRealtimeConcurrencyQueries = 0;
 
 const rules = defineRules({
   labels: {
-    delete: async ({ ctx, existingDoc }) =>
-      (await getToken(ctx)) === existingDoc.ownerToken,
-    insert: async ({ ctx, value }) =>
-      (await getToken(ctx)) === value.ownerToken,
-    read: async ({ ctx, doc }) => (await getToken(ctx)) === doc.ownerToken,
-    update: async ({ ctx, existingDoc }) =>
-      (await getToken(ctx)) === existingDoc.ownerToken,
+    delete: ({ existingDoc }) => existingDoc.ownerToken === "owner-a",
+    insert: () => true,
+    read: ({ doc }) => doc.ownerToken === "owner-a",
+    update: ({ existingDoc }) => existingDoc.ownerToken === "owner-a",
   },
   todos: {
-    delete: async ({ ctx, existingDoc }) =>
-      (await getToken(ctx)) === existingDoc.ownerToken,
-    insert: async ({ ctx, value }) =>
-      (await getToken(ctx)) === value.ownerToken,
-    read: async ({ ctx, doc }) => (await getToken(ctx)) === doc.ownerToken,
-    update: async ({ ctx, existingDoc }) =>
-      (await getToken(ctx)) === existingDoc.ownerToken,
+    delete: ({ existingDoc }) => existingDoc.ownerToken === "owner-a",
+    insert: ({ value }) => value.ownerToken !== "blocked-owner",
+    read: ({ doc }) => doc.ownerToken === "owner-a",
+    update: ({ existingDoc }) => existingDoc.ownerToken === "owner-a",
   },
 });
-
-async function getToken(ctx: unknown): Promise<string | null> {
-  const identity = await (
-    ctx as {
-      auth: {
-        getUserIdentity(): Promise<{ token: string } | null>;
-      };
-    }
-  ).auth.getUserIdentity();
-
-  return identity?.token ?? null;
-}
 
 const countTodos = internalQuery({
   args: { ownerToken: v.string() },
@@ -962,7 +945,7 @@ interface RealtimeIndexTestState {
     string,
     {
       activeQueryKey?: string;
-      authorizationHeader?: string;
+      authorizationFingerprint?: string;
       lastResultJson?: string;
       leaseExpiresAt: number;
       movePending?: boolean;
@@ -2561,6 +2544,9 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
+    expect(JSON.stringify([...state.durableStorage.values()])).not.toContain(
+      "Bearer owner-a"
+    );
 
     subscriptionDo = new RealtimeSubscriptionDO(state, {
       APP_DB: env.APP_DB,
@@ -3425,7 +3411,7 @@ describe("worker runtime", () => {
     ).toBe(false);
   });
 
-  it("rolls back realtime migration ownership when source delete fails", async () => {
+  it("prevents source delivery when migration source delete fails after activation", async () => {
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -3557,20 +3543,21 @@ describe("worker runtime", () => {
       );
 
     expect(subscriptionPaths).toContain("/adopt-registration");
-    expect(subscriptionPaths).toContain("/unregister");
-    expect(subscriptionPaths).not.toContain("/activate-registration");
-    expect(movedShardNames).toEqual([targetShardName, globalShardName]);
+    expect(subscriptionPaths).toContain("/activate-registration");
+    expect(subscriptionPaths).not.toContain("/unregister");
+    expect(movedShardNames).toEqual([targetShardName]);
     expect(sourceRegistration?.reEvaluationRetryAt).toBeGreaterThan(Date.now());
-    expect(targetRegistration).toBeUndefined();
+    expect(targetRegistration?.movePending).toBe(false);
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
         errorName: "Error",
         event: "runtime.realtime_registration_move_failed",
         sourceRemoved: false,
-        sourceOwnerRestored: true,
+        sourceOwnerRestored: false,
         subscriptionId: "sub-a",
-        targetRollbackSucceeded: true,
+        targetActivated: true,
+        targetRollbackSucceeded: false,
       })
     );
     expect(errorLog).toHaveBeenCalledWith(
@@ -3581,22 +3568,6 @@ describe("worker runtime", () => {
         subscriptionId: "sub-a",
       })
     );
-
-    await sourceSubscriptionDo.fetch(
-      new Request("https://baseflare.internal/unregister", {
-        body: JSON.stringify({
-          connectionKey: "client-a",
-          subscriptionId: "sub-a",
-        }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      })
-    );
-    expect(
-      getRealtimeIndexTestState(sourceSubscriptionDo).registrations.has(
-        registrationKey
-      )
-    ).toBe(false);
   });
 
   it("keeps source realtime registrations active when shard move rollback succeeds", async () => {
@@ -4553,6 +4524,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: clientAKey,
+          shardName: "subscription:g1:0",
           deliveries: [
             {
               result: [{ text: "only-a" }],
@@ -4585,6 +4557,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-missing",
+          shardName: "subscription:g1:0",
           deliveries: [{ result: [], subscriptionId: "sub-missing" }],
         }),
         headers: { "content-type": "application/json" },
@@ -4601,6 +4574,7 @@ describe("worker runtime", () => {
         new Request("https://baseflare.internal/deliver", {
           body: JSON.stringify({
             connectionKey: "client:client-a",
+            shardName: "subscription:g1:0",
             result: [{ text: "legacy-flat-payload" }],
             subscriptionId: "sub-legacy",
           }),
@@ -4650,6 +4624,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey,
+          shardName: "subscription:g1:0",
           deliveries: [
             {
               result: [{ text: "first" }],
@@ -4729,6 +4704,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-a",
+          shardName: "subscription:g1:0",
           deliveries: [
             { result: [], sequence: 1, subscriptionId: "sub-a" },
             { result: [], sequence: 1, subscriptionId: "sub-b" },
@@ -4963,6 +4939,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: clientAKey,
+          shardName: "subscription:g1:0",
           deliveries: [
             { result: [{ text: "anonymous-a" }], subscriptionId: "sub-a" },
           ],
@@ -5364,6 +5341,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey,
+          shardName: "subscription:g1:0",
           deliveries: [
             { result: [{ text: "shared" }], subscriptionId: "sub-shared" },
           ],
@@ -5429,6 +5407,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: ownerAKey,
+          shardName: "subscription:g1:0",
           deliveries: [
             { result: [{ text: "owner-a-only" }], subscriptionId: "sub-a" },
           ],
@@ -5490,6 +5469,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: clientKey,
+          shardName: "subscription:g1:0",
           deliveries: [
             { result: [{ text: "client-only" }], subscriptionId: "sub-client" },
           ],
@@ -5502,6 +5482,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: sessionKey,
+          shardName: "subscription:g1:0",
           deliveries: [
             {
               result: [{ text: "session-only" }],
@@ -5556,7 +5537,7 @@ describe("worker runtime", () => {
     registry.add(
       failedSocket as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: "auth-owner-a",
         connectionKey: "client-a",
         subscriptions: [realtimeSocketSubscription("sub-a")],
       })
@@ -5574,6 +5555,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: "client-a",
+          shardName: "subscription:g1:0",
           deliveries: [
             {
               result: [{ text: "still-delivered" }],
@@ -5701,9 +5683,15 @@ describe("worker runtime", () => {
     expect(attachment.connectionName).toBe(
       getRealtimeConnectionShardName(attachment.connectionKey)
     );
+    expect(JSON.stringify(attachment)).not.toContain("Bearer owner-a");
+    expect(registerRequests[0]).toEqual(
+      expect.objectContaining({
+        authorizationFingerprint: expect.any(String),
+      })
+    );
     expect(attachment).toEqual(
       expect.objectContaining({
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: expect.any(String),
         latestDeliveredOutboxSequence: null,
         runtimeId: "runtime:1",
         subscriptions: [
@@ -5851,6 +5839,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: restoredAttachment.connectionKey,
+          shardName: "subscription:g1:0",
           deliveries: [{ result: [], sequence: 42, subscriptionId: "sub-a" }],
         }),
         headers: { "content-type": "application/json" },
@@ -6085,6 +6074,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/deliver", {
         body: JSON.stringify({
           connectionKey: attachment.connectionKey,
+          shardName: "subscription:g1:0",
           deliveries: [{ result: [], sequence: 42, subscriptionId: "sub-a" }],
         }),
         headers: { "content-type": "application/json" },
@@ -6636,6 +6626,7 @@ describe("worker runtime", () => {
       "subscription:g2:0",
       "subscription:g2:1",
     ]);
+    expect(state.alarmTime).toBeTypeOf("number");
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
@@ -8428,6 +8419,65 @@ describe("worker runtime", () => {
     ).toBe(true);
   });
 
+  it("logs individual realtime notify failure details across multiple shards", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_shard_generations SET subscription_shard_count = 8 WHERE generation_id = 1"
+    ).run();
+    const ownerToken =
+      ["owner-a", "owner-b", "owner-c", "owner-d"].find((token) => {
+        const shardNames = new Set([
+          getRealtimeSubscriptionShardName(
+            createRealtimeGlobalSubscriptionRouteTarget(),
+            8
+          ),
+          getRealtimeSubscriptionShardName(
+            createRealtimeTableSubscriptionRouteTarget("todos"),
+            8
+          ),
+          getRealtimeSubscriptionShardName(
+            createRealtimePartitionSubscriptionRouteTarget(
+              todoOwnerPartition(token)
+            ),
+            8
+          ),
+        ]);
+        return shardNames.size >= 2;
+      }) ?? "owner-a";
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname === "/notify") {
+        return Promise.resolve(Response.json({ ok: false }, { status: 400 }));
+      }
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+
+    await invoke(
+      "/api/mutation/todos:create",
+      {
+        body: rpcBody({ ownerToken, text: "multi-shard-notify-failure" }),
+        headers: { authorization: `Bearer ${ownerToken}` },
+        method: "POST",
+      },
+      worker,
+      { ...env, REALTIME_SUBSCRIPTIONS: subscriptions }
+    );
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const failureLogs = errorLog.mock.calls
+      .map(([, payload]) => payload as Record<string, unknown>)
+      .filter(
+        (payload) =>
+          payload.event === "runtime.realtime_notify_failed" &&
+          typeof payload.shardName === "string" &&
+          payload.status === 400
+      );
+
+    expect(
+      new Set(failureLogs.map((log) => log.shardName)).size
+    ).toBeGreaterThanOrEqual(2);
+  });
+
   it("lets subscription Durable Objects catch up from the realtime outbox", async () => {
     await invoke(
       "/api/mutation/todos:create",
@@ -9510,6 +9560,7 @@ describe("worker runtime", () => {
           new Request("https://baseflare.internal/deliver", {
             body: JSON.stringify({
               connectionKey: "client-a",
+              shardName: "subscription:g1:0",
               deliveries: [
                 {
                   result: [{ text: "healed" }],
@@ -9534,7 +9585,7 @@ describe("worker runtime", () => {
     getRealtimeSocketRegistry(connectionDo).add(
       socket as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: "auth-owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
         latestDeliveredOutboxSequence: 1,
@@ -9598,7 +9649,7 @@ describe("worker runtime", () => {
     registry.add(
       anchoredSocket as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: "auth-owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
         latestDeliveredOutboxSequence: 42,
@@ -9609,7 +9660,7 @@ describe("worker runtime", () => {
     registry.add(
       freshSocket as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-b",
+        authorizationFingerprint: "auth-owner-b",
         connectionKey: "client-b",
         connectionName: getRealtimeConnectionShardName("client-b"),
         latestDeliveredOutboxSequence: null,
@@ -9676,7 +9727,7 @@ describe("worker runtime", () => {
     registry.add(
       socketA as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: "auth-owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
         latestDeliveredOutboxSequence: 7,
@@ -9687,7 +9738,7 @@ describe("worker runtime", () => {
     registry.add(
       socketB as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-b",
+        authorizationFingerprint: "auth-owner-b",
         connectionKey: "client-b",
         connectionName: getRealtimeConnectionShardName("client-b"),
         latestDeliveredOutboxSequence: 42,
@@ -9698,7 +9749,7 @@ describe("worker runtime", () => {
     registry.add(
       socketC as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-c",
+        authorizationFingerprint: "auth-owner-c",
         connectionKey: "client-c",
         connectionName: getRealtimeConnectionShardName("client-c"),
         latestDeliveredOutboxSequence: null,
@@ -9742,7 +9793,7 @@ describe("worker runtime", () => {
     getRealtimeSocketRegistry(connectionDo).add(
       socket as unknown as RuntimeWebSocket,
       realtimeSocketAttachment({
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: "auth-owner-a",
         connectionKey: "client-a",
         connectionName: getRealtimeConnectionShardName("client-a"),
         latestDeliveredOutboxSequence: null,
@@ -10017,15 +10068,15 @@ describe("worker runtime", () => {
       REALTIME_CONNECTIONS: connections,
       REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
     });
-    for (const [subscriptionId, authorizationHeader] of [
-      ["sub-a", "Bearer owner-a"],
-      ["sub-b", "Bearer owner-b"],
+    for (const [subscriptionId, authorizationFingerprint] of [
+      ["sub-a", "auth-owner-a"],
+      ["sub-b", "auth-owner-b"],
     ] as const) {
       await subscriptionDo.fetch(
         new Request("https://baseflare.internal/register", {
           body: JSON.stringify({
             args: { mode: "partition-todos", ownerToken: "owner-a" },
-            authorizationHeader,
+            authorizationFingerprint,
             connectionKey: "client-a",
             connectionName: "connection:0",
             epoch: 1,
@@ -10078,7 +10129,7 @@ describe("worker runtime", () => {
       new Request("https://baseflare.internal/register", {
         body: JSON.stringify({
           args: { mode: "partition-todos", ownerToken: "owner-a" },
-          authorizationHeader: "Bearer owner-a",
+          authorizationFingerprint: "auth-owner-a",
           connectionKey: "client-a",
           connectionName: "connection:0",
           epoch: 1,
@@ -10097,7 +10148,7 @@ describe("worker runtime", () => {
     if (!registration) {
       throw new Error("Expected realtime registration");
     }
-    registration.authorizationHeader = "Bearer owner-b";
+    registration.authorizationFingerprint = "auth-owner-b";
     await createRealtimeOutboxEvent("orphaned-active-query-auth", Date.now(), {
       partitions: [todoOwnerPartition("owner-a")],
       tables: ["todos"],
@@ -12984,7 +13035,7 @@ describe("worker runtime", () => {
       message: { result: [], sequence: 1, subscriptionId },
       registration: {
         args: { ownerToken: "owner-a" },
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: "auth-owner-a",
         connectionKey,
         connectionName: getRealtimeConnectionShardName(connectionKey),
         epoch: 1,
@@ -14144,7 +14195,7 @@ describe("worker runtime", () => {
       const subscriptionId = `sub-${index}`;
       const registration: StoredRealtimeRegistration = {
         args: { ownerToken: "owner-a" },
-        authorizationHeader: "Bearer owner-a",
+        authorizationFingerprint: "auth-owner-a",
         connectionKey: "client-a",
         connectionName: "connection:0",
         epoch: 1,
@@ -14444,8 +14495,7 @@ describe("worker runtime", () => {
 
   it("enforces fail-closed permissions", async () => {
     const deniedWrite = await invoke("/api/mutation/todos:create", {
-      body: rpcBody({ ownerToken: "owner-a", text: "secret" }),
-      headers: { authorization: "Bearer owner-b" },
+      body: rpcBody({ ownerToken: "blocked-owner", text: "secret" }),
       method: "POST",
     });
     const deniedBody = (await deniedWrite.json()) as {
@@ -14455,10 +14505,9 @@ describe("worker runtime", () => {
     expect(deniedWrite.status).toBe(403);
     expect(deniedBody.error.code).toBe(ErrorCode.PermissionDenied);
 
-    const id = await createTodoViaRpc("owner-a", "secret");
+    const id = await createTodoViaRpc("owner-b", "secret");
     const deniedRead = await invoke("/api/query/todos:get", {
       body: rpcBody({ id }),
-      headers: { authorization: "Bearer owner-b" },
       method: "POST",
     });
     const deniedReadBody = (await deniedRead.json()) as { result: unknown };

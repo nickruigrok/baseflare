@@ -3,27 +3,14 @@ export interface BearerAuthIdentity {
   readonly type: "bearer";
 }
 
-function parseAuthorizationHeader(headers: Headers): string | null {
-  const value = headers.get("authorization");
-  if (!value) {
-    return null;
-  }
-
-  const match = /^Bearer ([^\s]+)$/i.exec(value.trim());
-  return match?.[1] ?? null;
-}
-
-export function createAuth(headers: Headers): {
+export function createAuth(_headers: Headers): {
   getUserIdentity(): BearerAuthIdentity | null;
 } {
-  const token = parseAuthorizationHeader(headers);
-  const identity: BearerAuthIdentity | null = token
-    ? { token, type: "bearer" }
-    : null;
-
+  // Phase 5 will install Better Auth-backed identity resolution here. Until
+  // then, raw bearer strings are opaque credentials, not verified identity.
   return {
     getUserIdentity() {
-      return identity;
+      return null;
     },
   };
 }

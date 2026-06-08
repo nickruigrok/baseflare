@@ -32,6 +32,18 @@ describe("validators", () => {
     expect(v.any().validate({ anything: true })).toEqual({ anything: true });
   });
 
+  it("keeps record __proto__ values as own data properties", () => {
+    const parsed = JSON.parse('{"__proto__":{"isAdmin":true},"safe":1}') as {
+      readonly __proto__: unknown;
+      readonly safe: number;
+    };
+    const result = v.record(v.any()).validate(parsed);
+
+    expect(Object.hasOwn(result, "__proto__")).toBe(true);
+    expect((result as { readonly isAdmin?: boolean }).isAdmin).toBeUndefined();
+    expect(Object.getPrototypeOf(result)).toBe(Object.prototype);
+  });
+
   it("applies optional and default semantics to object shapes", () => {
     const todoValidator = v.object({
       text: v.string(),

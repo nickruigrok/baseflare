@@ -124,9 +124,8 @@ async function createRealtimeActiveQueryHash(
     return null;
   }
 
-  const authorizationFingerprint = registration.authorizationHeader
-    ? await sha256Hex(registration.authorizationHeader)
-    : null;
+  const authorizationFingerprint =
+    registration.authorizationFingerprint ?? null;
   return await sha256Hex(
     JSON.stringify([
       registration.runtimeId,

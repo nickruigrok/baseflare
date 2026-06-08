@@ -572,7 +572,12 @@ function recordValidator<TValueValidator extends AnyValidator>(
 
       const result: Record<string, unknown> = {};
       for (const [key, entry] of Object.entries(value)) {
-        result[key] = valueValidator.validate(entry, `${path}.${key}`);
+        Object.defineProperty(result, key, {
+          configurable: true,
+          enumerable: true,
+          value: valueValidator.validate(entry, `${path}.${key}`),
+          writable: true,
+        });
       }
 
       return result as Record<string, OutputValue<TValueValidator>>;
