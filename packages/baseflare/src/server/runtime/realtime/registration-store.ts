@@ -127,10 +127,37 @@ export class RealtimeRegistrationStore {
     await this.persistByKey(registrationKey, nextRegistration);
     registration.activeQueryKey = nextRegistration.activeQueryKey;
     this.registrations.set(registrationKey, nextRegistration);
-    await this.activeQueryStore?.upsertFromRegistration(
-      registrationKey,
-      nextRegistration
-    );
+    try {
+      await this.activeQueryStore?.upsertFromRegistration(
+        registrationKey,
+        nextRegistration
+      );
+    } catch (error) {
+      try {
+        if (existing) {
+          this.registrations.set(registrationKey, existing);
+          registration.activeQueryKey = existing.activeQueryKey;
+          await this.persistByKey(registrationKey, existing);
+        } else {
+          this.registrations.delete(registrationKey);
+          registration.activeQueryKey = undefined;
+          await this.deleteStoredByKey(registrationKey);
+        }
+      } catch (rollbackError) {
+        logRuntimeEvent(
+          "error",
+          "runtime.realtime_registration_upsert_rollback_failed",
+          {
+            errorName:
+              rollbackError instanceof Error
+                ? rollbackError.name
+                : typeof rollbackError,
+            registrationKey,
+          }
+        );
+      }
+      throw error;
+    }
 
     if (
       existing &&

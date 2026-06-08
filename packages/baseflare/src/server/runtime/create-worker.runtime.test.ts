@@ -39,6 +39,7 @@ import { RealtimeConnectionDO } from "./realtime/connection-do";
 import {
   createRealtimeGlobalSubscriptionRouteTarget,
   createRealtimePartitionSubscriptionRouteTarget,
+  createRegistrationKey,
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
   getRealtimeSubscriptionShardNames,
@@ -8604,10 +8605,15 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
+    const cursorBefore = await env.APP_DB.prepare(
+      "SELECT last_processed_outbox_sequence FROM _bf_realtime_shard_cursors WHERE shard_name = ?"
+    )
+      .bind(getRealtimeSubscriptionShardName())
+      .first<{ last_processed_outbox_sequence: number }>();
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/catch-up", {
-        body: JSON.stringify({ afterSequence: null, limit: 10 }),
+        body: JSON.stringify({ afterSequence: 123, limit: 10 }),
         headers: { "content-type": "application/json" },
         method: "POST",
       })
@@ -8627,6 +8633,12 @@ describe("worker runtime", () => {
       ok: true,
     });
     expect(connections.requests).toHaveLength(0);
+    const cursor = await env.APP_DB.prepare(
+      "SELECT last_processed_outbox_sequence FROM _bf_realtime_shard_cursors WHERE shard_name = ?"
+    )
+      .bind(getRealtimeSubscriptionShardName())
+      .first<{ last_processed_outbox_sequence: number }>();
+    expect(cursor).toEqual(cursorBefore);
   });
 
   it("fully re-evaluates realtime subscriptions when catch-up history has a gap", async () => {
@@ -8680,7 +8692,6 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
-
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/catch-up", {
         body: JSON.stringify({ afterSequence: 0, limit: 10 }),
@@ -8722,7 +8733,7 @@ describe("worker runtime", () => {
     expect(historyGapQueries).toHaveLength(1);
   });
 
-  it("advances catch-up cursor to afterSequence when retained gap rows are gone", async () => {
+  it("does not advance catch-up cursor to afterSequence when retained gap rows are gone", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await createTodoViaRpc("owner-a", "gap-empty-recovered");
     let historyGapQueries = 0;
@@ -8778,6 +8789,11 @@ describe("worker runtime", () => {
         method: "POST",
       })
     );
+    const cursorBefore = await env.APP_DB.prepare(
+      "SELECT last_processed_outbox_sequence FROM _bf_realtime_shard_cursors WHERE shard_name = ?"
+    )
+      .bind(getRealtimeSubscriptionShardName())
+      .first<{ last_processed_outbox_sequence: number }>();
 
     const response = await subscriptionDo.fetch(
       new Request("https://baseflare.internal/catch-up", {
@@ -8796,7 +8812,7 @@ describe("worker runtime", () => {
       .first<{ last_processed_outbox_sequence: number }>();
 
     expect(body.recoveredByFullReevaluation).toBe(true);
-    expect(cursor?.last_processed_outbox_sequence).toBe(123);
+    expect(cursor).toEqual(cursorBefore);
     expect(historyGapQueries).toBe(1);
   });
 
@@ -9132,14 +9148,14 @@ describe("worker runtime", () => {
       .bind(expiredAt)
       .first<{ count: number }>();
 
-    expect(remaining?.count).toBe(1);
+    expect(remaining?.count).toBe(0);
     expect(info).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({
         event: "runtime.metric",
         metric: "baseflare.runtime.realtime.outbox_cleanups",
         tags: { result: "cleaned" },
-        value: 1,
+        value: 2,
       })
     );
   });
@@ -14043,6 +14059,69 @@ describe("worker runtime", () => {
     expect(
       registrationsBody.registrations[0]?.reEvaluationRetryAt
     ).toBeGreaterThan(Date.now());
+  });
+
+  it("releases all realtime registration markers after an outer delivery group failure", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const deliveries: PendingRealtimeDelivery[] = [];
+    const reEvaluatingRegistrations = (
+      subscriptionDo as unknown as {
+        reEvaluatingRegistrations: Set<string>;
+      }
+    ).reEvaluatingRegistrations;
+    for (let index = 0; index < REALTIME_DELIVERY_BATCH_SIZE + 1; index += 1) {
+      const subscriptionId = `sub-${index}`;
+      const registration: StoredRealtimeRegistration = {
+        args: { ownerToken: "owner-a" },
+        authorizationHeader: "Bearer owner-a",
+        connectionKey: "client-a",
+        connectionName: "connection:0",
+        epoch: 1,
+        leaseExpiresAt: Date.now() + 60_000,
+        queryName: "todos:list",
+        runtimeId,
+        subscriptionId,
+      };
+      reEvaluatingRegistrations.add(
+        createRegistrationKey(registration.connectionKey, subscriptionId)
+      );
+      deliveries.push({
+        dependencies: { partitions: new Set(), tables: new Set(["todos"]) },
+        message: {
+          result: [],
+          sequence: 1,
+          subscriptionId,
+        },
+        registration,
+        resultJson: "[]",
+        versionSnapshot: { partitions: new Map(), tables: new Map() },
+      });
+    }
+    const internalSubscriptionDo = subscriptionDo as unknown as {
+      flushPendingDeliveries(
+        pendingDeliveries: readonly PendingRealtimeDelivery[]
+      ): Promise<{ readonly evaluated: number; readonly failed: number }>;
+      flushPendingDeliveryGroup(): Promise<{
+        readonly evaluated: number;
+        readonly failed: number;
+      }>;
+    };
+    internalSubscriptionDo.flushPendingDeliveryGroup = () =>
+      Promise.reject(new Error("Unexpected group failure"));
+
+    const result =
+      await internalSubscriptionDo.flushPendingDeliveries(deliveries);
+
+    expect(result).toEqual({
+      evaluated: 0,
+      failed: REALTIME_DELIVERY_BATCH_SIZE + 1,
+    });
+    expect(reEvaluatingRegistrations.size).toBe(0);
   });
 
   it("removes expired realtime registrations after non-ok delivery responses", async () => {

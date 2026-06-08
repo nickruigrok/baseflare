@@ -138,6 +138,76 @@ describe("RealtimeRegistrationStore", () => {
     expect(activeQueryStore.size()).toBe(0);
   });
 
+  it("rolls back a new registration when active query attachment fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const originalPut = state.storage.put;
+    state.storage.put = ((key, value) => {
+      if (key.startsWith("realtime:active-query:")) {
+        return Promise.reject(new Error("Active query put failed"));
+      }
+      return originalPut(key, value);
+    }) as typeof state.storage.put;
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    const key = registrationKey("sub-a");
+    const storedRegistration = registration("sub-a");
+
+    await expect(store.upsert(key, storedRegistration)).rejects.toThrow(
+      "Active query put failed"
+    );
+
+    expect(store.size()).toBe(0);
+    expect(store.get(key)).toBeUndefined();
+    expect(storedRegistration.activeQueryKey).toBeUndefined();
+    expect(activeQueryStore.size()).toBe(0);
+    expect(
+      [...state.durableStorage.keys()].some((storageKey) =>
+        storageKey.startsWith("realtime:registration:")
+      )
+    ).toBe(false);
+  });
+
+  it("restores the previous registration when replacement active query attachment fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    const key = registrationKey("sub-a");
+    const previousRegistration = registration("sub-a", {
+      args: { filter: "old" },
+    });
+    await store.upsert(key, previousRegistration);
+    const previousActiveQueryKey = previousRegistration.activeQueryKey;
+    const originalPut = state.storage.put;
+    state.storage.put = ((storageKey, value) => {
+      if (storageKey.startsWith("realtime:active-query:")) {
+        return Promise.reject(new Error("Active query put failed"));
+      }
+      return originalPut(storageKey, value);
+    }) as typeof state.storage.put;
+
+    await expect(
+      store.upsert(
+        key,
+        registration("sub-a", {
+          args: { filter: "new" },
+        })
+      )
+    ).rejects.toThrow("Active query put failed");
+
+    expect(store.get(key)).toMatchObject({
+      activeQueryKey: previousActiveQueryKey,
+      args: { filter: "old" },
+    });
+    expect(activeQueryStore.size()).toBe(1);
+    expect(
+      previousActiveQueryKey
+        ? activeQueryStore
+            .get(previousActiveQueryKey)
+            ?.memberRegistrationKeys.has(key)
+        : false
+    ).toBe(true);
+  });
+
   it("keeps active query indexes unchanged when dependency registration persistence fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const activeQueryStore = new RealtimeActiveQueryStore(state);

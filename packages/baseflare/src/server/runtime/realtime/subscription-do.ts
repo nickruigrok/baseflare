@@ -443,16 +443,18 @@ export class RealtimeSubscriptionDO {
       afterSequence
     );
     if (historyGap.hasGap) {
-      const recoverySequence = historyGap.latestSequence ?? afterSequence;
+      const recoverySequence = historyGap.latestSequence;
       const result = await this.reEvaluateActiveRegistrations(
         createFullRealtimeAffectedTargets(recoverySequence),
         "catch_up",
         database
       );
-      await this.advanceLastProcessedOutboxSequence(
-        recoverySequence,
-        shardContext
-      );
+      if (recoverySequence !== null) {
+        await this.advanceLastProcessedOutboxSequence(
+          recoverySequence,
+          shardContext
+        );
+      }
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({
@@ -492,17 +494,13 @@ export class RealtimeSubscriptionDO {
 
     const { events } = catchUp;
     if (events.length === 0) {
-      await this.advanceLastProcessedOutboxSequence(
-        afterSequence,
-        shardContext
-      );
       await this.cleanupRealtimeOutbox();
       await this.maybeEvaluateAutoscaling();
       return jsonResponse({
         evaluated: 0,
         events: createRealtimeOutboxResponseEvents(events),
         failed: 0,
-        latestSequence: afterSequence,
+        latestSequence: null,
         ok: true,
       });
     }
@@ -1285,6 +1283,9 @@ export class RealtimeSubscriptionDO {
             failed += result.failed;
           }
         } catch (error) {
+          for (const delivery of group.deliveries) {
+            this.releaseRegistrationEvaluation(delivery.registration);
+          }
           await Promise.allSettled(
             group.deliveries.map((delivery) =>
               this.recoverFailedDeliveryRegistration(delivery, error)
