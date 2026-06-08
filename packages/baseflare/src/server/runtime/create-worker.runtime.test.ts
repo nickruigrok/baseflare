@@ -9771,6 +9771,34 @@ describe("worker runtime", () => {
     );
   });
 
+  it("clamps realtime catch-up limits below one", async () => {
+    await createRealtimeOutboxEvent("catch-up-min-limit", Date.now(), {
+      partitions: [],
+      tables: ["todos"],
+    });
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 0 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      events: Array<{ eventId: string }>;
+      ok: boolean;
+    };
+
+    expect(body.ok).toBe(true);
+    expect(body.events).toHaveLength(1);
+    expect(body.events[0]?.eventId).toBe("catch-up-min-limit");
+  });
+
   it("advances realtime notify cursors by outbox sequence", async () => {
     await env.APP_DB.prepare(
       "INSERT INTO _bf_realtime_outbox (event_id, created_at, tables, partitions) VALUES (?, ?, ?, ?)"
@@ -12493,6 +12521,13 @@ describe("worker runtime", () => {
     };
 
     expect(body).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(
+      (
+        subscriptionDo as unknown as {
+          reEvaluatingRegistrations: Set<string>;
+        }
+      ).reEvaluatingRegistrations.size
+    ).toBe(0);
     expect(
       registrationsBody.registrations.map(
         (registration) => registration.subscriptionId

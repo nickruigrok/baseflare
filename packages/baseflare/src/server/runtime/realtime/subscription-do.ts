@@ -440,9 +440,7 @@ export class RealtimeSubscriptionDO {
     const catchUp = await fetchRealtimeOutboxEvents(
       database,
       afterSequence,
-      typeof body.limit === "number"
-        ? body.limit
-        : REALTIME_CATCH_UP_EVENT_LIMIT
+      this.catchUpEventLimit(body.limit)
     );
     if (catchUp.hasMalformedEvents) {
       const result = await this.reEvaluateActiveRegistrations(
@@ -1152,21 +1150,21 @@ export class RealtimeSubscriptionDO {
   }> {
     const startedAt = Date.now();
     this.deliveryBatchAttemptsSinceAutoscale += 1;
-    let result: RealtimeDeliveryResult;
     try {
-      result = await this.deliverPendingGroup(group);
-    } catch (error) {
-      this.deliveryBatchFailuresSinceAutoscale += 1;
-      await Promise.allSettled(
-        group.deliveries.map((delivery) =>
-          this.recoverFailedDeliveryRegistration(delivery, error)
-        )
-      );
-      this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
-      return { evaluated: 0, failed: group.deliveries.length };
-    }
+      let result: RealtimeDeliveryResult;
+      try {
+        result = await this.deliverPendingGroup(group);
+      } catch (error) {
+        this.deliveryBatchFailuresSinceAutoscale += 1;
+        await Promise.allSettled(
+          group.deliveries.map((delivery) =>
+            this.recoverFailedDeliveryRegistration(delivery, error)
+          )
+        );
+        this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
+        return { evaluated: 0, failed: group.deliveries.length };
+      }
 
-    try {
       const groupSubscriptionIds = new Set(
         group.deliveries.map((delivery) => delivery.registration.subscriptionId)
       );
@@ -1220,6 +1218,17 @@ export class RealtimeSubscriptionDO {
         );
       }
     }
+  }
+
+  private catchUpEventLimit(limit: unknown): number {
+    if (typeof limit !== "number" || !Number.isFinite(limit)) {
+      return REALTIME_CATCH_UP_EVENT_LIMIT;
+    }
+
+    return Math.max(
+      1,
+      Math.min(Math.trunc(limit), REALTIME_CATCH_UP_EVENT_LIMIT)
+    );
   }
 
   private async handleUndeliveredRegistration(
