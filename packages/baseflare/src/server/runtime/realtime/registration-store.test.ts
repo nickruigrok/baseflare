@@ -260,6 +260,80 @@ describe("RealtimeRegistrationStore", () => {
     ).not.toContain(activeQueryKey);
   });
 
+  it("rolls back dependency updates when active query attachment fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    const key = registrationKey("sub-a");
+    const storedRegistration = registration("sub-a", {
+      dependencies: { partitions: new Set(), tables: new Set(["todos"]) },
+      versionSnapshot: {
+        partitions: new Map(),
+        tables: new Map([["todos", 1]]),
+      },
+    });
+    await store.upsert(key, storedRegistration);
+    const activeQueryKey = storedRegistration.activeQueryKey;
+    if (!activeQueryKey) {
+      throw new Error("Expected active query key");
+    }
+    const originalPut = state.storage.put;
+    state.storage.put = ((storageKey, value) => {
+      if (storageKey.startsWith("realtime:active-query:")) {
+        return Promise.reject(new Error("Active query put failed"));
+      }
+      return originalPut(storageKey, value);
+    }) as typeof state.storage.put;
+
+    await expect(
+      store.updateSameShardDependencies(
+        key,
+        storedRegistration,
+        { partitions: new Set(), tables: new Set(["labels"]) },
+        { partitions: new Map(), tables: new Map([["labels", 1]]) }
+      )
+    ).rejects.toThrow("Active query put failed");
+
+    expect(storedRegistration.activeQueryKey).toBe(activeQueryKey);
+    expect(storedRegistration.dependencies?.tables).toEqual(new Set(["todos"]));
+    expect(storedRegistration.versionSnapshot?.tables).toEqual(
+      new Map([["todos", 1]])
+    );
+    expect(store.get(key)?.dependencies?.tables).toEqual(new Set(["todos"]));
+    expect(
+      activeQueryStore.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-todos",
+            partitions: [],
+            sequence: 1,
+            tables: ["todos"],
+          },
+        ])
+      )
+    ).toContain(activeQueryKey);
+    expect(
+      activeQueryStore.getRelevantKeys(
+        createRealtimeAffectedTargets([
+          {
+            createdAt: Date.now(),
+            eventId: "event-labels",
+            partitions: [],
+            sequence: 2,
+            tables: ["labels"],
+          },
+        ])
+      )
+    ).not.toContain(activeQueryKey);
+
+    const reloadedStore = new RealtimeRegistrationStore(state);
+    await reloadedStore.loadOnce();
+    expect(reloadedStore.get(key)?.dependencies?.tables).toEqual(
+      new Set(["todos"])
+    );
+  });
+
   it("updates dependency state after persistence succeeds", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeRegistrationStore(state);

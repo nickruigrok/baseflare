@@ -904,6 +904,7 @@ export class RealtimeSubscriptionDO {
     try {
       const evaluation = await this.evaluateActiveQueryDefinition(
         activeQuery,
+        registrations,
         database
       );
       await this.activeQueryStore.markEvaluated(
@@ -1631,6 +1632,7 @@ export class RealtimeSubscriptionDO {
 
   private async evaluateActiveQueryDefinition(
     activeQuery: StoredRealtimeActiveQuery,
+    registrations: readonly StoredRealtimeRegistration[],
     database: RuntimeDatabase
   ): Promise<RealtimeEvaluationResult> {
     const runtime = configuredRealtimeRuntimes.get(activeQuery.runtimeId);
@@ -1652,8 +1654,12 @@ export class RealtimeSubscriptionDO {
     }
 
     const headers = new Headers();
-    if (activeQuery.authorizationHeader) {
-      headers.set("authorization", activeQuery.authorizationHeader);
+    const authorizationHeader = this.resolveActiveQueryAuthorizationHeader(
+      activeQuery,
+      registrations
+    );
+    if (authorizationHeader) {
+      headers.set("authorization", authorizationHeader);
     }
 
     const { dependencies, readObserver } = createRealtimeDependencySet();
@@ -1681,6 +1687,30 @@ export class RealtimeSubscriptionDO {
     );
 
     return { dependencies, result, resultJson, versionSnapshot };
+  }
+
+  private resolveActiveQueryAuthorizationHeader(
+    activeQuery: StoredRealtimeActiveQuery,
+    registrations: readonly StoredRealtimeRegistration[]
+  ): string | undefined {
+    if (!activeQuery.authorizationHeader) {
+      return undefined;
+    }
+
+    // Phase 3 treats Authorization as an opaque app credential. Token
+    // validation, revocation, and refresh belong to the auth/client phases; the
+    // realtime runtime only ensures stored auth is still backed by live members.
+    const hasMatchingMember = registrations.some(
+      (registration) =>
+        registration.authorizationHeader === activeQuery.authorizationHeader
+    );
+    if (!hasMatchingMember) {
+      throw new InternalRuntimeError(
+        "Realtime active query authorization is no longer attached to a live registration"
+      );
+    }
+
+    return activeQuery.authorizationHeader;
   }
 
   private createPendingDelivery(

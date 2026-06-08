@@ -235,7 +235,9 @@ export class RealtimeRegistrationStore {
     dependencies: RealtimeDependencySet,
     versionSnapshot: RealtimeVersionSnapshot
   ): Promise<void> {
+    const previousDependencies = registration.dependencies;
     const previousActiveQueryKey = registration.activeQueryKey;
+    const previousVersionSnapshot = registration.versionSnapshot;
     const nextRegistration = {
       ...registration,
       dependencies,
@@ -255,11 +257,34 @@ export class RealtimeRegistrationStore {
     registration.versionSnapshot = versionSnapshot;
     registration.activeQueryKey = nextRegistration.activeQueryKey;
     this.registrations.set(registrationKey, registration);
-    await this.activeQueryStore?.upsertFromRegistration(
-      registrationKey,
-      registration,
-      { recomputeKey: true }
-    );
+    try {
+      await this.activeQueryStore?.upsertFromRegistration(
+        registrationKey,
+        registration,
+        { recomputeKey: true }
+      );
+    } catch (error) {
+      registration.dependencies = previousDependencies;
+      registration.versionSnapshot = previousVersionSnapshot;
+      registration.activeQueryKey = previousActiveQueryKey;
+      this.registrations.set(registrationKey, registration);
+      try {
+        await this.persistByKey(registrationKey, registration);
+      } catch (rollbackError) {
+        logRuntimeEvent(
+          "error",
+          "runtime.realtime_registration_dependency_update_rollback_failed",
+          {
+            errorName:
+              rollbackError instanceof Error
+                ? rollbackError.name
+                : typeof rollbackError,
+            registrationKey,
+          }
+        );
+      }
+      throw error;
+    }
     if (previousActiveQueryKey !== registration.activeQueryKey) {
       await this.activeQueryStore?.detachRegistration(
         registrationKey,

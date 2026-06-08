@@ -962,6 +962,7 @@ interface RealtimeIndexTestState {
     string,
     {
       activeQueryKey?: string;
+      authorizationHeader?: string;
       lastResultJson?: string;
       leaseExpiresAt: number;
       movePending?: boolean;
@@ -10053,6 +10054,71 @@ describe("worker runtime", () => {
     );
 
     expect(realtimeDependencyTrackingQueryCalls).toBe(2);
+  });
+
+  it("does not evaluate authenticated active queries with orphaned stored auth", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { mode: "partition-todos", ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:dependencyTracking",
+          runtimeId,
+          subscriptionId: "sub-a",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(realtimeRegistrationKey("client-a", "sub-a"));
+    if (!registration) {
+      throw new Error("Expected realtime registration");
+    }
+    registration.authorizationHeader = "Bearer owner-b";
+    await createRealtimeOutboxEvent("orphaned-active-query-auth", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "orphaned-active-query-auth" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(await response.json()).toEqual({
+      evaluated: 0,
+      failed: 1,
+      ok: true,
+    });
+    expect(realtimeDependencyTrackingQueryCalls).toBe(0);
+    expect(connections.requests).toHaveLength(0);
+    expect(registration.reEvaluationRetryAt).toBeGreaterThan(Date.now());
   });
 
   it("batches relevant realtime version-gap reads", async () => {
