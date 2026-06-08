@@ -110,6 +110,10 @@ export class RealtimeActiveQueryStore {
         continue;
       }
 
+      if (this.areSetsEqual(activeQuery.memberRegistrationKeys, members)) {
+        continue;
+      }
+
       await this.replaceMembers(activeQueryKey, activeQuery, members);
     }
 
@@ -440,6 +444,23 @@ export class RealtimeActiveQueryStore {
     for (const activeQueryKey of activeQueryKeys) {
       target.add(activeQueryKey);
     }
+  }
+
+  private areSetsEqual(
+    left: ReadonlySet<string>,
+    right: ReadonlySet<string>
+  ): boolean {
+    if (left.size !== right.size) {
+      return false;
+    }
+
+    for (const value of left) {
+      if (!right.has(value)) {
+        return false;
+      }
+    }
+
+    return true;
   }
 
   private addToIndexes(

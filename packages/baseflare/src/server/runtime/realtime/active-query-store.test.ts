@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeRealtimeDurableObjectState } from "../realtime.test-helpers";
 import { RealtimeActiveQueryStore } from "./active-query-store";
 import {
@@ -379,6 +379,48 @@ describe("RealtimeActiveQueryStore", () => {
         ])
       ).size
     ).toBe(1);
+  });
+
+  it("skips member persistence when synced membership is unchanged", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeActiveQueryStore(state);
+    const partitionDependencies: RealtimeDependencySet = {
+      partitions: new Set([todoOwnerPartitionId("owner-a")]),
+      tables: new Set(),
+    };
+    const registrations = [
+      registration("sub-a", { dependencies: partitionDependencies }),
+      registration("sub-b", { dependencies: partitionDependencies }),
+    ];
+    await store.syncRegistrations(registrations);
+    const storagePut = vi.spyOn(state.storage, "put");
+
+    await store.syncRegistrations(registrations);
+
+    expect(storagePut).not.toHaveBeenCalled();
+  });
+
+  it("persists member changes during registration sync", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeActiveQueryStore(state);
+    const partitionDependencies: RealtimeDependencySet = {
+      partitions: new Set([todoOwnerPartitionId("owner-a")]),
+      tables: new Set(),
+    };
+    await store.syncRegistrations([
+      registration("sub-a", { dependencies: partitionDependencies }),
+    ]);
+    const storagePut = vi.spyOn(state.storage, "put");
+
+    await store.syncRegistrations([
+      registration("sub-a", { dependencies: partitionDependencies }),
+      registration("sub-b", { dependencies: partitionDependencies }),
+    ]);
+
+    expect(storagePut).toHaveBeenCalledTimes(1);
+    expect(store.values()[0]?.memberRegistrationKeys).toEqual(
+      new Set([registrationKey("sub-a"), registrationKey("sub-b")])
+    );
   });
 
   it("removes active queries that have no synced registrations", async () => {

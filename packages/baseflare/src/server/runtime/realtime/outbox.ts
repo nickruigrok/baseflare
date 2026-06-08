@@ -476,6 +476,17 @@ export async function fetchRealtimeOutboxHistoryGap(
   };
 }
 
+export async function hasRealtimeOutboxEvents(
+  database: Pick<RuntimeDatabase, "prepare">
+): Promise<boolean> {
+  const row = await bindStatement(
+    database,
+    `SELECT 1 AS has_events FROM ${REALTIME_OUTBOX_TABLE_NAME} LIMIT 1`,
+    []
+  ).first<{ has_events: number }>();
+  return row?.has_events === 1;
+}
+
 export async function deleteRealtimeOutboxEventsBefore(
   database: Pick<RuntimeDatabase, "prepare">,
   createdBefore: number,

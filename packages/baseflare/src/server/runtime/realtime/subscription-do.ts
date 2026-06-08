@@ -11,6 +11,7 @@ import {
   fetchRealtimeOutboxEventSequenceById,
   fetchRealtimeOutboxEvents,
   fetchRealtimeOutboxHistoryGap,
+  hasRealtimeOutboxEvents,
 } from "./outbox";
 import { RealtimeRegistrationStore } from "./registration-store";
 import {
@@ -132,8 +133,10 @@ export class RealtimeSubscriptionDO {
   async alarm(): Promise<void> {
     await this.loadRealtimeState();
     await this.registrationStore.cleanupExpired();
-    await this.cleanupRealtimeOutbox();
-    await this.scheduleOutboxCleanupAlarm({ replace: true });
+    const cleanupSucceeded = await this.cleanupRealtimeOutbox();
+    if (!cleanupSucceeded || (await this.shouldScheduleOutboxCleanupAlarm())) {
+      await this.scheduleOutboxCleanupAlarm({ replace: true });
+    }
   }
 
   async fetch(request: Request): Promise<Response> {
@@ -1126,17 +1129,27 @@ export class RealtimeSubscriptionDO {
     readonly evaluated: number;
     readonly failed: number;
   }> {
-    const groupResults = await Promise.all(
-      this.createPendingDeliveryGroups(pendingDeliveries).map(async (group) => {
+    const deliveryGroups = this.createPendingDeliveryGroups(pendingDeliveries);
+    const groupResults = await Promise.allSettled(
+      deliveryGroups.map(async (group) => {
         let evaluated = 0;
         let failed = 0;
-        for (const deliveries of chunkRealtimeDeliveries(group.deliveries)) {
-          const result = await this.flushPendingDeliveryGroup({
-            ...group,
-            deliveries,
-          });
-          evaluated += result.evaluated;
-          failed += result.failed;
+        try {
+          for (const deliveries of chunkRealtimeDeliveries(group.deliveries)) {
+            const result = await this.flushPendingDeliveryGroup({
+              ...group,
+              deliveries,
+            });
+            evaluated += result.evaluated;
+            failed += result.failed;
+          }
+        } catch (error) {
+          await Promise.allSettled(
+            group.deliveries.map((delivery) =>
+              this.recoverFailedDeliveryRegistration(delivery, error)
+            )
+          );
+          failed = group.deliveries.length;
         }
         emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
           result: getRealtimeDeliveryGroupMetricResult(evaluated, failed),
@@ -1149,8 +1162,10 @@ export class RealtimeSubscriptionDO {
     let evaluated = 0;
     let failed = 0;
     for (const result of groupResults) {
-      evaluated += result.evaluated;
-      failed += result.failed;
+      if (result.status === "fulfilled") {
+        evaluated += result.value.evaluated;
+        failed += result.value.failed;
+      }
     }
 
     return { evaluated, failed };
@@ -1402,10 +1417,10 @@ export class RealtimeSubscriptionDO {
     );
   }
 
-  private async cleanupRealtimeOutbox(): Promise<void> {
+  private async cleanupRealtimeOutbox(): Promise<boolean> {
     const now = Date.now();
     if (now - this.lastOutboxCleanupAt < REALTIME_OUTBOX_CLEANUP_INTERVAL_MS) {
-      return;
+      return true;
     }
 
     this.lastOutboxCleanupAt = now;
@@ -1423,10 +1438,12 @@ export class RealtimeSubscriptionDO {
         result:
           deleted >= REALTIME_OUTBOX_CLEANUP_LIMIT ? "limited" : "cleaned",
       });
+      return true;
     } catch (error) {
       logRuntimeEvent("error", "runtime.realtime_outbox_cleanup_failed", {
         errorName: error instanceof Error ? error.name : typeof error,
       });
+      return false;
     }
   }
 
@@ -1446,6 +1463,21 @@ export class RealtimeSubscriptionDO {
     }
 
     await storage.setAlarm(Date.now() + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
+  }
+
+  private async shouldScheduleOutboxCleanupAlarm(): Promise<boolean> {
+    if (this.registrationStore.size() > 0) {
+      return true;
+    }
+
+    try {
+      return await hasRealtimeOutboxEvents(this.database);
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_outbox_cleanup_failed", {
+        errorName: error instanceof Error ? error.name : typeof error,
+      });
+      return true;
+    }
   }
 
   private async evaluateActiveQueryDefinition(

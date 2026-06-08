@@ -57,6 +57,7 @@ import {
 import type { RealtimeSocketRegistry } from "./realtime/socket-registry";
 import { RealtimeSubscriptionDO } from "./realtime/subscription-do";
 import type {
+  PendingRealtimeDelivery,
   RealtimeDependencySet,
   RealtimeSocketAttachment,
   RealtimeSocketSubscription,
@@ -8477,6 +8478,62 @@ describe("worker runtime", () => {
     expect(state.alarmTime).toBe(now + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
   });
 
+  it("does not perpetuate realtime outbox cleanup alarms on idle shards", async () => {
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const state = new FakeRealtimeDurableObjectState();
+    state.alarmTime = now;
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    try {
+      await subscriptionDo.alarm();
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(state.alarmTime).toBe(now);
+  });
+
+  it("keeps realtime outbox cleanup alarms while registrations are active", async () => {
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          connectionKey: "client:active-cleanup-alarm",
+          connectionName: getRealtimeConnectionShardName(
+            "client:active-cleanup-alarm"
+          ),
+          epoch: 1,
+          leaseExpiresAt: now + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS,
+          queryName: "todos:list",
+          runtimeId: "runtime:1",
+          subscriptionId: "sub-active-cleanup-alarm",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    state.alarmTime = now;
+    try {
+      await subscriptionDo.alarm();
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(state.alarmTime).toBe(now + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
+  });
+
   it("reschedules realtime outbox cleanup alarms after cleanup failure", async () => {
     const errorLog = vi
       .spyOn(console, "error")
@@ -8490,6 +8547,45 @@ describe("worker runtime", () => {
       prepare(sql: string) {
         if (sql.includes("MIN(last_processed_outbox_sequence)")) {
           throw new Error("cleanup unavailable");
+        }
+
+        return env.APP_DB.prepare(sql);
+      },
+    } as unknown as D1Database;
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: failingDatabase,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    try {
+      await subscriptionDo.alarm();
+    } finally {
+      nowSpy.mockRestore();
+    }
+
+    expect(errorLog).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errorName: "DatabaseRuntimeError",
+        event: "runtime.realtime_outbox_cleanup_failed",
+      })
+    );
+    expect(state.alarmTime).toBe(now + REALTIME_OUTBOX_CLEANUP_INTERVAL_MS);
+  });
+
+  it("reschedules realtime outbox cleanup alarms when outbox presence check fails", async () => {
+    const errorLog = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const now = Date.now();
+    const nowSpy = vi.spyOn(Date, "now").mockReturnValue(now);
+    const state = new FakeRealtimeDurableObjectState();
+    state.alarmTime = now;
+    const failingDatabase = {
+      batch: env.APP_DB.batch.bind(env.APP_DB),
+      prepare(sql: string) {
+        if (sql.includes("SELECT 1 AS has_events")) {
+          throw new Error("presence unavailable");
         }
 
         return env.APP_DB.prepare(sql);
@@ -12289,6 +12385,71 @@ describe("worker runtime", () => {
         getRealtimeDeliveryItems(delivery).map((item) => item.subscriptionId)
       )
     ).toEqual([["sub-a", "sub-b"], ["sub-b"]]);
+  });
+
+  it("continues realtime delivery groups after one group rejects unexpectedly", async () => {
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const attemptedConnectionKeys: string[] = [];
+    const flushPendingDeliveryGroup = vi
+      .spyOn(
+        subscriptionDo as unknown as {
+          flushPendingDeliveryGroup(group: {
+            connectionKey: string;
+            deliveries: readonly PendingRealtimeDelivery[];
+          }): Promise<{ evaluated: number; failed: number }>;
+        },
+        "flushPendingDeliveryGroup"
+      )
+      .mockImplementation((group) => {
+        attemptedConnectionKeys.push(group.connectionKey);
+        if (group.connectionKey === "client-a") {
+          return Promise.reject(new Error("group unavailable"));
+        }
+
+        return Promise.resolve({
+          evaluated: group.deliveries.length,
+          failed: 0,
+        });
+      });
+    const createDelivery = (
+      connectionKey: string,
+      subscriptionId: string
+    ): PendingRealtimeDelivery => ({
+      dependencies: { partitions: new Set(), tables: new Set(["todos"]) },
+      message: { result: [], sequence: 1, subscriptionId },
+      registration: {
+        args: { ownerToken: "owner-a" },
+        authorizationHeader: "Bearer owner-a",
+        connectionKey,
+        connectionName: getRealtimeConnectionShardName(connectionKey),
+        epoch: 1,
+        leaseExpiresAt: Date.now() + 60_000,
+        queryName: "todos:list",
+        runtimeId: "runtime:1",
+        subscriptionId,
+      },
+      resultJson: "[]",
+      versionSnapshot: { partitions: new Map(), tables: new Map() },
+    });
+
+    const result = await (
+      subscriptionDo as unknown as {
+        flushPendingDeliveries(
+          deliveries: readonly PendingRealtimeDelivery[]
+        ): Promise<{ evaluated: number; failed: number }>;
+      }
+    ).flushPendingDeliveries([
+      createDelivery("client-a", "sub-a"),
+      createDelivery("client-b", "sub-b"),
+    ]);
+
+    expect(result).toEqual({ evaluated: 1, failed: 1 });
+    expect(attemptedConnectionKeys).toEqual(["client-a", "client-b"]);
+    expect(flushPendingDeliveryGroup).toHaveBeenCalledTimes(2);
   });
 
   it("counts fully undelivered accepted realtime batches as failed", async () => {
