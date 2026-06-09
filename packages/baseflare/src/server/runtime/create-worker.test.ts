@@ -245,6 +245,17 @@ describe("worker request body reader", () => {
       { APP_DB: inertDatabase },
       testExecutionContext
     );
+    const deniedPreflight = await worker.fetch(
+      new Request("http://example.com/api/action/cors:probe", {
+        headers: {
+          "access-control-request-method": "POST",
+          origin: "https://evil.example",
+        },
+        method: "OPTIONS",
+      }),
+      { APP_DB: inertDatabase },
+      testExecutionContext
+    );
 
     expect(allowed.headers.get("access-control-allow-origin")).toBe(
       "https://app.example"
@@ -260,6 +271,11 @@ describe("worker request body reader", () => {
       "authorization"
     );
     expect(preflight.headers.get("access-control-max-age")).toBe("600");
+    expect(deniedPreflight.status).toBe(204);
+    expect(
+      deniedPreflight.headers.get("access-control-allow-origin")
+    ).toBeNull();
+    expect(deniedPreflight.headers.get("vary")).toBeNull();
   });
 
   it("does not require D1 Sessions for direct action context construction", () => {

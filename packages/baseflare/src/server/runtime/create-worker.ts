@@ -175,14 +175,8 @@ function handleCorsPreflight(
   }
 
   const headers = corsHeadersForRequest(request, manifest);
-  if (!headers) {
-    throw new NotFoundRuntimeError(
-      `Route "${request.method} ${new URL(request.url).pathname}" was not found`
-    );
-  }
-
   return new Response(null, {
-    headers,
+    headers: headers ?? undefined,
     status: 204,
   });
 }
