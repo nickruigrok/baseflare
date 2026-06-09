@@ -9,6 +9,7 @@ import type {
 import {
   jsonResult,
   NotFoundRuntimeError,
+  PermissionDeniedRuntimeError,
   RuntimeError,
   toErrorResponse,
   ValidationRuntimeError,
@@ -181,6 +182,32 @@ function handleCorsPreflight(
   });
 }
 
+function assertRealtimeSubscribeOrigin(
+  request: Request,
+  url: URL,
+  manifest: BaseflareManifest
+): void {
+  if (url.pathname !== "/api/subscribe") {
+    return;
+  }
+
+  const origin = request.headers.get("origin");
+  if (!origin) {
+    return;
+  }
+
+  const allowedOrigins = manifest.config?.cors?.origins;
+  if (
+    allowedOrigins ? allowedOrigins.includes(origin) : origin === url.origin
+  ) {
+    return;
+  }
+
+  throw new PermissionDeniedRuntimeError(
+    "Realtime subscription origin is not allowed"
+  );
+}
+
 function createInvocationOptions(
   env: BaseflareRuntimeEnv,
   manifest: BaseflareManifest,
@@ -335,6 +362,7 @@ async function routeRequest(
   } catch {
     throw new ValidationRuntimeError("Request URL is malformed");
   }
+  assertRealtimeSubscribeOrigin(request, url, manifest);
 
   return (
     (await routeRealtimeSubscribe(request, env, realtimeRuntimeId)) ??

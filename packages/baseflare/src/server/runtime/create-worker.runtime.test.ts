@@ -2010,6 +2010,76 @@ describe("worker runtime", () => {
     expect(response.headers.get("vary")).toBe("Origin");
   });
 
+  it("rejects disallowed realtime WebSocket origins before routing", async () => {
+    const corsWorker = createWorker(
+      createManifest({
+        config: {
+          cors: {
+            origins: ["https://app.example"],
+          },
+          project: "cors-project",
+        },
+      })
+    );
+    const connections = new FakeDurableObjectNamespace();
+    const response = await invoke(
+      "/api/subscribe?clientId=client-a",
+      {
+        headers: {
+          authorization: "Bearer owner-a",
+          origin: "https://evil.example",
+          upgrade: "websocket",
+        },
+        method: "GET",
+      },
+      corsWorker,
+      { ...env, REALTIME_CONNECTIONS: connections }
+    );
+    const body = (await response.json()) as {
+      readonly error: { readonly code: ErrorCode; readonly message: string };
+    };
+
+    expect(response.status).toBe(403);
+    expect(body.error.code).toBe(ErrorCode.PermissionDenied);
+    expect(connections.requests).toHaveLength(0);
+  });
+
+  it("allows only same-origin browser realtime WebSockets without CORS config", async () => {
+    const sameOriginConnections = new FakeDurableObjectNamespace();
+    const sameOrigin = await invoke(
+      "/api/subscribe?clientId=client-a",
+      {
+        headers: {
+          authorization: "Bearer owner-a",
+          origin: "http://example.com",
+          upgrade: "websocket",
+        },
+        method: "GET",
+      },
+      worker,
+      { ...env, REALTIME_CONNECTIONS: sameOriginConnections }
+    );
+    const crossOriginConnections = new FakeDurableObjectNamespace();
+    const crossOrigin = await invoke(
+      "/api/subscribe?clientId=client-a",
+      {
+        headers: {
+          authorization: "Bearer owner-a",
+          origin: "https://evil.example",
+          upgrade: "websocket",
+        },
+        method: "GET",
+      },
+      worker,
+      { ...env, REALTIME_CONNECTIONS: crossOriginConnections }
+    );
+
+    expect(sameOrigin.status).toBe(200);
+    expect(sameOriginConnections.requests).toHaveLength(1);
+    expect(crossOrigin.status).toBe(403);
+    expect(crossOriginConnections.requests).toHaveLength(0);
+  });
+
   it("rejects explicit realtime client ids without authorization", async () => {
     const connections = new FakeDurableObjectNamespace();
 
