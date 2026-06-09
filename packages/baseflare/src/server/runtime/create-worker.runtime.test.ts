@@ -144,6 +144,9 @@ let realtimeDependencyTrackingQueryCalls = 0;
 let realtimeDynamicDependencyOwnerToken = "owner-a";
 let activeRealtimeConcurrencyQueries = 0;
 let maxActiveRealtimeConcurrencyQueries = 0;
+let realtimeGatedQueryCalls = 0;
+let realtimeGatedQueryGate: Promise<void> | null = null;
+let realtimeGatedQueryEntered: (() => void) | null = null;
 
 const rules = defineRules({
   labels: {
@@ -312,6 +315,24 @@ const realtimeNoReadQuery = query({
   args: { label: v.string() },
   handler(_ctx, args) {
     return [{ text: args.label }];
+  },
+});
+
+const realtimeGatedQuery = query({
+  args: { ownerToken: v.string() },
+  async handler(ctx, args) {
+    realtimeGatedQueryCalls += 1;
+    const result = await ctx.db
+      .query("todos")
+      .filter({ ownerToken: args.ownerToken })
+      .order("text", "asc")
+      .collect();
+    realtimeGatedQueryEntered?.();
+    if (realtimeGatedQueryGate) {
+      await realtimeGatedQueryGate;
+    }
+
+    return result;
   },
 });
 
@@ -676,6 +697,11 @@ function createManifest(
         modulePath: "realtime",
       },
       {
+        definition: realtimeGatedQuery,
+        exportName: "gated",
+        modulePath: "realtime",
+      },
+      {
         definition: realtimeConcurrencyTrackingQuery,
         exportName: "concurrencyTracking",
         modulePath: "realtime",
@@ -984,6 +1010,23 @@ function getRealtimeIndexTestState(
       registrationStore: { snapshotForTest(): RealtimeIndexTestState };
     }
   ).registrationStore.snapshotForTest();
+}
+
+function getRealtimeEvaluationWaiterCount(
+  subscriptionDo: RealtimeSubscriptionDO
+): number {
+  const locks = (
+    subscriptionDo as unknown as {
+      reEvaluatingActiveQueries: Map<string, { waiterTargets: unknown }>;
+    }
+  ).reEvaluatingActiveQueries;
+  let waiters = 0;
+  for (const lock of locks.values()) {
+    if (lock.waiterTargets !== null) {
+      waiters += 1;
+    }
+  }
+  return waiters;
 }
 
 function getRealtimeActiveQueryTestState(
@@ -1348,6 +1391,9 @@ describe("worker runtime", () => {
     multiTableConflictAttempts = 0;
     activeRealtimeConcurrencyQueries = 0;
     maxActiveRealtimeConcurrencyQueries = 0;
+    realtimeGatedQueryCalls = 0;
+    realtimeGatedQueryGate = null;
+    realtimeGatedQueryEntered = null;
     realtimeDependencyTrackingQueryCalls = 0;
     realtimeDynamicDependencyOwnerToken = "owner-a";
     rowConflictAttempts = 0;
@@ -9865,6 +9911,193 @@ describe("worker runtime", () => {
     // snapshot is now complete and the unchanged-version event is skipped.
     await unchangedEvent("converge-2");
     expect((await catchUp()).evaluated).toBe(0);
+  });
+
+  it("waits for an in-flight evaluation and delivers a commit that raced its reads", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "gated-seed");
+    const deliveredResults: string[][] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          for (const item of items) {
+            deliveredResults.push(item.result.map((todo) => todo.text));
+          }
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:gated",
+          runtimeId,
+          subscriptionId: "sub-gated-race",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    const bumpedEvent = (eventId: string) =>
+      createRealtimeOutboxEvent(eventId, Date.now(), {
+        partitions: [todoOwnerPartition("owner-a")],
+        tables: ["todos"],
+      });
+    // Two warm rounds: discover dependencies, then complete the snapshot.
+    await bumpedEvent("gated-warm-1");
+    await notify("gated-warm-1");
+    await bumpedEvent("gated-warm-2");
+    await notify("gated-warm-2");
+    const warmedCalls = realtimeGatedQueryCalls;
+
+    // Close the gate and start an evaluation that parks after its reads.
+    const gate = createDeferred();
+    const entered = createDeferred();
+    realtimeGatedQueryGate = gate.promise;
+    realtimeGatedQueryEntered = () => entered.resolve(undefined);
+    await createTodoViaRpc("owner-a", "early");
+    await bumpedEvent("gated-early");
+    const notifyEarly = notify("gated-early");
+    await entered.promise;
+
+    // A second commit lands while the first evaluation is parked: its data
+    // was not read by the in-flight run, so the second notify must wait for
+    // the lock, detect the version gap, and re-evaluate.
+    realtimeGatedQueryEntered = null;
+    realtimeGatedQueryGate = null;
+    await createTodoViaRpc("owner-a", "late");
+    await bumpedEvent("gated-late");
+    const notifyLate = notify("gated-late");
+    // Drain the event loop so the second notify reaches the in-flight lock
+    // and registers as its waiter before the gate opens.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(realtimeGatedQueryCalls).toBe(warmedCalls + 1);
+    expect(getRealtimeEvaluationWaiterCount(subscriptionDo)).toBe(1);
+    gate.resolve(undefined);
+
+    const [earlyResponse, lateResponse] = await Promise.all([
+      notifyEarly,
+      notifyLate,
+    ]);
+    expect(((await earlyResponse.json()) as { ok: boolean }).ok).toBe(true);
+    expect((await lateResponse.json()) as Record<string, unknown>).toEqual(
+      expect.objectContaining({ evaluated: 1, failed: 0, ok: true })
+    );
+    // The waiter re-ran the query exactly once and delivered the racing
+    // commit's data without waiting for the reconciliation alarm.
+    expect(realtimeGatedQueryCalls).toBe(warmedCalls + 2);
+    expect(deliveredResults.at(-1)).toContain("late");
+  });
+
+  it("coalesces a notify burst into one evaluation", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "burst-seed");
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:gated",
+          runtimeId,
+          subscriptionId: "sub-gated-burst",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    const bumpedEvent = (eventId: string) =>
+      createRealtimeOutboxEvent(eventId, Date.now(), {
+        partitions: [todoOwnerPartition("owner-a")],
+        tables: ["todos"],
+      });
+    await bumpedEvent("burst-warm-1");
+    await notify("burst-warm-1");
+    await bumpedEvent("burst-warm-2");
+    await notify("burst-warm-2");
+    const warmedCalls = realtimeGatedQueryCalls;
+
+    // Commit one data change plus a burst of events FIRST, then fire all
+    // notifies concurrently: the holder's pre-execution snapshot already
+    // covers every commit, so the waiter finds no gap and the rest skip.
+    const gate = createDeferred();
+    const entered = createDeferred();
+    realtimeGatedQueryGate = gate.promise;
+    realtimeGatedQueryEntered = () => entered.resolve(undefined);
+    await createTodoViaRpc("owner-a", "burst-data");
+    const burstEventIds = [1, 2, 3, 4, 5, 6].map((index) => `burst-${index}`);
+    for (const eventId of burstEventIds) {
+      await bumpedEvent(eventId);
+    }
+    const responses = burstEventIds.map((eventId) => notify(eventId));
+    await entered.promise;
+    realtimeGatedQueryEntered = null;
+    realtimeGatedQueryGate = null;
+    // Drain the event loop so every concurrent notify classifies against the
+    // held lock (one waiter, the rest merge-skip) before the gate opens.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(getRealtimeEvaluationWaiterCount(subscriptionDo)).toBe(1);
+    gate.resolve(undefined);
+
+    const bodies = (await Promise.all(responses).then((all) =>
+      Promise.all(all.map((response) => response.json()))
+    )) as Array<{ evaluated: number; failed: number; ok: boolean }>;
+    for (const body of bodies) {
+      expect(body.ok).toBe(true);
+      expect(body.failed).toBe(0);
+    }
+    // One evaluation served the whole burst: the holder ran the query once
+    // and the waiter's post-wait version check found everything absorbed.
+    expect(realtimeGatedQueryCalls).toBe(warmedCalls + 1);
+    expect(bodies.reduce((total, body) => total + body.evaluated, 0)).toBe(1);
   });
 
   it("heals a missed delivery during live reconciliation while the socket stays open", async () => {

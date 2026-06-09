@@ -72,6 +72,24 @@ export function createRealtimeAffectedTargets(
   return { all: false, broadTables, partitions, sequence, tables };
 }
 
+export function mergeRealtimeAffectedTargets(
+  left: RealtimeAffectedTargets,
+  right: RealtimeAffectedTargets
+): RealtimeAffectedTargets {
+  let sequence: number | null = null;
+  if (left.sequence !== null || right.sequence !== null) {
+    sequence = Math.max(left.sequence ?? 0, right.sequence ?? 0);
+  }
+
+  return {
+    all: left.all || right.all,
+    broadTables: new Set([...left.broadTables, ...right.broadTables]),
+    partitions: new Set([...left.partitions, ...right.partitions]),
+    sequence,
+    tables: new Set([...left.tables, ...right.tables]),
+  };
+}
+
 export function createFullRealtimeAffectedTargets(
   sequence: number | null
 ): RealtimeAffectedTargets {

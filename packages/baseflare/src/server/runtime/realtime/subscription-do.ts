@@ -26,6 +26,7 @@ import {
   getRealtimeRegistrationHomeRouteTarget,
   getRealtimeShardGenerationIdFromName,
   getRealtimeSubscriptionShardName,
+  mergeRealtimeAffectedTargets,
   parseRealtimeDependencySetValue,
   parseRealtimeVersionSnapshotValue,
   serializeRealtimeDependencySet,
@@ -104,6 +105,33 @@ interface RealtimeActiveQueryCandidate {
 }
 
 /**
+ * Awaitable in-flight evaluation lock. `waiterTargets` is the single pending
+ * waiter slot: while a holder evaluates, the first concurrent pass claims it
+ * and defers; later passes merge their affected targets into it and skip,
+ * because the waiter re-checks versions against live D1 state after the
+ * holder releases, which observes every commit the skipped passes saw.
+ */
+interface ActiveQueryEvaluationLock {
+  readonly promise: Promise<void>;
+  readonly release: () => void;
+  waiterTargets: RealtimeAffectedTargets | null;
+}
+
+interface RealtimeDeferredActiveQueryWait {
+  readonly activeQueryKey: string;
+  readonly lock: ActiveQueryEvaluationLock;
+}
+
+interface RealtimePreparedActiveQuery {
+  readonly activeQuery?: StoredRealtimeActiveQuery;
+  readonly deferredWait?: RealtimeDeferredActiveQueryWait;
+  readonly evaluated: number;
+  readonly failed: number;
+  readonly replayStoredResult: boolean;
+  readonly skipped: number;
+}
+
+/**
  * Durable Object that owns realtime query state for one shard: subscriber
  * registrations, version-first re-evaluation on notify/catch-up, outbox
  * recovery, and batched delivery to connection DOs. Exported through
@@ -116,7 +144,10 @@ export class RealtimeSubscriptionDO {
   private readonly registrationStore: RealtimeRegistrationStore;
   private readonly state: RealtimeDurableObjectState;
   private readonly pendingNotifyEventIds = new Set<string>();
-  private readonly reEvaluatingActiveQueries = new Set<string>();
+  private readonly reEvaluatingActiveQueries = new Map<
+    string,
+    ActiveQueryEvaluationLock
+  >();
   private readonly reEvaluatingRegistrations = new Set<string>();
   private deliveryBatchAttemptsSinceAutoscale = 0;
   private deliveryBatchFailuresSinceAutoscale = 0;
@@ -652,6 +683,7 @@ export class RealtimeSubscriptionDO {
     let failed = 0;
     let skipped = 0;
     const candidateActiveQueries: RealtimeActiveQueryCandidate[] = [];
+    const deferredWaits: RealtimeDeferredActiveQueryWait[] = [];
     const pendingDeliveries: PendingRealtimeDelivery[] = [];
     const activeQueryKeys = [...this.activeQueryStore.getRelevantKeys(targets)];
     skipped += Math.max(
@@ -676,6 +708,9 @@ export class RealtimeSubscriptionDO {
             replayStoredResult: result.replayStoredResult,
           });
         }
+        if (result.deferredWait) {
+          deferredWaits.push(result.deferredWait);
+        }
       }
     );
 
@@ -687,6 +722,40 @@ export class RealtimeSubscriptionDO {
     evaluated += evaluationResult.evaluated;
     failed += evaluationResult.failed;
     pendingDeliveries.push(...evaluationResult.deliveries);
+
+    // Deferred waits run only after evaluateActiveQueries has released every
+    // lock this invocation acquired, so waiting cannot deadlock with another
+    // invocation waiting on one of our candidates.
+    if (deferredWaits.length > 0) {
+      const waitedCandidates: RealtimeActiveQueryCandidate[] = [];
+      await runWithConcurrency(
+        deferredWaits,
+        REALTIME_REEVALUATION_CONCURRENCY,
+        async (wait) => {
+          const result = await this.resumeDeferredActiveQueryEvaluation(
+            wait,
+            database
+          );
+          evaluated += result.evaluated;
+          failed += result.failed;
+          skipped += result.skipped;
+          if (result.activeQuery) {
+            waitedCandidates.push({
+              activeQuery: result.activeQuery,
+              replayStoredResult: result.replayStoredResult,
+            });
+          }
+        }
+      );
+      const waitedResult = await this.evaluateActiveQueries(
+        waitedCandidates,
+        targets.sequence,
+        database
+      );
+      evaluated += waitedResult.evaluated;
+      failed += waitedResult.failed;
+      pendingDeliveries.push(...waitedResult.deliveries);
+    }
 
     const deliveryResult = await this.flushPendingDeliveries(pendingDeliveries);
     evaluated += deliveryResult.evaluated;
@@ -728,13 +797,7 @@ export class RealtimeSubscriptionDO {
     activeQueryKey: string,
     targets: RealtimeAffectedTargets,
     database: RuntimeDatabase
-  ): Promise<{
-    readonly evaluated: number;
-    readonly failed: number;
-    readonly activeQuery?: StoredRealtimeActiveQuery;
-    readonly replayStoredResult: boolean;
-    readonly skipped: number;
-  }> {
+  ): Promise<RealtimePreparedActiveQuery> {
     const activeQuery = this.activeQueryStore.get(activeQueryKey);
     if (!activeQuery) {
       return { evaluated: 0, failed: 0, replayStoredResult: false, skipped: 0 };
@@ -744,11 +807,45 @@ export class RealtimeSubscriptionDO {
       return { evaluated: 0, failed: 0, replayStoredResult: false, skipped: 1 };
     }
 
-    if (this.reEvaluatingActiveQueries.has(activeQueryKey)) {
-      return { evaluated: 0, failed: 0, replayStoredResult: false, skipped: 1 };
+    const inflight = this.reEvaluatingActiveQueries.get(activeQueryKey);
+    if (inflight) {
+      if (inflight.waiterTargets) {
+        inflight.waiterTargets = mergeRealtimeAffectedTargets(
+          inflight.waiterTargets,
+          targets
+        );
+        return {
+          evaluated: 0,
+          failed: 0,
+          replayStoredResult: false,
+          skipped: 1,
+        };
+      }
+
+      inflight.waiterTargets = targets;
+      return {
+        deferredWait: { activeQueryKey, lock: inflight },
+        evaluated: 0,
+        failed: 0,
+        replayStoredResult: false,
+        skipped: 0,
+      };
     }
 
-    this.reEvaluatingActiveQueries.add(activeQueryKey);
+    this.acquireActiveQueryEvaluationLock(activeQueryKey);
+    return await this.checkAndClaimActiveQuery(activeQuery, targets, database);
+  }
+
+  /**
+   * Runs the version-gap check for an active query whose evaluation lock the
+   * caller already holds. Returns the query as an evaluation or replay
+   * candidate with the lock still held; every other path releases the lock.
+   */
+  private async checkAndClaimActiveQuery(
+    activeQuery: StoredRealtimeActiveQuery,
+    targets: RealtimeAffectedTargets,
+    database: RuntimeDatabase
+  ): Promise<RealtimePreparedActiveQuery> {
     let shouldRelease = true;
     try {
       if (!(await hasRelevantVersionGap(activeQuery, targets, database))) {
@@ -784,9 +881,97 @@ export class RealtimeSubscriptionDO {
       return { evaluated: 0, failed: 1, replayStoredResult: false, skipped: 0 };
     } finally {
       if (shouldRelease) {
-        this.reEvaluatingActiveQueries.delete(activeQueryKey);
+        this.releaseActiveQueryEvaluationByKey(activeQuery.key);
       }
     }
+  }
+
+  /**
+   * Resolves a deferred wait after this invocation has released every lock it
+   * acquired, so waiting can never participate in a hold-and-wait cycle: a
+   * waiting invocation holds nothing, holders never wait, and the re-claim
+   * loop ends when commits stop. The post-wait gap check reads live D1
+   * versions, so it observes every commit merged in by skipped passes.
+   */
+  private async resumeDeferredActiveQueryEvaluation(
+    wait: RealtimeDeferredActiveQueryWait,
+    database: RuntimeDatabase
+  ): Promise<RealtimePreparedActiveQuery> {
+    let lock = wait.lock;
+    for (;;) {
+      await lock.promise;
+      const waiterTargets = lock.waiterTargets;
+      if (!waiterTargets) {
+        return {
+          evaluated: 0,
+          failed: 0,
+          replayStoredResult: false,
+          skipped: 0,
+        };
+      }
+
+      const next = this.reEvaluatingActiveQueries.get(wait.activeQueryKey);
+      if (!next) {
+        // The key is free: re-fetch the active query (it may have been
+        // deleted or migrated while waiting), re-check backoff, and run the
+        // version-gap check with every merged target.
+        const activeQuery = this.activeQueryStore.get(wait.activeQueryKey);
+        if (!activeQuery) {
+          return {
+            evaluated: 0,
+            failed: 0,
+            replayStoredResult: false,
+            skipped: 0,
+          };
+        }
+
+        if (this.isActiveQueryReEvaluationBackedOff(activeQuery)) {
+          return {
+            evaluated: 0,
+            failed: 0,
+            replayStoredResult: false,
+            skipped: 1,
+          };
+        }
+
+        this.acquireActiveQueryEvaluationLock(wait.activeQueryKey);
+        return await this.checkAndClaimActiveQuery(
+          activeQuery,
+          waiterTargets,
+          database
+        );
+      }
+
+      if (next.waiterTargets) {
+        // Another invocation claimed the waiter slot first; its post-wait
+        // gap check covers our targets once merged.
+        next.waiterTargets = mergeRealtimeAffectedTargets(
+          next.waiterTargets,
+          waiterTargets
+        );
+        return {
+          evaluated: 0,
+          failed: 0,
+          replayStoredResult: false,
+          skipped: 1,
+        };
+      }
+
+      next.waiterTargets = waiterTargets;
+      lock = next;
+    }
+  }
+
+  private acquireActiveQueryEvaluationLock(activeQueryKey: string): void {
+    let release: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.reEvaluatingActiveQueries.set(activeQueryKey, {
+      promise,
+      release,
+      waiterTargets: null,
+    });
   }
 
   private async evaluateActiveQueries(
@@ -1102,7 +1287,18 @@ export class RealtimeSubscriptionDO {
   private releaseActiveQueryEvaluation(
     activeQuery: StoredRealtimeActiveQuery
   ): void {
-    this.reEvaluatingActiveQueries.delete(activeQuery.key);
+    this.releaseActiveQueryEvaluationByKey(activeQuery.key);
+  }
+
+  private releaseActiveQueryEvaluationByKey(activeQueryKey: string): void {
+    const lock = this.reEvaluatingActiveQueries.get(activeQueryKey);
+    if (!lock) {
+      return;
+    }
+
+    // Delete before resolving so a woken waiter sees the key as free.
+    this.reEvaluatingActiveQueries.delete(activeQueryKey);
+    lock.release();
   }
 
   private isRegistrationReEvaluationBackedOff(

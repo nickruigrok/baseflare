@@ -8,6 +8,7 @@ import {
   getRealtimeConnectionShardName,
   getRealtimeSubscriptionShardName,
   isZeroRealtimeVersionSnapshot,
+  mergeRealtimeAffectedTargets,
 } from "./routing";
 import { REALTIME_CONNECTION_SHARD_COUNT } from "./types";
 
@@ -147,5 +148,75 @@ describe("realtime routing", () => {
         type: "table",
       },
     ]);
+  });
+
+  describe("mergeRealtimeAffectedTargets", () => {
+    it("unions tables, broad tables, and partitions", () => {
+      const merged = mergeRealtimeAffectedTargets(
+        {
+          all: false,
+          broadTables: new Set(["labels"]),
+          partitions: new Set(["p1"]),
+          sequence: 3,
+          tables: new Set(["todos"]),
+        },
+        {
+          all: false,
+          broadTables: new Set(["todos"]),
+          partitions: new Set(["p1", "p2"]),
+          sequence: null,
+          tables: new Set(["labels"]),
+        }
+      );
+
+      expect(merged.all).toBe(false);
+      expect([...merged.broadTables].sort()).toEqual(["labels", "todos"]);
+      expect([...merged.partitions].sort()).toEqual(["p1", "p2"]);
+      expect([...merged.tables].sort()).toEqual(["labels", "todos"]);
+    });
+
+    it("keeps the highest sequence and null when both are null", () => {
+      const base = {
+        all: false,
+        broadTables: new Set<string>(),
+        partitions: new Set<string>(),
+        tables: new Set<string>(),
+      };
+
+      expect(
+        mergeRealtimeAffectedTargets(
+          { ...base, sequence: 5 },
+          { ...base, sequence: 9 }
+        ).sequence
+      ).toBe(9);
+      expect(
+        mergeRealtimeAffectedTargets(
+          { ...base, sequence: null },
+          { ...base, sequence: 7 }
+        ).sequence
+      ).toBe(7);
+      expect(
+        mergeRealtimeAffectedTargets(
+          { ...base, sequence: null },
+          { ...base, sequence: null }
+        ).sequence
+      ).toBeNull();
+    });
+
+    it("forces full evaluation when either side targets everything", () => {
+      const base = {
+        broadTables: new Set<string>(),
+        partitions: new Set<string>(),
+        sequence: null,
+        tables: new Set<string>(),
+      };
+
+      expect(
+        mergeRealtimeAffectedTargets(
+          { ...base, all: true },
+          { ...base, all: false }
+        ).all
+      ).toBe(true);
+    });
   });
 });
