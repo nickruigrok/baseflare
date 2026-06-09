@@ -338,12 +338,12 @@ npx baseflare deploy --env production
 ```
 
 1. CLI bundles the `baseflare/` directory with the Baseflare Worker bundler, aligned with the Rolldown/tsdown toolchain used for package builds
-2. CLI wraps the bundle into a Worker entry point template:
+2. CLI wraps the bundle into a Worker entry point template (`baseflare/runtime` is the internal deployment entry — generated code only, never app code):
    ```typescript
-   import { createWorker } from 'baseflare/server'
+   import { createWorker } from 'baseflare/runtime'
    import * as userCode from './bundle.js'
    export default createWorker(userCode)
-   export { RealtimeConnectionDO, RealtimeSubscriptionDO } from 'baseflare/server'
+   export { RealtimeConnectionDO, RealtimeSubscriptionDO } from 'baseflare/runtime'
    ```
 3. CLI deploys the Worker via Cloudflare Workers API (`PUT /client/v4/accounts/{id}/workers/scripts/{name}`)
 4. CLI applies table/index changes to D1 before traffic reaches the Worker. `createWorker()` does not run DDL during requests.
@@ -959,7 +959,7 @@ item-level, so undelivered subscription results stay retryable.
 6. Client reconnection with subscription restore through connection DO reconciliation
 7. Release performance suite:
    - `pnpm test:perf` for deterministic local workerd-backed realtime scale tests
-   - optional `pnpm test:perf:cloudflare` for staging WebSocket/platform stress tests
+   - optional `pnpm test:perf:cloudflare` for staging WebSocket/platform stress tests (deferred to Phase 4 — it requires the CLI deploy pipeline to provision a staging environment)
    - tracks fanout latency, D1 re-evaluations, queue depth, outbox lag, delivery batching, recovery time, and idle DO hibernation
 
 **"Done" criteria:**
@@ -1172,10 +1172,11 @@ npx baseflare dashboard
    - Auth table migrations run on deploy alongside developer table migrations
 3. Route mounting at `/api/auth/*` on environment Worker
 4. `ctx.auth` population from verified Better Auth session token in every query/mutation/action
-5. Per-request auth instance (D1 bindings only available in fetch handler)
-6. Uses D1 `batch()` for atomicity
-7. better-auth provider configuration passed through from `defineAuth()` (Google, GitHub, email/password, etc.)
-8. Per-environment auth isolation (separate D1 databases)
+5. Realtime re-auth on push — subscription DOs currently evaluate active queries with no auth context (Phase 3 design; active-query keys already include the authorization fingerprint so credentials never coalesce). Phase 5 must re-resolve verified identity per active query on every evaluation and stop delivery when the credential is revoked, so "session revoked → next push excludes that subscriber" holds.
+6. Per-request auth instance (D1 bindings only available in fetch handler)
+7. Uses D1 `batch()` for atomicity
+8. better-auth provider configuration passed through from `defineAuth()` (Google, GitHub, email/password, etc.)
+9. Per-environment auth isolation (separate D1 databases)
 
 **"Done" criteria:**
 ```bash
@@ -1532,7 +1533,8 @@ Deferred to post-v1. Includes `createTestCtx()`, mock utilities, subscription tr
   "exports": {
     "./values": "./dist/values/index.js",
     "./server": "./dist/server/index.js",
-    "./client": "./dist/client/index.js"
+    "./client": "./dist/client/index.js",
+    "./runtime": "./dist/runtime/index.js"
   }
 }
 ```
@@ -1737,27 +1739,11 @@ interface StorageActionWriter extends StorageWriter {
   store(blob: Blob): Promise<string>;  // server-side upload, returns storage ID
 }
 
-// Document serialization
-export function serialize(doc: Record<string, unknown>): { _data: string }
-export function deserialize(row: { _id: string; _data: string }): Record<string, unknown>
-
-// Schema diffing + validation (internal)
-export function diffSchemas(current: Schema, target: Schema): SchemaDiff
-export function validateInsertData(table: TableDefinition, data: Record<string, unknown>): Record<string, unknown>
-export function validateReplaceData(table: TableDefinition, data: Record<string, unknown>): Record<string, unknown>
-export function validatePatchData(
-  table: TableDefinition,
-  current: Record<string, unknown>,
-  patch: Record<string, unknown>,
-): Record<string, unknown>
-
-// Worker entry point factory
-export function createWorker(userCode: UserCodeBundle): ExportedHandler
-
-// Durable Objects
-export class RealtimeConnectionDO implements DurableObject { ... }
-export class RealtimeSubscriptionDO implements DurableObject { ... }
 ```
+
+**Internal modules (not exported from `baseflare/server`):** document serialization (`serialize`/`deserialize`), schema diffing (`diffSchemas`), write-validation helpers (`validateInsertData`/`validateReplaceData`/`validatePatchData`), permission evaluation (`evaluateRules`), and the raw query builder factory are runtime/CLI plumbing. The CLI lives in the same package and deep-imports them from `src/`; they have no public home. The public export surface of every subpath is locked by a snapshot test (`src/public-api.test.ts`).
+
+**`baseflare/runtime` (internal subpath):** `createWorker`, `RealtimeConnectionDO`, `RealtimeSubscriptionDO`, and the manifest/runtime env types live on a dedicated `baseflare/runtime` entry consumed only by the CLI-generated worker entry — same package, one extra `exports` key (precedent: `react/jsx-runtime`). It is documented as internal and not semver-stable; app code never imports it.
 
 **Key design note:** Actions do not have direct `ctx.db` access. Use `ctx.runQuery()` and `ctx.runMutation()` for database work from actions. Each `ctx.runMutation()` call is its own mutation transaction, so atomic multi-write workflows should live in one mutation.
 

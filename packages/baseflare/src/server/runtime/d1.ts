@@ -6,14 +6,17 @@ import {
 } from "../db/cursor";
 import { deserialize } from "../db/deserialize";
 import {
-  assertQueryField,
+  combineFilters,
   compileFilter,
   type FilterObject,
   type FilterValue,
 } from "../db/filters";
 import {
+  assertDirection,
   assertTableIdentifier,
   buildOrderClause,
+  createBaseQueryState,
+  normalizeOrderField,
   type QueryState,
 } from "../db/query-builder";
 import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
@@ -253,7 +256,7 @@ export function deserializeVersionedRuntimeDocument(
   };
 }
 
-export function fetchStoredDocument(
+function fetchStoredDocument(
   database: D1PrepareDatabase,
   tableName: string,
   id: string
@@ -265,41 +268,13 @@ export function fetchStoredDocument(
   );
 }
 
-export async function fetchVersionedDocument(
+async function fetchVersionedDocument(
   database: D1PrepareDatabase,
   tableName: string,
   id: string
 ): Promise<VersionedRuntimeDocument | null> {
   const row = await fetchStoredDocument(database, tableName, id);
   return row ? deserializeVersionedRuntimeDocument(tableName, row) : null;
-}
-
-function createBaseQueryState(): QueryState {
-  return { order: { field: "_id", direction: "asc" } };
-}
-
-function assertDirection(value: string): asserts value is QueryOrderDirection {
-  if (value !== "asc" && value !== "desc") {
-    throw new Error(
-      `Order direction must be "asc" or "desc", received "${value}"`
-    );
-  }
-}
-
-function normalizeOrderField(field: string): string {
-  if (field === "_id" || field === "_createdAt") {
-    return "_id";
-  }
-
-  assertQueryField(field);
-  return field;
-}
-
-function mergeFilters(
-  left: FilterObject | undefined,
-  right: FilterObject
-): FilterObject {
-  return left ? { AND: [left, right] } : right;
 }
 
 function toScalarCursorValue(value: unknown): FilterValue | undefined {
@@ -422,7 +397,7 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
   }
 
   filter(filter: FilterObject): QueryBuilder<RuntimeDocument> {
-    return this.clone({ filter: mergeFilters(this.state.filter, filter) });
+    return this.clone({ filter: combineFilters(this.state.filter, filter) });
   }
 
   order(direction: QueryOrderDirection): QueryBuilder<RuntimeDocument>;

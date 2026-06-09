@@ -45,6 +45,7 @@ export class FakeRealtimeDurableObjectState {
   readonly durableStorage = new Map<string, unknown>();
   private readonly hibernatedSockets: readonly AttachedTestWebSocket[];
   alarmTime: number | null = null;
+  failedStorageDeletes = 0;
   failedStoragePuts = 0;
 
   constructor(hibernatedSockets: readonly AttachedTestWebSocket[] = []) {
@@ -65,8 +66,16 @@ export class FakeRealtimeDurableObjectState {
   }
 
   storage = {
-    delete: (key: string) => {
-      this.durableStorage.delete(key);
+    delete: (keyOrKeys: string | readonly string[]) => {
+      if (this.failedStorageDeletes > 0) {
+        this.failedStorageDeletes -= 1;
+        return Promise.reject(new Error("Storage delete failed"));
+      }
+
+      const keys = Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys];
+      for (const key of keys) {
+        this.durableStorage.delete(key);
+      }
       return Promise.resolve();
     },
     deleteAlarm: () => {
@@ -89,13 +98,20 @@ export class FakeRealtimeDurableObjectState {
         .slice(0, limit);
       return Promise.resolve(new Map(entries) as Map<string, T>);
     },
-    put: <T = unknown>(key: string, value: T) => {
+    put: <T = unknown>(keyOrEntries: string | Record<string, T>, value?: T) => {
       if (this.failedStoragePuts > 0) {
         this.failedStoragePuts -= 1;
         return Promise.reject(new Error("Storage put failed"));
       }
 
-      this.durableStorage.set(key, value);
+      if (typeof keyOrEntries === "string") {
+        this.durableStorage.set(keyOrEntries, value);
+        return Promise.resolve();
+      }
+
+      for (const [key, entryValue] of Object.entries(keyOrEntries)) {
+        this.durableStorage.set(key, entryValue);
+      }
       return Promise.resolve();
     },
     setAlarm: (scheduledTime: number) => {

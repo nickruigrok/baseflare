@@ -161,6 +161,25 @@ describe("RealtimeActiveQueryStore", () => {
     ).toBe(150);
   });
 
+  it("drops legacy active query storage keys during reload", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    await state.storage.put("realtime:active-query:legacy-key", {
+      args: {},
+      key: "legacy-key",
+      memberRegistrationKeys: [registrationKey("sub-a")],
+      queryName: "todos:list",
+      runtimeId: "runtime:1",
+    });
+
+    const reloadedStore = new RealtimeActiveQueryStore(state);
+    await reloadedStore.loadOnce();
+
+    expect(reloadedStore.size()).toBe(0);
+    expect(state.durableStorage.has("realtime:active-query:legacy-key")).toBe(
+      false
+    );
+  });
+
   it("keeps active query indexes unchanged when dependency persistence fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeActiveQueryStore(state);

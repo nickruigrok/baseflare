@@ -1,5 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
-import { createRealtimeSocketAttachment } from "./shared";
+import {
+  createRealtimeSocketAttachment,
+  parseRealtimeSocketAttachment,
+} from "./shared";
 import { RealtimeSocketRegistry } from "./socket-registry";
 import type {
   RealtimeSocketAttachment,
@@ -8,6 +11,7 @@ import type {
 } from "./types";
 
 type TestSocket = RuntimeWebSocket & {
+  failSerializations?: number;
   readonly sentMessages: string[];
   readonly storedAttachments: unknown[];
   failSends?: boolean;
@@ -21,6 +25,7 @@ function createSocket(): TestSocket {
     close: vi.fn(),
     deserializeAttachment: () => storedAttachments.at(-1),
     dispatchEvent: vi.fn(),
+    failSerializations: 0,
     failSends: false,
     readyState: 1,
     removeEventListener: vi.fn(),
@@ -32,6 +37,10 @@ function createSocket(): TestSocket {
     },
     sentMessages: [],
     serializeAttachment: (attachment: unknown) => {
+      if (socket.failSerializations && socket.failSerializations > 0) {
+        socket.failSerializations -= 1;
+        throw new Error("attachment serialization failed");
+      }
       storedAttachments.push(attachment);
     },
     storedAttachments,
@@ -73,6 +82,21 @@ describe("RealtimeSocketRegistry", () => {
     expect(registry.snapshotForTest().socketStates.size).toBe(0);
     expect(registry.snapshotForTest().sockets.size).toBe(0);
     expect(removedAttachments).toEqual([socketAttachment]);
+  });
+
+  it("does not add sockets when attachment serialization fails", () => {
+    const registry = new RealtimeSocketRegistry();
+    const socket = createSocket();
+    socket.failSerializations = 1;
+
+    expect(() => registry.add(socket, attachment("client:client-a"))).toThrow(
+      "attachment serialization failed"
+    );
+
+    expect(registry.snapshotForTest().socketStates.size).toBe(0);
+    expect(registry.snapshotForTest().sockets.size).toBe(0);
+    expect(registry.hasSockets("client:client-a")).toBe(false);
+    expect(socket.storedAttachments).toEqual([]);
   });
 
   it("delivers only to sockets for the target connection key", () => {
@@ -307,6 +331,37 @@ describe("RealtimeSocketRegistry", () => {
     ).toBe("subscription:g1:4");
   });
 
+  it("rolls back shard ownership updates when a later socket fails to serialize", () => {
+    const registry = new RealtimeSocketRegistry();
+    const firstSocket = createSocket();
+    const failingSocket = createSocket();
+    const subscription = {
+      args: {},
+      epoch: 1,
+      queryName: "todos:list",
+      subscriptionId: "sub-a",
+      subscriptionShardName: "subscription:g1:0",
+    };
+    registry.add(firstSocket, attachment("client:client-a", [subscription]));
+    registry.add(failingSocket, attachment("client:client-a", [subscription]));
+    failingSocket.failSerializations = 1;
+
+    expect(() =>
+      registry.updateSubscriptionShardName(
+        "client:client-a",
+        "sub-a",
+        "subscription:g1:4"
+      )
+    ).toThrow("attachment serialization failed");
+
+    expect(
+      registry.getSubscription(firstSocket, "sub-a")?.subscriptionShardName
+    ).toBe("subscription:g1:0");
+    expect(
+      registry.getSubscription(failingSocket, "sub-a")?.subscriptionShardName
+    ).toBe("subscription:g1:0");
+  });
+
   it("fails closed when a socket attachment cannot be restored", () => {
     const registry = new RealtimeSocketRegistry();
     const socket = createSocket();
@@ -319,5 +374,73 @@ describe("RealtimeSocketRegistry", () => {
       "Session expired, please reconnect"
     );
     expect(registry.snapshotForTest().socketStates.size).toBe(0);
+  });
+
+  it("clears malformed restored subscription shard names", () => {
+    const parsed = parseRealtimeSocketAttachment({
+      connectionKey: "client:client-a",
+      latestDeliveredOutboxSequence: null,
+      runtimeId: "runtime:1",
+      subscriptions: [
+        {
+          args: {},
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-a",
+          subscriptionShardName: "not-a-subscription-shard",
+        },
+      ],
+    });
+
+    expect(parsed?.subscriptions).toEqual([
+      {
+        args: {},
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        subscriptionShardName: undefined,
+      },
+    ]);
+  });
+
+  it("drops restored subscriptions whose args exceed realtime bounds", () => {
+    let deepArgs: Record<string, unknown> = {};
+    for (let depth = 0; depth < 40; depth += 1) {
+      deepArgs = { child: deepArgs };
+    }
+
+    const parsed = parseRealtimeSocketAttachment({
+      connectionKey: "client:client-a",
+      latestDeliveredOutboxSequence: null,
+      runtimeId: "runtime:1",
+      subscriptions: [
+        {
+          args: deepArgs,
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId: "sub-a",
+          subscriptionShardName: "subscription:g1:0",
+        },
+      ],
+    });
+
+    expect(parsed?.subscriptions).toEqual([]);
+  });
+
+  it("caps restored subscriptions to the realtime per-socket limit", () => {
+    const parsed = parseRealtimeSocketAttachment({
+      connectionKey: "client:client-a",
+      latestDeliveredOutboxSequence: null,
+      runtimeId: "runtime:1",
+      subscriptions: Array.from({ length: 101 }, (_value, index) => ({
+        args: {},
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: `sub-${index}`,
+        subscriptionShardName: "subscription:g1:0",
+      })),
+    });
+
+    expect(parsed?.subscriptions).toHaveLength(100);
   });
 });

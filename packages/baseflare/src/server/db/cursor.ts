@@ -1,4 +1,4 @@
-import { ValidationError } from "baseflare/values";
+import { isUuidV7, ValidationError } from "baseflare/values";
 
 import {
   type FilterValue,
@@ -120,6 +120,7 @@ export function decodeCursor(cursor: string, order: OrderSpec): CursorPayload {
     Array.isArray(parsed) ||
     typeof (parsed as Record<string, unknown>).orderField !== "string" ||
     typeof (parsed as Record<string, unknown>).id !== "string" ||
+    !isUuidV7((parsed as Record<string, unknown>).id as string) ||
     !isOrderDirection((parsed as Record<string, unknown>).orderDirection)
   ) {
     throw new ValidationError("cursor", "Invalid pagination cursor");
@@ -138,7 +139,19 @@ export function decodeCursor(cursor: string, order: OrderSpec): CursorPayload {
 
   assertDecodedCursorValue(payload, order);
 
-  return payload as unknown as CursorPayload;
+  // Rebuild the payload so unknown fields from forged cursors are dropped.
+  return order.field === "_id"
+    ? {
+        id: payload.id as string,
+        orderDirection: order.direction,
+        orderField: order.field,
+      }
+    : {
+        id: payload.id as string,
+        orderDirection: order.direction,
+        orderField: order.field,
+        v: scalarOrderValue(payload.v, "cursor.v"),
+      };
 }
 
 export function buildCursorPredicate(

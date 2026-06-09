@@ -11,6 +11,10 @@ import {
   serializeRealtimeDependencySet,
   serializeRealtimeVersionSnapshot,
 } from "./routing";
+import {
+  type RealtimeStorageBatchOperation,
+  writeRealtimeStorageBatch,
+} from "./storage-batch";
 import { listRealtimeStoragePrefix } from "./storage-list";
 import type {
   RealtimeAffectedTargets,
@@ -23,6 +27,10 @@ import type {
 import { REALTIME_REEVALUATION_FAILURE_RETRY_MS } from "./types";
 
 const REALTIME_ACTIVE_QUERY_STORAGE_PREFIX = "realtime:active-query:";
+
+function applyNoRealtimeActiveQueryChange(): void {
+  return;
+}
 
 type StoredRealtimeActiveQueryValue = Omit<
   StoredRealtimeActiveQuery,
@@ -38,6 +46,12 @@ type StoredRealtimeActiveQueryValue = Omit<
     readonly tables: ReadonlyArray<readonly [string, number]>;
   };
 };
+
+export interface RealtimeActiveQueryStoreChange {
+  readonly activeQueryKey?: string;
+  apply(): void;
+  readonly operations: readonly RealtimeStorageBatchOperation[];
+}
 
 export interface RealtimeActiveQueryStoreSnapshot {
   readonly activeQueries: Map<string, StoredRealtimeActiveQuery>;
@@ -64,7 +78,7 @@ export class RealtimeActiveQueryStore {
     }
 
     const storage = this.state.storage;
-    if (!storage?.list) {
+    if (!storage) {
       this.loaded = true;
       return;
     }
@@ -75,8 +89,14 @@ export class RealtimeActiveQueryStore {
         REALTIME_ACTIVE_QUERY_STORAGE_PREFIX
       );
     for (const [storageKey, value] of storedActiveQueries) {
+      const activeQueryKey = storageKey.slice(
+        REALTIME_ACTIVE_QUERY_STORAGE_PREFIX.length
+      );
       const activeQuery = this.parseStoredActiveQueryValue(value);
-      if (!activeQuery) {
+      if (
+        !(activeQuery && isRealtimeActiveQueryKey(activeQueryKey)) ||
+        activeQuery.key !== activeQueryKey
+      ) {
         logRuntimeEvent(
           "warn",
           "runtime.realtime_active_query_reload_dropped",
@@ -84,12 +104,10 @@ export class RealtimeActiveQueryStore {
             storageKey,
           }
         );
+        await storage.delete(storageKey);
         continue;
       }
 
-      const activeQueryKey = storageKey.slice(
-        REALTIME_ACTIVE_QUERY_STORAGE_PREFIX.length
-      );
       this.activeQueries.set(activeQueryKey, activeQuery);
       this.addToIndexes(activeQueryKey, activeQuery);
     }
@@ -197,6 +215,24 @@ export class RealtimeActiveQueryStore {
     registration: StoredRealtimeRegistration,
     options: { readonly recomputeKey?: boolean } = {}
   ): Promise<string> {
+    const change = await this.prepareUpsertFromRegistration(
+      registrationKey,
+      registration,
+      options
+    );
+    await writeRealtimeStorageBatch(this.state.storage, change.operations);
+    change.apply();
+    if (!change.activeQueryKey) {
+      throw new Error("Realtime active query upsert did not produce a key");
+    }
+    return change.activeQueryKey;
+  }
+
+  async prepareUpsertFromRegistration(
+    registrationKey: string,
+    registration: StoredRealtimeRegistration,
+    options: { readonly recomputeKey?: boolean } = {}
+  ): Promise<RealtimeActiveQueryStoreChange> {
     const activeQueryKey = await this.keyForRegistration(
       registration,
       registrationKey,
@@ -242,37 +278,52 @@ export class RealtimeActiveQueryStore {
           versionSnapshot: registration.versionSnapshot,
         };
 
-    await this.persistByKey(activeQueryKey, nextActiveQuery);
-    if (existing) {
-      this.removeFromIndexes(activeQueryKey, existing);
-    }
-    this.activeQueries.set(activeQueryKey, nextActiveQuery);
-    this.addToIndexes(activeQueryKey, nextActiveQuery);
-    registration.activeQueryKey = activeQueryKey;
-    return activeQueryKey;
+    return {
+      activeQueryKey,
+      apply: () => {
+        if (existing) {
+          this.removeFromIndexes(activeQueryKey, existing);
+        }
+        this.activeQueries.set(activeQueryKey, nextActiveQuery);
+        this.addToIndexes(activeQueryKey, nextActiveQuery);
+        registration.activeQueryKey = activeQueryKey;
+      },
+      operations: [this.putOperation(activeQueryKey, nextActiveQuery)],
+    };
   }
 
   async detachRegistration(
     registrationKey: string,
     activeQueryKey: string | undefined
   ): Promise<void> {
+    const change = this.prepareDetachRegistration(
+      registrationKey,
+      activeQueryKey
+    );
+    await writeRealtimeStorageBatch(this.state.storage, change.operations);
+    change.apply();
+  }
+
+  prepareDetachRegistration(
+    registrationKey: string,
+    activeQueryKey: string | undefined
+  ): RealtimeActiveQueryStoreChange {
     if (!activeQueryKey) {
-      return;
+      return this.noopChange();
     }
 
     const activeQuery = this.activeQueries.get(activeQueryKey);
     if (!activeQuery) {
-      return;
+      return this.noopChange();
     }
 
     const memberRegistrationKeys = new Set(activeQuery.memberRegistrationKeys);
     memberRegistrationKeys.delete(registrationKey);
     if (memberRegistrationKeys.size === 0) {
-      await this.delete(activeQueryKey);
-      return;
+      return this.prepareDelete(activeQueryKey);
     }
 
-    await this.replaceMembers(
+    return this.prepareReplaceMembers(
       activeQueryKey,
       activeQuery,
       memberRegistrationKeys
@@ -350,34 +401,84 @@ export class RealtimeActiveQueryStore {
     activeQuery: StoredRealtimeActiveQuery,
     memberRegistrationKeys: Set<string>
   ): Promise<void> {
+    const change = this.prepareReplaceMembers(
+      activeQueryKey,
+      activeQuery,
+      memberRegistrationKeys
+    );
+    await writeRealtimeStorageBatch(this.state.storage, change.operations);
+    change.apply();
+  }
+
+  private async delete(activeQueryKey: string): Promise<void> {
+    const change = this.prepareDelete(activeQueryKey);
+    await writeRealtimeStorageBatch(this.state.storage, change.operations);
+    change.apply();
+  }
+
+  private prepareReplaceMembers(
+    activeQueryKey: string,
+    activeQuery: StoredRealtimeActiveQuery,
+    memberRegistrationKeys: Set<string>
+  ): RealtimeActiveQueryStoreChange {
     const nextActiveQuery = {
       ...activeQuery,
       memberRegistrationKeys,
     };
-    await this.persistByKey(activeQueryKey, nextActiveQuery);
-    activeQuery.memberRegistrationKeys.clear();
-    for (const registrationKey of memberRegistrationKeys) {
-      activeQuery.memberRegistrationKeys.add(registrationKey);
-    }
+    return {
+      apply: () => {
+        activeQuery.memberRegistrationKeys.clear();
+        for (const registrationKey of memberRegistrationKeys) {
+          activeQuery.memberRegistrationKeys.add(registrationKey);
+        }
+      },
+      operations: [this.putOperation(activeQueryKey, nextActiveQuery)],
+    };
   }
 
-  private async delete(activeQueryKey: string): Promise<void> {
+  private prepareDelete(
+    activeQueryKey: string
+  ): RealtimeActiveQueryStoreChange {
     const activeQuery = this.activeQueries.get(activeQueryKey);
-    if (!activeQuery) {
-      await this.state.storage?.delete?.(this.storageKey(activeQueryKey));
-      return;
-    }
+    return {
+      apply: () => {
+        if (activeQuery) {
+          this.removeFromIndexes(activeQueryKey, activeQuery);
+        }
+        this.activeQueries.delete(activeQueryKey);
+      },
+      operations: [
+        {
+          key: this.storageKey(activeQueryKey),
+          type: "delete",
+        },
+      ],
+    };
+  }
 
-    await this.state.storage?.delete?.(this.storageKey(activeQueryKey));
-    this.removeFromIndexes(activeQueryKey, activeQuery);
-    this.activeQueries.delete(activeQueryKey);
+  private noopChange(): RealtimeActiveQueryStoreChange {
+    return {
+      apply: applyNoRealtimeActiveQueryChange,
+      operations: [],
+    };
+  }
+
+  private putOperation(
+    activeQueryKey: string,
+    activeQuery: StoredRealtimeActiveQuery
+  ): RealtimeStorageBatchOperation {
+    return {
+      key: this.storageKey(activeQueryKey),
+      type: "put",
+      value: this.serializeStoredActiveQuery(activeQuery),
+    };
   }
 
   private async persistByKey(
     activeQueryKey: string,
     activeQuery: StoredRealtimeActiveQuery
   ): Promise<void> {
-    await this.state.storage?.put?.(
+    await this.state.storage?.put(
       this.storageKey(activeQueryKey),
       this.serializeStoredActiveQuery(activeQuery)
     );

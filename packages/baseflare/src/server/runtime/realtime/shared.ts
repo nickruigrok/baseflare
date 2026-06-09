@@ -1,12 +1,17 @@
 import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
+import { assertJsonBounds } from "../json-bounds";
 import { emitRuntimeMetric, logRuntimeEvent } from "../logging";
 import { sha256Hex } from "./hash";
-import { getRealtimeConnectionShardName } from "./routing";
+import {
+  getRealtimeConnectionShardName,
+  parseRealtimeSubscriptionShardName,
+} from "./routing";
 import type {
   PendingRealtimeDelivery,
   RealtimeDurableObjectState,
   RealtimeMetricResult,
   RealtimeMetricSource,
+  RealtimeRegistration,
   RealtimeRuntime,
   RealtimeSequencedOutboxEvent,
   RealtimeSocketAttachment,
@@ -15,10 +20,9 @@ import type {
 import {
   JSON_HEADERS,
   REALTIME_DELIVERY_BATCH_SIZE,
+  REALTIME_LEASE_MS,
+  REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET,
   REALTIME_MAX_IDENTIFIER_LENGTH,
-  REALTIME_MAX_JSON_DEPTH,
-  REALTIME_MAX_JSON_NODES,
-  REALTIME_MAX_JSON_STRING_LENGTH,
   REALTIME_OUTBOX_LAG_METRIC,
   REALTIME_RUNTIME_LIMIT_EXCEEDED_METRIC,
 } from "./types";
@@ -49,6 +53,7 @@ export function configureRealtimeRuntime(runtime: RealtimeRuntime): string {
   return runtimeId;
 }
 
+/** @internal test-only */
 export function resetRealtimeRuntimeStateForTest(): void {
   configuredRealtimeRuntimes.clear();
   nextRealtimeRuntimeId = 0;
@@ -124,72 +129,6 @@ export function assertRealtimeStringLength(
   }
 }
 
-export function assertRealtimeJsonBounds(value: unknown, label: string): void {
-  let nodeCount = 0;
-  const stack: Array<{ readonly depth: number; readonly value: unknown }> = [
-    { depth: 0, value },
-  ];
-
-  while (stack.length > 0) {
-    const current = stack.pop();
-    if (!current) {
-      continue;
-    }
-
-    nodeCount += 1;
-    if (nodeCount > REALTIME_MAX_JSON_NODES) {
-      throw new ValidationRuntimeError(
-        `${label} must contain at most ${REALTIME_MAX_JSON_NODES} JSON nodes`
-      );
-    }
-
-    if (current.depth > REALTIME_MAX_JSON_DEPTH) {
-      throw new ValidationRuntimeError(
-        `${label} must be at most ${REALTIME_MAX_JSON_DEPTH} levels deep`
-      );
-    }
-
-    pushRealtimeJsonChildren(current.value, current.depth, label, stack);
-  }
-}
-
-function pushRealtimeJsonChildren(
-  value: unknown,
-  depth: number,
-  label: string,
-  stack: Array<{ readonly depth: number; readonly value: unknown }>
-): void {
-  if (typeof value === "string") {
-    assertRealtimeStringLength(value, label, REALTIME_MAX_JSON_STRING_LENGTH);
-    return;
-  }
-
-  if (Array.isArray(value)) {
-    for (const item of value) {
-      stack.push({ depth: depth + 1, value: item });
-    }
-    return;
-  }
-
-  if (typeof value !== "object" || value === null) {
-    return;
-  }
-
-  const prototype = Object.getPrototypeOf(value);
-  if (!(prototype === Object.prototype || prototype === null)) {
-    throw new ValidationRuntimeError(`${label} must be JSON-serializable`);
-  }
-
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    assertRealtimeStringLength(
-      key,
-      `${label} key`,
-      REALTIME_MAX_JSON_STRING_LENGTH
-    );
-    stack.push({ depth: depth + 1, value: child });
-  }
-}
-
 export function getEpoch(value: unknown): number {
   if (value === undefined) {
     return 0;
@@ -245,7 +184,12 @@ export function createRealtimeSocketAttachment(input: {
 }
 
 function parseRealtimeSocketSubscription(
-  value: unknown
+  value: unknown,
+  context: {
+    readonly connectionKey: string;
+    readonly runtimeId: string;
+    readonly subscriptionIndex: number;
+  }
 ): RealtimeSocketSubscription | null {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return null;
@@ -262,16 +206,73 @@ function parseRealtimeSocketSubscription(
     return null;
   }
 
+  const args = subscription.args ?? {};
+  try {
+    assertRealtimeStringLength(
+      subscription.queryName,
+      "queryName",
+      REALTIME_MAX_IDENTIFIER_LENGTH
+    );
+    assertRealtimeStringLength(
+      subscription.subscriptionId,
+      "subscriptionId",
+      REALTIME_MAX_IDENTIFIER_LENGTH
+    );
+    assertJsonBounds(args, "Realtime subscription args");
+  } catch {
+    return null;
+  }
+
+  const subscriptionShardName = parseStoredSubscriptionShardName(
+    subscription.subscriptionShardName,
+    context
+  );
+
   return {
-    args: subscription.args ?? {},
+    args,
     epoch: subscription.epoch,
     queryName: subscription.queryName,
-    subscriptionShardName:
-      typeof subscription.subscriptionShardName === "string"
-        ? subscription.subscriptionShardName
-        : undefined,
+    subscriptionShardName,
     subscriptionId: subscription.subscriptionId,
   };
+}
+
+function parseStoredSubscriptionShardName(
+  value: unknown,
+  context: {
+    readonly connectionKey: string;
+    readonly runtimeId: string;
+    readonly subscriptionIndex: number;
+  }
+): string | undefined {
+  if (typeof value !== "string" || value.length === 0) {
+    return undefined;
+  }
+
+  try {
+    assertRealtimeStringLength(
+      value,
+      "subscriptionShardName",
+      REALTIME_MAX_IDENTIFIER_LENGTH
+    );
+  } catch {
+    return undefined;
+  }
+
+  if (parseRealtimeSubscriptionShardName(value)) {
+    return value;
+  }
+
+  logRuntimeEvent(
+    "warn",
+    "runtime.realtime_socket_subscription_shard_cleared",
+    {
+      connectionKey: context.connectionKey,
+      runtimeId: context.runtimeId,
+      subscriptionIndex: context.subscriptionIndex,
+    }
+  );
+  return undefined;
 }
 
 export function parseRealtimeSocketAttachment(
@@ -290,6 +291,20 @@ export function parseRealtimeSocketAttachment(
   ) {
     return null;
   }
+  try {
+    assertRealtimeStringLength(
+      attachment.connectionKey,
+      "connectionKey",
+      REALTIME_MAX_IDENTIFIER_LENGTH
+    );
+    assertRealtimeStringLength(
+      attachment.runtimeId,
+      "runtimeId",
+      REALTIME_MAX_IDENTIFIER_LENGTH
+    );
+  } catch {
+    return null;
+  }
 
   const latestDeliveredOutboxSequence =
     attachment.latestDeliveredOutboxSequence;
@@ -303,11 +318,29 @@ export function parseRealtimeSocketAttachment(
 
   const subscriptions: RealtimeSocketSubscription[] = [];
   if (Array.isArray(attachment.subscriptions)) {
-    for (const [
-      subscriptionIndex,
-      subscription,
-    ] of attachment.subscriptions.entries()) {
-      const parsedSubscription = parseRealtimeSocketSubscription(subscription);
+    if (
+      attachment.subscriptions.length >
+      REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET
+    ) {
+      logRuntimeEvent(
+        "warn",
+        "runtime.realtime_socket_subscription_attachment_dropped",
+        {
+          connectionKey: attachment.connectionKey,
+          runtimeId: attachment.runtimeId,
+          subscriptionIndex: REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET,
+        }
+      );
+    }
+
+    for (const [subscriptionIndex, subscription] of attachment.subscriptions
+      .slice(0, REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET)
+      .entries()) {
+      const parsedSubscription = parseRealtimeSocketSubscription(subscription, {
+        connectionKey: attachment.connectionKey,
+        runtimeId: attachment.runtimeId,
+        subscriptionIndex,
+      });
       if (parsedSubscription) {
         subscriptions.push(parsedSubscription);
         continue;
@@ -395,6 +428,41 @@ export async function createRealtimeAuthorizationFingerprint(
   return await sha256Hex(authorizationHeader);
 }
 
+export async function parseRealtimeRegistration(
+  body: Record<string, unknown>
+): Promise<RealtimeRegistration> {
+  return {
+    args: body.args ?? {},
+    authorizationFingerprint: await parseAuthorizationFingerprint(body),
+    connectionKey: getStringField(body, "connectionKey"),
+    connectionName: getStringField(body, "connectionName"),
+    epoch: getEpoch(body.epoch),
+    leaseExpiresAt:
+      typeof body.leaseExpiresAt === "number"
+        ? body.leaseExpiresAt
+        : Date.now() + REALTIME_LEASE_MS,
+    queryName: getStringField(body, "queryName"),
+    runtimeId: getStringField(body, "runtimeId"),
+    subscriptionId: getStringField(body, "subscriptionId"),
+  };
+}
+
+async function parseAuthorizationFingerprint(
+  body: Record<string, unknown>
+): Promise<string | undefined> {
+  if (typeof body.authorizationFingerprint === "string") {
+    return body.authorizationFingerprint;
+  }
+
+  if (typeof body.authorizationHeader === "string") {
+    return await createRealtimeAuthorizationFingerprint(
+      body.authorizationHeader
+    );
+  }
+
+  return undefined;
+}
+
 async function createAuthBoundConnectionKeyHash(
   runtimeId: string,
   authorizationHeader: string,
@@ -441,6 +509,30 @@ export function emitOutboxLagMetric(
   );
   emitRealtimeMetric(REALTIME_OUTBOX_LAG_METRIC, lagMs, { source });
   return lagMs;
+}
+
+/**
+ * Runs `work` over `items` with at most `limit` items in flight. Callers own
+ * error handling inside `work`; a thrown error stops that worker's loop.
+ */
+export async function runWithConcurrency<T>(
+  items: readonly T[],
+  limit: number,
+  work: (item: T) => Promise<void>
+): Promise<void> {
+  let nextIndex = 0;
+  const worker = async (): Promise<void> => {
+    while (nextIndex < items.length) {
+      const item = items[nextIndex];
+      nextIndex += 1;
+      if (item !== undefined) {
+        await work(item);
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, () => worker())
+  );
 }
 
 export function chunkRealtimeDeliveries(

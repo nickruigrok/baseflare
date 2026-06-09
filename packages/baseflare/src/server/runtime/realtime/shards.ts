@@ -378,6 +378,7 @@ async function retireDrainedRealtimeShardGenerations(
   }
 }
 
+/** @internal test-only */
 export function evaluateRealtimeAutoscalingForTest(
   database: Pick<RuntimeDatabase, "batch" | "prepare">,
   input: {

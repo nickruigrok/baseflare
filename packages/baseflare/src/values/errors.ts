@@ -1,3 +1,4 @@
+/** Stable error codes used in RPC error envelopes (`{ error: { code, message } }`). */
 export const ErrorCode = {
   Unauthorized: "UNAUTHORIZED",
   PermissionDenied: "PERMISSION_DENIED",

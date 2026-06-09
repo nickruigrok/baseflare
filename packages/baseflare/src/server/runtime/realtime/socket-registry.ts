@@ -45,6 +45,8 @@ export class RealtimeSocketRegistry {
 
   add(socket: RuntimeWebSocket, attachment: RealtimeSocketAttachment): void {
     const existingAttachment = this.socketStates.get(socket)?.attachment;
+    this.setAttachment(socket, attachment);
+    this.sockets.add(socket);
     if (
       existingAttachment &&
       existingAttachment.connectionKey !== attachment.connectionKey
@@ -55,8 +57,6 @@ export class RealtimeSocketRegistry {
       );
     }
 
-    this.sockets.add(socket);
-    this.setAttachment(socket, attachment);
     const sockets =
       this.socketsByConnectionKey.get(attachment.connectionKey) ??
       new Set<RuntimeWebSocket>();
@@ -192,7 +192,9 @@ export class RealtimeSocketRegistry {
       return [];
     }
 
-    const updates: RealtimeSocketSubscriptionUpdate[] = [];
+    const updates: Array<
+      RealtimeSocketSubscriptionUpdate & { readonly socket: RuntimeWebSocket }
+    > = [];
     for (const socket of sockets) {
       const attachment = this.getAttachment(socket);
       const previousSubscription = attachment?.subscriptions.find(
@@ -217,16 +219,22 @@ export class RealtimeSocketRegistry {
         continue;
       }
 
-      this.setAttachment(socket, nextAttachment);
-      updates.push({
-        nextAttachment,
-        nextSubscription,
-        previousAttachment: attachment,
-        previousSubscription,
-      });
+      try {
+        this.setAttachment(socket, nextAttachment);
+        updates.push({
+          nextAttachment,
+          nextSubscription,
+          previousAttachment: attachment,
+          previousSubscription,
+          socket,
+        });
+      } catch (error) {
+        this.rollbackSubscriptionShardNameUpdates(updates);
+        throw error;
+      }
     }
 
-    return updates;
+    return updates.map(({ socket: _socket, ...update }) => update);
   }
 
   deliver(
@@ -387,7 +395,26 @@ export class RealtimeSocketRegistry {
     socket: RuntimeWebSocket,
     attachment: RealtimeSocketAttachment
   ): void {
-    this.socketStates.set(socket, { attachment });
     socket.serializeAttachment?.(attachment);
+    this.socketStates.set(socket, { attachment });
+  }
+
+  private rollbackSubscriptionShardNameUpdates(
+    updates: readonly (RealtimeSocketSubscriptionUpdate & {
+      readonly socket: RuntimeWebSocket;
+    })[]
+  ): void {
+    for (const update of [...updates].reverse()) {
+      try {
+        this.setAttachment(update.socket, update.previousAttachment);
+      } catch {
+        try {
+          update.socket.close?.(1011, "Session expired, please reconnect");
+        } catch {
+          // Best-effort close: the socket may already be closing.
+        }
+        this.remove(update.socket);
+      }
+    }
   }
 }

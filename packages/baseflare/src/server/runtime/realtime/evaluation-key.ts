@@ -1,13 +1,13 @@
+import {
+  MAX_JSON_DEPTH,
+  MAX_JSON_NODES,
+  MAX_JSON_STRING_LENGTH,
+} from "../json-bounds";
 import { sha256Hex } from "./hash";
 import { getRealtimeRegistrationHomeRouteTarget } from "./routing";
 import type {
   RealtimeSubscriptionRouteTarget,
   StoredRealtimeRegistration,
-} from "./types";
-import {
-  REALTIME_MAX_JSON_DEPTH,
-  REALTIME_MAX_JSON_NODES,
-  REALTIME_MAX_JSON_STRING_LENGTH,
 } from "./types";
 
 interface CanonicalizationState {
@@ -20,10 +20,10 @@ function canonicalizeRealtimeValue(
   depth = 0
 ): string | null {
   state.nodeCount += 1;
-  if (state.nodeCount > REALTIME_MAX_JSON_NODES) {
+  if (state.nodeCount > MAX_JSON_NODES) {
     return null;
   }
-  if (depth > REALTIME_MAX_JSON_DEPTH) {
+  if (depth > MAX_JSON_DEPTH) {
     return null;
   }
 
@@ -32,7 +32,7 @@ function canonicalizeRealtimeValue(
   }
 
   if (typeof value === "string") {
-    if (value.length > REALTIME_MAX_JSON_STRING_LENGTH) {
+    if (value.length > MAX_JSON_STRING_LENGTH) {
       return null;
     }
     return JSON.stringify(value);
@@ -87,7 +87,7 @@ function canonicalizeRealtimeObject(
 ): string | null {
   const entries: string[] = [];
   for (const key of Object.keys(input).sort()) {
-    if (key.length > REALTIME_MAX_JSON_STRING_LENGTH) {
+    if (key.length > MAX_JSON_STRING_LENGTH) {
       return null;
     }
     const canonicalValue = canonicalizeRealtimeValue(

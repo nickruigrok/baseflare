@@ -1,21 +1,21 @@
-import type { RealtimeDurableObjectState } from "./types";
+import type { RealtimeStorage } from "./types";
 
 const REALTIME_STORAGE_LIST_PAGE_SIZE = 128;
 
 export async function listRealtimeStoragePrefix<T>(
-  storage: NonNullable<RealtimeDurableObjectState["storage"]>,
+  storage: RealtimeStorage,
   prefix: string
 ): Promise<Map<string, T>> {
   const entries = new Map<string, T>();
   let startAfter: string | undefined;
 
   while (true) {
-    const page = await storage.list?.<T>({
+    const page = await storage.list<T>({
       limit: REALTIME_STORAGE_LIST_PAGE_SIZE,
       prefix,
       startAfter,
     });
-    if (!page || page.size === 0) {
+    if (page.size === 0) {
       return entries;
     }
 

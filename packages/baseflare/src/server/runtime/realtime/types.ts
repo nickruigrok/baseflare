@@ -9,22 +9,30 @@ export type RuntimeWebSocket = WebSocket & {
   serializeAttachment?(attachment: unknown): void;
 };
 
+export interface RealtimeStorage {
+  delete(keys: readonly string[] | string): Promise<void>;
+  deleteAlarm(): Promise<void>;
+  get<T = unknown>(key: string): Promise<T | undefined>;
+  getAlarm(): Promise<number | null>;
+  list<T = unknown>(options?: {
+    readonly limit?: number;
+    readonly prefix?: string;
+    readonly startAfter?: string;
+  }): Promise<Map<string, T>>;
+  put<T = unknown>(
+    keyOrEntries: Record<string, T> | string,
+    value?: T
+  ): Promise<void>;
+  setAlarm(scheduledTime: number): Promise<void>;
+}
+
+// The production Durable Object runtime always provides storage and the
+// Hibernation API; both are optional only for lightweight in-memory test
+// states that run DOs without persistence.
 export interface RealtimeDurableObjectState {
   acceptWebSocket?(socket: RuntimeWebSocket): void;
   getWebSockets?(): RuntimeWebSocket[];
-  storage?: {
-    delete?(key: string): Promise<void>;
-    deleteAlarm?(): Promise<void>;
-    get?<T = unknown>(key: string): Promise<T | undefined>;
-    getAlarm?(): Promise<number | null>;
-    list?<T = unknown>(options?: {
-      readonly limit?: number;
-      readonly prefix?: string;
-      readonly startAfter?: string;
-    }): Promise<Map<string, T>>;
-    put?<T = unknown>(key: string, value: T): Promise<void>;
-    setAlarm?(scheduledTime: number): Promise<void>;
-  };
+  storage?: RealtimeStorage;
 }
 
 export interface RealtimePartitionTarget {
@@ -230,12 +238,6 @@ export const REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET = 100;
 
 export const REALTIME_MAX_IDENTIFIER_LENGTH = 256;
 
-export const REALTIME_MAX_JSON_DEPTH = 32;
-
-export const REALTIME_MAX_JSON_NODES = 10_000;
-
-export const REALTIME_MAX_JSON_STRING_LENGTH = 16 * 1024;
-
 export const REALTIME_MAX_MESSAGE_BYTES = 1024 * 1024;
 
 export const REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS = 3;
@@ -256,7 +258,10 @@ export const REALTIME_SCALE_UP_WINDOW_MS = 10 * 60 * 1000;
 
 export const REALTIME_SCALE_DOWN_WINDOW_MS = 24 * 60 * 60 * 1000;
 
-export const REALTIME_LEASE_MS = 60_000;
+// Leases renew on delivery and on liveness-checked cleanup; keep the lease
+// comfortably above the reconciliation interval so idle-but-live
+// registrations are not expired-at-rest between renewals.
+export const REALTIME_LEASE_MS = 300_000;
 
 export const REALTIME_OUTBOX_CLEANUP_INTERVAL_MS = 60 * 60 * 1000;
 

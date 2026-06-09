@@ -2214,6 +2214,51 @@ describe("worker runtime", () => {
     });
   });
 
+  it("rejects realtime subscriptions to unknown queries at subscribe time", async () => {
+    createRealtimeRuntimeId();
+    const response = await SELF.fetch(
+      new Request(
+        "http://example.com/api/subscribe?clientId=unknown-query-client",
+        {
+          headers: {
+            authorization: "Bearer owner-a",
+            upgrade: "websocket",
+          },
+          method: "GET",
+        }
+      )
+    );
+    const client = (response as Response & { readonly webSocket?: WebSocket })
+      .webSocket as WebSocket & { accept?: () => void };
+    const messages: Array<{ error?: string; type: string }> = [];
+    client.accept?.();
+    client.addEventListener("message", (event) => {
+      messages.push(
+        JSON.parse(String(event.data)) as { error?: string; type: string }
+      );
+    });
+
+    client.send(
+      JSON.stringify({
+        args: {},
+        epoch: 1,
+        queryName: "todos:doesNotExist",
+        subscriptionId: "sub-unknown-query",
+        type: "subscribe",
+      })
+    );
+    for (let attempt = 0; attempt < 200 && messages.length < 1; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(messages).toEqual([
+      {
+        error: 'Realtime query "todos:doesNotExist" was not found',
+        type: "error",
+      },
+    ]);
+  });
+
   // Real Durable Object coverage. workerd's test runtime cannot force genuine
   // hibernation *eviction*, so these exercise the real Hibernation API surface
   // (getWebSockets, serialize/deserialize attachments), real state.storage alarm
@@ -2920,6 +2965,113 @@ describe("worker runtime", () => {
     expect(state.alarmTime).toBeTypeOf("number");
   });
 
+  it("renews expired realtime registrations with live sockets instead of pruning", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const state = new FakeRealtimeDurableObjectState();
+    const livenessChecks: string[][] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        if (new URL(request.url).pathname === "/has-sockets") {
+          const body = (await request.json()) as {
+            subscriptionIds?: string[];
+          };
+          livenessChecks.push(body.subscriptionIds ?? []);
+          return Response.json({
+            connected: true,
+            liveSubscriptionIds: ["sub-idle-live"],
+            ok: true,
+          });
+        }
+        return Response.json({ ok: true });
+      }
+    );
+    let subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const register = (subscriptionId: string, leaseExpiresAt: number) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/register", {
+          body: JSON.stringify({
+            args: { ownerToken: "owner-a" },
+            connectionKey: "client:client-a",
+            connectionName: "connection:0",
+            epoch: 1,
+            leaseExpiresAt,
+            queryName: "todos:list",
+            runtimeId,
+            subscriptionId,
+          }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+
+    await register("sub-idle-live", Date.now() - 1);
+    await register("sub-idle-closed", Date.now() - 1);
+
+    await subscriptionDo.alarm();
+
+    // One liveness call covers every expired registration on the connection.
+    expect(livenessChecks).toEqual([["sub-idle-live", "sub-idle-closed"]]);
+
+    subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const registrationsResponse =
+      await fetchRealtimeRegistrations(subscriptionDo);
+    const body = (await registrationsResponse.json()) as {
+      registrations: Array<{ leaseExpiresAt: number; subscriptionId: string }>;
+    };
+
+    // The registration with a live socket is renewed; the closed tab's
+    // registration is dropped instead of being renewed alongside it.
+    expect(
+      body.registrations.map((registration) => registration.subscriptionId)
+    ).toEqual(["sub-idle-live"]);
+    expect(body.registrations[0]?.leaseExpiresAt).toBeGreaterThan(Date.now());
+  });
+
+  it("keeps expired realtime registrations when the liveness check fails", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const state = new FakeRealtimeDurableObjectState();
+    const connections = new FakeDurableObjectNamespace(() => {
+      throw new Error("connection DO unavailable");
+    });
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          connectionKey: "client:client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() - 1,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-idle",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    await subscriptionDo.alarm();
+
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(JSON.stringify(["client:client-a", "sub-idle"]));
+    expect(registration).toBeDefined();
+    expect(registration?.reEvaluationRetryAt).toBeTypeOf("number");
+  });
+
   it("activates migrated realtime registrations only after ownership moves", async () => {
     const runtimeId = createRealtimeRuntimeId();
     const deliveredIds: string[] = [];
@@ -3577,15 +3729,18 @@ describe("worker runtime", () => {
     );
     let shouldFailSourceDelete = true;
     const originalSourceDelete = sourceState.storage.delete;
-    sourceState.storage.delete = (key: string) => {
+    sourceState.storage.delete = (keyOrKeys: string | readonly string[]) => {
+      const keys = Array.isArray(keyOrKeys) ? keyOrKeys : [keyOrKeys];
       if (
         shouldFailSourceDelete &&
-        key.includes(realtimeRegistrationKey("client-a", "sub-a"))
+        keys.some((key) =>
+          key.includes(realtimeRegistrationKey("client-a", "sub-a"))
+        )
       ) {
         shouldFailSourceDelete = false;
         return Promise.reject(new Error("Storage delete failed"));
       }
-      return originalSourceDelete(key);
+      return originalSourceDelete(keyOrKeys);
     };
     const subscriptionPaths: string[] = [];
     const subscriptions = new FakeDurableObjectNamespace((name, request) => {
@@ -3886,45 +4041,6 @@ describe("worker runtime", () => {
     expect(
       subscriptionPaths.filter((path) => path === "/adopt-registration")
     ).toHaveLength(adoptionAttemptsAfterFailure + 1);
-  });
-
-  it("logs and counts unexpected missing realtime registration keys", async () => {
-    const errorLog = vi
-      .spyOn(console, "error")
-      .mockImplementation(() => undefined);
-    const subscriptionDo = new RealtimeSubscriptionDO(null, {
-      APP_DB: env.APP_DB,
-      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
-      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
-    });
-    (
-      subscriptionDo as unknown as {
-        activeQueryStore: {
-          getRelevantKeys: () => Set<string | undefined>;
-        };
-      }
-    ).activeQueryStore.getRelevantKeys = () => new Set([undefined]);
-    await createRealtimeOutboxEvent("missing-key-event", Date.now(), {
-      tables: ["todos"],
-    });
-
-    const response = await subscriptionDo.fetch(
-      new Request("https://baseflare.internal/notify", {
-        body: JSON.stringify({ eventId: "missing-key-event" }),
-        headers: { "content-type": "application/json" },
-        method: "POST",
-      })
-    );
-    const body = (await response.json()) as { failed: number };
-
-    expect(body.failed).toBe(1);
-    expect(errorLog).toHaveBeenCalledWith(
-      "baseflare-runtime",
-      expect.objectContaining({
-        errorName: "InternalRuntimeError",
-        event: "runtime.realtime_active_query_evaluation_failed",
-      })
-    );
   });
 
   // Migration delivery suppression guard: a migrated registration must not
@@ -5746,6 +5862,7 @@ describe("worker runtime", () => {
   });
 
   it("stores realtime socket attachments through the hibernation API", async () => {
+    createRealtimeRuntimeId();
     const state = new FakeRealtimeDurableObjectState();
     const registerRequests: unknown[] = [];
     const connectionDo = new RealtimeConnectionDO(state, {
@@ -5824,6 +5941,7 @@ describe("worker runtime", () => {
   });
 
   it("preserves a pending realtime reconciliation alarm during subscription activity", async () => {
+    createRealtimeRuntimeId();
     const state = new FakeRealtimeDurableObjectState();
     const connectionDo = new RealtimeConnectionDO(state, {
       APP_DB: env.APP_DB,
@@ -5893,6 +6011,7 @@ describe("worker runtime", () => {
   });
 
   it("restores hibernated realtime subscriptions and catches up from attachments", async () => {
+    createRealtimeRuntimeId();
     const state = new FakeRealtimeDurableObjectState();
     const subscriptionRequests: Array<{ body: unknown; path: string }> = [];
     let connectionDo = new RealtimeConnectionDO(state, {
@@ -6119,6 +6238,7 @@ describe("worker runtime", () => {
   });
 
   it("passes a realtime outbox bookmark through reconciliation alarm catch-up", async () => {
+    createRealtimeRuntimeId();
     const state = new FakeRealtimeDurableObjectState();
     const catchUpBodies: Array<{
       afterSequence: number | null;
@@ -6210,6 +6330,7 @@ describe("worker runtime", () => {
   });
 
   it("does not fan out reconciliation catch-up to unrelated active-generation shards", async () => {
+    createRealtimeRuntimeId();
     await env.APP_DB.prepare(
       "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
     )
@@ -6282,6 +6403,7 @@ describe("worker runtime", () => {
   });
 
   it("logs and counts hibernation subscription restore failures", async () => {
+    createRealtimeRuntimeId();
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const errorLog = vi
       .spyOn(console, "error")
@@ -6402,6 +6524,7 @@ describe("worker runtime", () => {
   });
 
   it("catches up accepted hibernation restores when another restore still fails", async () => {
+    createRealtimeRuntimeId();
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -6515,6 +6638,7 @@ describe("worker runtime", () => {
   });
 
   it("retries hibernation restore when generation lookup fails at wakeup", async () => {
+    createRealtimeRuntimeId();
     const errorLog = vi
       .spyOn(console, "error")
       .mockImplementation(() => undefined);
@@ -6867,6 +6991,7 @@ describe("worker runtime", () => {
   });
 
   it("restores realtime subscriptions without serial register round trips", async () => {
+    createRealtimeRuntimeId();
     let activeRegistrations = 0;
     let maxActiveRegistrations = 0;
     const registerRequests: unknown[] = [];
@@ -6953,6 +7078,7 @@ describe("worker runtime", () => {
   });
 
   it("restores the maximum allowed realtime subscription count", async () => {
+    createRealtimeRuntimeId();
     const registerRequests: unknown[] = [];
     let generationLookupCount = 0;
     const database = Object.create(env.APP_DB) as D1Database;
@@ -7094,6 +7220,7 @@ describe("worker runtime", () => {
   });
 
   it("reports partial realtime restore failures after successful registrations", async () => {
+    createRealtimeRuntimeId();
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const registerRequests: unknown[] = [];
     const subscriptionDo = new FakeDurableObjectNamespace(
@@ -7210,6 +7337,7 @@ describe("worker runtime", () => {
   });
 
   it("reports realtime restore failures when registration returns an error response", async () => {
+    createRealtimeRuntimeId();
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
         if (new URL(request.url).pathname === "/catch-up") {
@@ -7311,6 +7439,7 @@ describe("worker runtime", () => {
   });
 
   it("runs realtime restore catch-up from the supplied outbox sequence", async () => {
+    createRealtimeRuntimeId();
     let catchUpBody:
       | { afterSequence: number | null; outboxBookmark?: string }
       | undefined;
@@ -7406,6 +7535,7 @@ describe("worker runtime", () => {
   });
 
   it("uses conservative realtime catch-up when restore has no sequence", async () => {
+    createRealtimeRuntimeId();
     let catchUpBody: { afterSequence: number | null } | undefined;
     const subscriptionDo = new FakeDurableObjectNamespace(
       async (_name, request) => {
@@ -7578,6 +7708,7 @@ describe("worker runtime", () => {
   });
 
   it("reports realtime restore catch-up failures in the restored payload", async () => {
+    createRealtimeRuntimeId();
     const subscriptionDo = new FakeDurableObjectNamespace((_name, request) => {
       if (new URL(request.url).pathname === "/catch-up") {
         return Promise.resolve(Response.json({ ok: false }, { status: 500 }));
@@ -7767,6 +7898,7 @@ describe("worker runtime", () => {
   });
 
   it("does not report direct realtime subscriptions as live after registration errors", async () => {
+    createRealtimeRuntimeId();
     const connectionDo = new RealtimeConnectionDO(null, {
       APP_DB: env.APP_DB,
       REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
@@ -7884,6 +8016,7 @@ describe("worker runtime", () => {
   });
 
   it("targets realtime unsubscribe to the moved subscription shard", async () => {
+    createRealtimeRuntimeId();
     const subscriptions = new FakeDurableObjectNamespace(() =>
       Promise.resolve(Response.json({ ok: true }))
     );
@@ -9572,9 +9705,9 @@ describe("worker runtime", () => {
     });
     const advanceCursor = (
       subscriptionDo as unknown as {
-        advanceLastProcessedOutboxSequence(sequence: number): Promise<void>;
+        advanceShardCursor(sequence: number): Promise<void>;
       }
-    ).advanceLastProcessedOutboxSequence.bind(subscriptionDo);
+    ).advanceShardCursor.bind(subscriptionDo);
 
     await expect(advanceCursor(1)).rejects.toThrow(
       "Realtime shard cursor cannot advance without shard context"

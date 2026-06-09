@@ -38,7 +38,6 @@ describe("RealtimeRegistrationStore", () => {
     await store.upsert(
       registrationKey("sub-a"),
       registration("sub-a", {
-        activeQueryKey: "active-query-a",
         dependencies: { partitions: new Set(), tables: new Set(["todos"]) },
       })
     );
@@ -47,7 +46,6 @@ describe("RealtimeRegistrationStore", () => {
     await reloadedStore.loadOnce();
 
     expect(reloadedStore.get(registrationKey("sub-a"))).toMatchObject({
-      activeQueryKey: "active-query-a",
       queryName: "todos:list",
       subscriptionId: "sub-a",
     });
@@ -72,6 +70,29 @@ describe("RealtimeRegistrationStore", () => {
     expect(reloaded?.authorizationFingerprint).toMatch(/^[0-9a-f]{64}$/);
     expect(JSON.stringify([...state.durableStorage.values()])).not.toContain(
       "Bearer owner-a"
+    );
+  });
+
+  it("replaces legacy active query keys during registration reload", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const key = registrationKey("sub-a");
+    await state.storage.put(`realtime:registration:${key}`, {
+      ...registration("sub-a"),
+      activeQueryKey: "legacy-active-query-key",
+    });
+
+    const reloadedStore = new RealtimeRegistrationStore(
+      state,
+      activeQueryStore
+    );
+    await reloadedStore.loadOnce();
+
+    const reloaded = reloadedStore.get(key);
+    expect(reloaded?.activeQueryKey).toMatch(/^aq:/);
+    expect(activeQueryStore.get(reloaded?.activeQueryKey ?? "")).toBeDefined();
+    expect(JSON.stringify([...state.durableStorage.values()])).not.toContain(
+      "legacy-active-query-key"
     );
   });
 
@@ -156,22 +177,16 @@ describe("RealtimeRegistrationStore", () => {
     expect(activeQueryStore.size()).toBe(0);
   });
 
-  it("rolls back a new registration when active query attachment fails", async () => {
+  it("keeps registration and active query state unchanged when an upsert batch fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
-    const originalPut = state.storage.put;
-    state.storage.put = ((key, value) => {
-      if (key.startsWith("realtime:active-query:")) {
-        return Promise.reject(new Error("Active query put failed"));
-      }
-      return originalPut(key, value);
-    }) as typeof state.storage.put;
     const activeQueryStore = new RealtimeActiveQueryStore(state);
     const store = new RealtimeRegistrationStore(state, activeQueryStore);
     const key = registrationKey("sub-a");
     const storedRegistration = registration("sub-a");
+    state.failedStoragePuts = 1;
 
     await expect(store.upsert(key, storedRegistration)).rejects.toThrow(
-      "Active query put failed"
+      "Storage put failed"
     );
 
     expect(store.size()).toBe(0);
@@ -185,7 +200,7 @@ describe("RealtimeRegistrationStore", () => {
     ).toBe(false);
   });
 
-  it("restores the previous registration when replacement active query attachment fails", async () => {
+  it("keeps the previous registration when a replacement batch fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const activeQueryStore = new RealtimeActiveQueryStore(state);
     const store = new RealtimeRegistrationStore(state, activeQueryStore);
@@ -195,13 +210,7 @@ describe("RealtimeRegistrationStore", () => {
     });
     await store.upsert(key, previousRegistration);
     const previousActiveQueryKey = previousRegistration.activeQueryKey;
-    const originalPut = state.storage.put;
-    state.storage.put = ((storageKey, value) => {
-      if (storageKey.startsWith("realtime:active-query:")) {
-        return Promise.reject(new Error("Active query put failed"));
-      }
-      return originalPut(storageKey, value);
-    }) as typeof state.storage.put;
+    state.failedStoragePuts = 1;
 
     await expect(
       store.upsert(
@@ -210,7 +219,7 @@ describe("RealtimeRegistrationStore", () => {
           args: { filter: "new" },
         })
       )
-    ).rejects.toThrow("Active query put failed");
+    ).rejects.toThrow("Storage put failed");
 
     expect(store.get(key)).toMatchObject({
       activeQueryKey: previousActiveQueryKey,
@@ -278,7 +287,7 @@ describe("RealtimeRegistrationStore", () => {
     ).not.toContain(activeQueryKey);
   });
 
-  it("rolls back dependency updates when active query attachment fails", async () => {
+  it("keeps dependency state unchanged when a dependency update batch fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const activeQueryStore = new RealtimeActiveQueryStore(state);
     const store = new RealtimeRegistrationStore(state, activeQueryStore);
@@ -295,13 +304,7 @@ describe("RealtimeRegistrationStore", () => {
     if (!activeQueryKey) {
       throw new Error("Expected active query key");
     }
-    const originalPut = state.storage.put;
-    state.storage.put = ((storageKey, value) => {
-      if (storageKey.startsWith("realtime:active-query:")) {
-        return Promise.reject(new Error("Active query put failed"));
-      }
-      return originalPut(storageKey, value);
-    }) as typeof state.storage.put;
+    state.failedStoragePuts = 1;
 
     await expect(
       store.updateSameShardDependencies(
@@ -310,7 +313,7 @@ describe("RealtimeRegistrationStore", () => {
         { partitions: new Set(), tables: new Set(["labels"]) },
         { partitions: new Map(), tables: new Map([["labels", 1]]) }
       )
-    ).rejects.toThrow("Active query put failed");
+    ).rejects.toThrow("Storage put failed");
 
     expect(storedRegistration.activeQueryKey).toBe(activeQueryKey);
     expect(storedRegistration.dependencies?.tables).toEqual(new Set(["todos"]));
@@ -397,7 +400,7 @@ describe("RealtimeRegistrationStore", () => {
     expect(reloadedStore.values()).toEqual([]);
   });
 
-  it("cleans up only expired registrations", async () => {
+  it("lists only expired registrations", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeRegistrationStore(state);
     const expiredRegistration = {
@@ -408,9 +411,10 @@ describe("RealtimeRegistrationStore", () => {
     await store.upsert(registrationKey("sub-expired"), expiredRegistration);
     await store.upsert(registrationKey("sub-active"), activeRegistration);
 
-    await store.cleanupExpired();
+    const expired = store.expired();
 
-    expect(store.get(registrationKey("sub-expired"))).toBeUndefined();
+    expect(expired).toHaveLength(1);
+    expect(expired[0]?.subscriptionId).toBe("sub-expired");
     expect(store.get(registrationKey("sub-active"))).toBe(activeRegistration);
   });
 

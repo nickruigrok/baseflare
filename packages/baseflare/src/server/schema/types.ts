@@ -125,6 +125,9 @@ export function assertFieldName(name: string): void {
 }
 
 export function createTableStatement(tableName: string): string {
+  // Schema parsing already validates identifiers; assert again here so no
+  // future caller can interpolate an unvalidated name into DDL.
+  assertTableName(tableName);
   return `CREATE TABLE ${tableName} (_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0 CHECK(_rev >= 0))`;
 }
 
@@ -133,12 +136,15 @@ export function createIndexStatement(
   index: TableIndex,
   options: { ifNotExists?: boolean } = {}
 ): string {
-  const expressions = index.fields
-    .map((field) => `json_extract(_data, '$.${field}')`)
-    .join(", ");
+  assertTableName(tableName);
+  assertIdentifier(index.name, "Index name");
+  const expressions = index.fields.map((field) => {
+    assertFieldName(field);
+    return `json_extract(_data, '$.${field}')`;
+  });
   const ifNotExists = options.ifNotExists ? " IF NOT EXISTS" : "";
 
-  return `CREATE INDEX${ifNotExists} ${tableName}_${index.name} ON ${tableName} (${expressions})`;
+  return `CREATE INDEX${ifNotExists} ${tableName}_${index.name} ON ${tableName} (${expressions.join(", ")})`;
 }
 
 export function createTableVersionStatements(

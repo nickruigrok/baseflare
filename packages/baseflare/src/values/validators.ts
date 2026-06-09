@@ -707,6 +707,12 @@ function optionalValidator<
   return validator.optional();
 }
 
+/**
+ * Validator builders for schema fields, function args, and return values —
+ * e.g. `v.string().min(1)`, `v.id("users")`, `v.optional(v.number())`.
+ * Validators run at write/call time; chain `.optional()`, `.default()`,
+ * `.min()`/`.max()`, and `.searchable()` where supported.
+ */
 export const v = {
   string: stringValidator,
   number: numberValidator,

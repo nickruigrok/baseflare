@@ -127,6 +127,11 @@ function validateWorkerConfig(worker: BaseflareWorkerConfig): void {
   }
 }
 
+/**
+ * Defines the committed project configuration (`baseflare.config.ts`):
+ * project slug, functions directory, CORS, limits, and worker settings.
+ * Validates eagerly and rejects unknown keys.
+ */
 export function defineConfig(config: BaseflareConfig): BaseflareConfig {
   assertPlainObject(config, "config");
   assertAllowedKeys(config, "config", CONFIG_KEYS);

@@ -18,9 +18,9 @@ import {
   createMutationDatabaseSession,
   MutationDatabase,
   RetryableMutationConflictError,
-  resetOccContentionWarningStateForTest,
   withMutationRetry,
 } from "./mutation-database";
+import { resetOccContentionWarningStateForTest } from "./occ";
 import type { RealtimeMutationNotifier } from "./realtime/types";
 import type {
   D1BindingValue,

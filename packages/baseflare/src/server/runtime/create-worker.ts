@@ -21,11 +21,12 @@ import {
   executeQueryDefinition,
 } from "./execution";
 import { createFunctionIndex } from "./function-index";
+import { assertJsonBounds } from "./json-bounds";
 import { getRequestLogFields, logRuntimeEvent } from "./logging";
 import { routeRealtimeSubscribe } from "./realtime/connection-do";
 import { createRealtimeMutationNotifier } from "./realtime/outbox";
 import { configureRealtimeRuntime } from "./realtime/shared";
-import { assertRpcJsonBounds, readRequestBodyText } from "./request-body";
+import { readRequestBodyText } from "./request-body";
 import type {
   BaseflareExecutionContext,
   BaseflareManifest,
@@ -52,20 +53,17 @@ function getRouteName(pathname: string, prefix: string): string | null {
   }
 }
 
+const RPC_ROUTES = [
+  { kind: "query", label: "Query", prefix: "/api/query/" },
+  { kind: "mutation", label: "Mutation", prefix: "/api/mutation/" },
+  { kind: "action", label: "Action", prefix: "/api/action/" },
+] as const;
+
 function getRpcMethodError(pathname: string): string | null {
-  if (pathname.startsWith("/api/query/")) {
-    return "Query RPC requests must use POST";
-  }
-
-  if (pathname.startsWith("/api/mutation/")) {
-    return "Mutation RPC requests must use POST";
-  }
-
-  if (pathname.startsWith("/api/action/")) {
-    return "Action RPC requests must use POST";
-  }
-
-  return null;
+  const route = RPC_ROUTES.find((rpcRoute) =>
+    pathname.startsWith(rpcRoute.prefix)
+  );
+  return route ? `${route.label} RPC requests must use POST` : null;
 }
 
 async function parseRpcBodyArgs(request: Request): Promise<unknown> {
@@ -86,7 +84,7 @@ async function parseRpcBodyArgs(request: Request): Promise<unknown> {
         : "Invalid RPC request JSON"
     );
   }
-  assertRpcJsonBounds(parsed, "RPC request body");
+  assertJsonBounds(parsed, "RPC request body");
 
   if (
     typeof parsed !== "object" ||
@@ -226,7 +224,7 @@ function createInvocationOptions(
   };
 }
 
-async function handleQueryRequest(
+async function handleRpcRequest(
   request: Request,
   url: URL,
   env: BaseflareRuntimeEnv,
@@ -234,98 +232,56 @@ async function handleQueryRequest(
   ctx: BaseflareExecutionContext,
   functionIndex: ReturnType<typeof createFunctionIndex>
 ): Promise<Response | null> {
-  const queryName = getRouteName(url.pathname, "/api/query/");
-  if (!queryName) {
-    return null;
+  for (const route of RPC_ROUTES) {
+    const name = getRouteName(url.pathname, route.prefix);
+    if (!name) {
+      continue;
+    }
+
+    if (request.method !== "POST") {
+      return null;
+    }
+
+    const entry = functionIndex.getByName(route.kind, name, "public");
+    if (!entry) {
+      throw new NotFoundRuntimeError(`${route.label} "${name}" was not found`);
+    }
+
+    const args = await parseRpcBodyArgs(request);
+    const options = createInvocationOptions(
+      env,
+      manifest,
+      request,
+      ctx,
+      functionIndex
+    );
+    if (route.kind === "query") {
+      return jsonResult(
+        await executeQueryDefinition(
+          entry.definition as QueryDefinition,
+          options,
+          args
+        )
+      );
+    }
+
+    const invocationOptions = { ...options, invocationName: entry.name };
+    return jsonResult(
+      route.kind === "mutation"
+        ? await executeMutationDefinition(
+            entry.definition as MutationDefinition,
+            invocationOptions,
+            args
+          )
+        : await executeActionDefinition(
+            entry.definition as ActionDefinition,
+            invocationOptions,
+            args
+          )
+    );
   }
 
-  if (request.method !== "POST") {
-    return null;
-  }
-
-  const entry = functionIndex.getByName("query", queryName, "public");
-  if (!entry) {
-    throw new NotFoundRuntimeError(`Query "${queryName}" was not found`);
-  }
-
-  const args = await parseRpcBodyArgs(request);
-  const result = await executeQueryDefinition(
-    entry.definition as QueryDefinition,
-    createInvocationOptions(env, manifest, request, ctx, functionIndex),
-    args
-  );
-
-  return jsonResult(result);
-}
-
-async function handleMutationRequest(
-  request: Request,
-  url: URL,
-  env: BaseflareRuntimeEnv,
-  manifest: BaseflareManifest,
-  ctx: BaseflareExecutionContext,
-  functionIndex: ReturnType<typeof createFunctionIndex>
-): Promise<Response | null> {
-  const mutationName = getRouteName(url.pathname, "/api/mutation/");
-  if (!mutationName) {
-    return null;
-  }
-
-  if (request.method !== "POST") {
-    return null;
-  }
-
-  const entry = functionIndex.getByName("mutation", mutationName, "public");
-  if (!entry) {
-    throw new NotFoundRuntimeError(`Mutation "${mutationName}" was not found`);
-  }
-
-  const args = await parseRpcBodyArgs(request);
-  const result = await executeMutationDefinition(
-    entry.definition as MutationDefinition,
-    {
-      ...createInvocationOptions(env, manifest, request, ctx, functionIndex),
-      invocationName: entry.name,
-    },
-    args
-  );
-
-  return jsonResult(result);
-}
-
-async function handleActionRequest(
-  request: Request,
-  url: URL,
-  env: BaseflareRuntimeEnv,
-  manifest: BaseflareManifest,
-  ctx: BaseflareExecutionContext,
-  functionIndex: ReturnType<typeof createFunctionIndex>
-): Promise<Response | null> {
-  const actionName = getRouteName(url.pathname, "/api/action/");
-  if (!actionName) {
-    return null;
-  }
-
-  if (request.method !== "POST") {
-    return null;
-  }
-
-  const entry = functionIndex.getByName("action", actionName, "public");
-  if (!entry) {
-    throw new NotFoundRuntimeError(`Action "${actionName}" was not found`);
-  }
-
-  const args = await parseRpcBodyArgs(request);
-  const result = await executeActionDefinition(
-    entry.definition as ActionDefinition,
-    {
-      ...createInvocationOptions(env, manifest, request, ctx, functionIndex),
-      invocationName: entry.name,
-    },
-    args
-  );
-
-  return jsonResult(result);
+  return null;
 }
 
 function handleCustomHttpRequest(
@@ -366,30 +322,7 @@ async function routeRequest(
 
   return (
     (await routeRealtimeSubscribe(request, env, realtimeRuntimeId)) ??
-    (await handleQueryRequest(
-      request,
-      url,
-      env,
-      manifest,
-      ctx,
-      functionIndex
-    )) ??
-    (await handleMutationRequest(
-      request,
-      url,
-      env,
-      manifest,
-      ctx,
-      functionIndex
-    )) ??
-    (await handleActionRequest(
-      request,
-      url,
-      env,
-      manifest,
-      ctx,
-      functionIndex
-    )) ??
+    (await handleRpcRequest(request, url, env, manifest, ctx, functionIndex)) ??
     (await handleCustomHttpRequest(
       request,
       url,
@@ -411,6 +344,12 @@ async function routeRequest(
   );
 }
 
+/**
+ * Builds the environment Worker `fetch` handler from a Baseflare manifest:
+ * RPC routes, the realtime WebSocket endpoint, custom HTTP routes, and CORS.
+ * Consumed by the CLI-generated worker entry via `baseflare/runtime`; never
+ * runs schema DDL — schema application is deploy-owned.
+ */
 export function createWorker<
   TEnv extends BaseflareRuntimeEnv = BaseflareRuntimeEnv,
 >(manifest: BaseflareManifest): ExportedHandler<TEnv> {

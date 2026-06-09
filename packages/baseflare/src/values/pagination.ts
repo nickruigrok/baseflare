@@ -11,6 +11,10 @@ export interface PaginationResult<TValue> {
   page: TValue[];
 }
 
+/**
+ * Reusable args validator for paginated queries: `{ numItems, cursor }`.
+ * Pass the validated value straight to `ctx.db.query(...).paginate(...)`.
+ */
 export const paginationOptsValidator = v.object({
   numItems: v.number().integer().min(1),
   cursor: v.union(v.string(), v.null()).default(null),

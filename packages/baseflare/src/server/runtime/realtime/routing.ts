@@ -279,12 +279,34 @@ function getRealtimeShardName(
 export function getRealtimeShardGenerationIdFromName(
   shardName: string
 ): number {
-  const match = /^subscription:g(\d+):\d+$/.exec(shardName);
-  if (!match) {
+  const parsed = parseRealtimeSubscriptionShardName(shardName);
+  if (!parsed) {
     return DEFAULT_REALTIME_SHARD_GENERATION.generationId;
   }
 
-  return Number(match[1]);
+  return parsed.generationId;
+}
+
+export function parseRealtimeSubscriptionShardName(
+  shardName: string
+): { readonly generationId: number; readonly shardIndex: number } | undefined {
+  const match = /^subscription:g(\d+):(\d+)$/.exec(shardName);
+  if (!match) {
+    return undefined;
+  }
+
+  const generationId = Number(match[1]);
+  const shardIndex = Number(match[2]);
+  if (
+    !Number.isSafeInteger(generationId) ||
+    generationId <= 0 ||
+    !Number.isSafeInteger(shardIndex) ||
+    shardIndex < 0
+  ) {
+    return undefined;
+  }
+
+  return { generationId, shardIndex };
 }
 
 export function getRealtimeConnectionShardName(

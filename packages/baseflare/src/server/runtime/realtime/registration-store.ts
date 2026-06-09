@@ -1,5 +1,6 @@
 import { logRuntimeEvent } from "../logging";
 import type { RealtimeActiveQueryStore } from "./active-query-store";
+import { isRealtimeActiveQueryKey } from "./evaluation-key";
 import {
   createRegistrationKey,
   parseRealtimeDependencySetValue,
@@ -7,23 +8,19 @@ import {
   serializeRealtimeDependencySet,
   serializeRealtimeVersionSnapshot,
 } from "./routing";
+import { parseRealtimeRegistration } from "./shared";
 import {
-  createRealtimeAuthorizationFingerprint,
-  getEpoch,
-  getStringField,
-} from "./shared";
+  type RealtimeStorageBatchOperation,
+  writeRealtimeStorageBatch,
+} from "./storage-batch";
 import { listRealtimeStoragePrefix } from "./storage-list";
 import type {
   RealtimeDependencySet,
   RealtimeDurableObjectState,
-  RealtimeRegistration,
   RealtimeVersionSnapshot,
   StoredRealtimeRegistration,
 } from "./types";
-import {
-  REALTIME_LEASE_MS,
-  REALTIME_REEVALUATION_FAILURE_RETRY_MS,
-} from "./types";
+import { REALTIME_REEVALUATION_FAILURE_RETRY_MS } from "./types";
 
 const REALTIME_REGISTRATION_STORAGE_PREFIX = "realtime:registration:";
 
@@ -68,7 +65,7 @@ export class RealtimeRegistrationStore {
     }
 
     const storage = this.state.storage;
-    if (!storage?.list) {
+    if (!storage) {
       this.loaded = true;
       return;
     }
@@ -78,6 +75,8 @@ export class RealtimeRegistrationStore {
         storage,
         REALTIME_REGISTRATION_STORAGE_PREFIX
       );
+    const activeQueryKeysBeforeSync = new Map<string, string | undefined>();
+    const sanitizedRegistrationKeys = new Set<string>();
     for (const [storageKey, value] of storedRegistrations) {
       const registration = await this.parseStoredRegistrationValue(value);
       if (!registration) {
@@ -94,15 +93,42 @@ export class RealtimeRegistrationStore {
       const registrationKey = storageKey.slice(
         REALTIME_REGISTRATION_STORAGE_PREFIX.length
       );
+      if (
+        registration.activeQueryKey &&
+        !isRealtimeActiveQueryKey(registration.activeQueryKey)
+      ) {
+        registration.activeQueryKey = undefined;
+        sanitizedRegistrationKeys.add(registrationKey);
+      }
       this.registrations.set(registrationKey, registration);
+      activeQueryKeysBeforeSync.set(
+        registrationKey,
+        registration.activeQueryKey
+      );
       if (
         typeof (value as { readonly authorizationHeader?: unknown })
           .authorizationHeader === "string"
       ) {
-        await this.persistByKey(registrationKey, registration);
+        sanitizedRegistrationKeys.add(registrationKey);
       }
     }
     await this.activeQueryStore?.syncRegistrations(this.values());
+    for (const [registrationKey, activeQueryKey] of activeQueryKeysBeforeSync) {
+      if (
+        this.registrations.get(registrationKey)?.activeQueryKey !==
+        activeQueryKey
+      ) {
+        sanitizedRegistrationKeys.add(registrationKey);
+      }
+    }
+    await Promise.all(
+      [...sanitizedRegistrationKeys].map((registrationKey) => {
+        const registration = this.registrations.get(registrationKey);
+        return registration
+          ? this.persistByKey(registrationKey, registration)
+          : Promise.resolve();
+      })
+    );
     this.loaded = true;
   }
 
@@ -134,46 +160,24 @@ export class RealtimeRegistrationStore {
             activeQueryKey: activeQueryKey ?? registration.activeQueryKey,
           }
         : registration;
-    await this.persistByKey(registrationKey, nextRegistration);
-    registration.activeQueryKey = nextRegistration.activeQueryKey;
-    this.registrations.set(registrationKey, nextRegistration);
-    try {
-      await this.activeQueryStore?.upsertFromRegistration(
+    const activeQueryChange =
+      await this.activeQueryStore?.prepareUpsertFromRegistration(
         registrationKey,
         nextRegistration
       );
-    } catch (error) {
-      try {
-        if (existing) {
-          this.registrations.set(registrationKey, existing);
-          registration.activeQueryKey = existing.activeQueryKey;
-          await this.persistByKey(registrationKey, existing);
-        } else {
-          this.registrations.delete(registrationKey);
-          registration.activeQueryKey = undefined;
-          await this.deleteStoredByKey(registrationKey);
-        }
-      } catch (rollbackError) {
-        logRuntimeEvent(
-          "error",
-          "runtime.realtime_registration_upsert_rollback_failed",
-          {
-            errorName:
-              rollbackError instanceof Error
-                ? rollbackError.name
-                : typeof rollbackError,
-            registrationKey,
-          }
-        );
-      }
-      throw error;
-    }
+    await writeRealtimeStorageBatch(this.state.storage, [
+      this.putOperation(registrationKey, nextRegistration),
+      ...(activeQueryChange?.operations ?? []),
+    ]);
+    registration.activeQueryKey = nextRegistration.activeQueryKey;
+    this.registrations.set(registrationKey, nextRegistration);
+    activeQueryChange?.apply();
 
     if (
       existing &&
       existing.activeQueryKey !== nextRegistration.activeQueryKey
     ) {
-      await this.activeQueryStore?.detachRegistration(
+      await this.detachRegistrationFromActiveQuery(
         registrationKey,
         existing.activeQueryKey
       );
@@ -187,28 +191,14 @@ export class RealtimeRegistrationStore {
       return;
     }
 
-    await this.deleteStoredByKey(registrationKey);
+    await writeRealtimeStorageBatch(this.state.storage, [
+      this.deleteOperation(registrationKey),
+    ]);
     this.registrations.delete(registrationKey);
-    try {
-      await this.activeQueryStore?.detachRegistration(
-        registrationKey,
-        registration.activeQueryKey
-      );
-    } catch (error) {
-      logRuntimeEvent("error", "runtime.realtime_registration_detach_failed", {
-        errorName: error instanceof Error ? error.name : typeof error,
-        registrationKey,
-      });
-      try {
-        await this.activeQueryStore?.syncRegistrations(this.values());
-      } catch (syncError) {
-        logRuntimeEvent("error", "runtime.realtime_active_query_sync_failed", {
-          errorName:
-            syncError instanceof Error ? syncError.name : typeof syncError,
-          registrationKey,
-        });
-      }
-    }
+    await this.detachRegistrationFromActiveQuery(
+      registrationKey,
+      registration.activeQueryKey
+    );
   }
 
   async deleteExpired(
@@ -228,31 +218,15 @@ export class RealtimeRegistrationStore {
     return true;
   }
 
-  async cleanupExpired(now = Date.now()): Promise<void> {
-    const expiredRegistrationKeys: string[] = [];
-    for (const [registrationKey, registration] of this.registrations) {
+  expired(now = Date.now()): StoredRealtimeRegistration[] {
+    const expiredRegistrations: StoredRealtimeRegistration[] = [];
+    for (const registration of this.registrations.values()) {
       if (registration.leaseExpiresAt <= now) {
-        expiredRegistrationKeys.push(registrationKey);
+        expiredRegistrations.push(registration);
       }
     }
 
-    const results = await Promise.allSettled(
-      expiredRegistrationKeys.map((registrationKey) =>
-        this.delete(registrationKey)
-      )
-    );
-    for (const [index, result] of results.entries()) {
-      if (result.status === "fulfilled") {
-        continue;
-      }
-      logRuntimeEvent("error", "runtime.realtime_registration_cleanup_failed", {
-        errorName:
-          result.reason instanceof Error
-            ? result.reason.name
-            : typeof result.reason,
-        registrationKey: expiredRegistrationKeys[index],
-      });
-    }
+    return expiredRegistrations;
   }
 
   async updateSameShardDependencies(
@@ -261,9 +235,7 @@ export class RealtimeRegistrationStore {
     dependencies: RealtimeDependencySet,
     versionSnapshot: RealtimeVersionSnapshot
   ): Promise<void> {
-    const previousDependencies = registration.dependencies;
     const previousActiveQueryKey = registration.activeQueryKey;
-    const previousVersionSnapshot = registration.versionSnapshot;
     const nextRegistration = {
       ...registration,
       dependencies,
@@ -278,41 +250,23 @@ export class RealtimeRegistrationStore {
       nextRegistration.activeQueryKey = activeQueryKey;
     }
 
-    await this.persistByKey(registrationKey, nextRegistration);
+    const activeQueryChange =
+      await this.activeQueryStore?.prepareUpsertFromRegistration(
+        registrationKey,
+        nextRegistration,
+        { recomputeKey: true }
+      );
+    await writeRealtimeStorageBatch(this.state.storage, [
+      this.putOperation(registrationKey, nextRegistration),
+      ...(activeQueryChange?.operations ?? []),
+    ]);
     registration.dependencies = dependencies;
     registration.versionSnapshot = versionSnapshot;
     registration.activeQueryKey = nextRegistration.activeQueryKey;
     this.registrations.set(registrationKey, registration);
-    try {
-      await this.activeQueryStore?.upsertFromRegistration(
-        registrationKey,
-        registration,
-        { recomputeKey: true }
-      );
-    } catch (error) {
-      registration.dependencies = previousDependencies;
-      registration.versionSnapshot = previousVersionSnapshot;
-      registration.activeQueryKey = previousActiveQueryKey;
-      this.registrations.set(registrationKey, registration);
-      try {
-        await this.persistByKey(registrationKey, registration);
-      } catch (rollbackError) {
-        logRuntimeEvent(
-          "error",
-          "runtime.realtime_registration_dependency_update_rollback_failed",
-          {
-            errorName:
-              rollbackError instanceof Error
-                ? rollbackError.name
-                : typeof rollbackError,
-            registrationKey,
-          }
-        );
-      }
-      throw error;
-    }
+    activeQueryChange?.apply();
     if (previousActiveQueryKey !== registration.activeQueryKey) {
-      await this.activeQueryStore?.detachRegistration(
+      await this.detachRegistrationFromActiveQuery(
         registrationKey,
         previousActiveQueryKey
       );
@@ -403,20 +357,65 @@ export class RealtimeRegistrationStore {
     registrationKey: string,
     registration: StoredRealtimeRegistration
   ): Promise<void> {
-    await this.state.storage?.put?.(
-      this.registrationStorageKey(registrationKey),
-      this.serializeStoredRegistration(registration)
-    );
+    await writeRealtimeStorageBatch(this.state.storage, [
+      this.putOperation(registrationKey, registration),
+    ]);
   }
 
   private async deleteStoredByKey(registrationKey: string): Promise<void> {
-    await this.state.storage?.delete?.(
-      this.registrationStorageKey(registrationKey)
-    );
+    await writeRealtimeStorageBatch(this.state.storage, [
+      this.deleteOperation(registrationKey),
+    ]);
   }
 
   private registrationStorageKey(registrationKey: string): string {
     return `${REALTIME_REGISTRATION_STORAGE_PREFIX}${registrationKey}`;
+  }
+
+  private putOperation(
+    registrationKey: string,
+    registration: StoredRealtimeRegistration
+  ): RealtimeStorageBatchOperation {
+    return {
+      key: this.registrationStorageKey(registrationKey),
+      type: "put",
+      value: this.serializeStoredRegistration(registration),
+    };
+  }
+
+  private deleteOperation(
+    registrationKey: string
+  ): RealtimeStorageBatchOperation {
+    return {
+      key: this.registrationStorageKey(registrationKey),
+      type: "delete",
+    };
+  }
+
+  private async detachRegistrationFromActiveQuery(
+    registrationKey: string,
+    activeQueryKey: string | undefined
+  ): Promise<void> {
+    try {
+      await this.activeQueryStore?.detachRegistration(
+        registrationKey,
+        activeQueryKey
+      );
+    } catch (error) {
+      logRuntimeEvent("error", "runtime.realtime_registration_detach_failed", {
+        errorName: error instanceof Error ? error.name : typeof error,
+        registrationKey,
+      });
+      try {
+        await this.activeQueryStore?.syncRegistrations(this.values());
+      } catch (syncError) {
+        logRuntimeEvent("error", "runtime.realtime_active_query_sync_failed", {
+          errorName:
+            syncError instanceof Error ? syncError.name : typeof syncError,
+          registrationKey,
+        });
+      }
+    }
   }
 
   private async parseStoredRegistrationValue(
@@ -429,7 +428,7 @@ export class RealtimeRegistrationStore {
     try {
       const input = value as Record<string, unknown>;
       return {
-        ...(await this.parseRegistration(input)),
+        ...(await parseRealtimeRegistration(input)),
         dependencies: parseRealtimeDependencySetValue(input.dependencies),
         lastResultJson:
           typeof input.lastResultJson === "string"
@@ -451,41 +450,6 @@ export class RealtimeRegistrationStore {
     } catch {
       return undefined;
     }
-  }
-
-  private async parseAuthorizationFingerprint(
-    body: Record<string, unknown>
-  ): Promise<string | undefined> {
-    if (typeof body.authorizationFingerprint === "string") {
-      return body.authorizationFingerprint;
-    }
-
-    if (typeof body.authorizationHeader === "string") {
-      return await createRealtimeAuthorizationFingerprint(
-        body.authorizationHeader
-      );
-    }
-
-    return undefined;
-  }
-
-  private async parseRegistration(
-    body: Record<string, unknown>
-  ): Promise<RealtimeRegistration> {
-    return {
-      args: body.args ?? {},
-      authorizationFingerprint: await this.parseAuthorizationFingerprint(body),
-      connectionKey: getStringField(body, "connectionKey"),
-      connectionName: getStringField(body, "connectionName"),
-      epoch: getEpoch(body.epoch),
-      leaseExpiresAt:
-        typeof body.leaseExpiresAt === "number"
-          ? body.leaseExpiresAt
-          : Date.now() + REALTIME_LEASE_MS,
-      queryName: getStringField(body, "queryName"),
-      runtimeId: getStringField(body, "runtimeId"),
-      subscriptionId: getStringField(body, "subscriptionId"),
-    };
   }
 
   private serializeStoredRegistration(
