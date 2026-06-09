@@ -103,6 +103,10 @@ declare module "cloudflare:test" {
   }
 }
 
+declare const WebSocketPair: {
+  new (): [WebSocket, WebSocket];
+};
+
 const schema = defineSchema({
   labels: defineTable({
     ownerToken: v.string(),
@@ -1962,6 +1966,48 @@ describe("worker runtime", () => {
     expect(new URL(connections.requests[0]?.request.url ?? "").pathname).toBe(
       "/api/subscribe"
     );
+  });
+
+  it("preserves WebSocket upgrade responses when adding CORS headers", async () => {
+    const corsWorker = createWorker(
+      createManifest({
+        config: {
+          cors: {
+            origins: ["https://app.example"],
+          },
+          project: "cors-project",
+        },
+      })
+    );
+    const connections = new FakeDurableObjectNamespace(() => {
+      const pair = new WebSocketPair();
+      return Promise.resolve(
+        new Response(null, {
+          status: 101,
+          webSocket: pair[0],
+        } as ResponseInit)
+      );
+    });
+    const response = (await invoke(
+      "/api/subscribe?clientId=client-a",
+      {
+        headers: {
+          authorization: "Bearer owner-a",
+          origin: "https://app.example",
+          upgrade: "websocket",
+        },
+        method: "GET",
+      },
+      corsWorker,
+      { ...env, REALTIME_CONNECTIONS: connections }
+    )) as Response & { readonly webSocket?: WebSocket };
+
+    expect(response.status).toBe(101);
+    expect(response.webSocket).toBeDefined();
+    expect(response.headers.get("access-control-allow-origin")).toBe(
+      "https://app.example"
+    );
+    expect(response.headers.get("vary")).toBe("Origin");
   });
 
   it("rejects explicit realtime client ids without authorization", async () => {

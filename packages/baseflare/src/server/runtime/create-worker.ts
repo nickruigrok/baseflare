@@ -152,11 +152,18 @@ function withCorsHeaders(
     headers.set(key, value);
   }
 
-  return new Response(response.body, {
+  const webSocket = (response as Response & { readonly webSocket?: WebSocket })
+    .webSocket;
+  const init: ResponseInit & { webSocket?: WebSocket } = {
     headers,
     status: response.status,
     statusText: response.statusText,
-  });
+  };
+  if (webSocket) {
+    init.webSocket = webSocket;
+  }
+
+  return new Response(response.body, init);
 }
 
 function handleCorsPreflight(
