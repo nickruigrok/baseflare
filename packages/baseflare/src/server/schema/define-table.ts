@@ -73,7 +73,9 @@ function createTableBuilder<TFields extends ValidatorShape>(
  * Defines a document table from field validators. Chain `.index(name, fields,
  * options?)` to add `json_extract()` indexes; pass `{ partition: true }` on at
  * most one index to enable partition-scoped conflict detection and realtime
- * routing.
+ * routing. Partition indexes are also the realtime scaling lever: a write
+ * then invalidates only subscriptions reading the same partition instead of
+ * every query on the table.
  */
 export function defineTable<TFields extends ValidatorShape>(
   fields: TFields

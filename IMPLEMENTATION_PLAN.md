@@ -509,6 +509,9 @@ queries route to table/global subscription instances so they remain correct.
 
 Partition metadata is a shared table concept, not realtime-only. It can later
 support tenant sharding, bulk workflows, observability, and data placement.
+Realtime invalidation granularity follows the partition axis: writes to a
+partitioned table re-evaluate only subscriptions reading the affected
+partitions, while unpartitioned tables invalidate table-wide.
 
 ### 1.11 Backups
 
