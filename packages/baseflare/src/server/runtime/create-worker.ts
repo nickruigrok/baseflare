@@ -118,6 +118,7 @@ function corsHeadersForRequest(
 
   const headers = new Headers({
     "Access-Control-Allow-Origin": origin,
+    Vary: "Origin",
   });
   const requestedMethods = request.headers.get("access-control-request-method");
   if (requestedMethods) {

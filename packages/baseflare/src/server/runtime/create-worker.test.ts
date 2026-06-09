@@ -249,11 +249,13 @@ describe("worker request body reader", () => {
     expect(allowed.headers.get("access-control-allow-origin")).toBe(
       "https://app.example"
     );
+    expect(allowed.headers.get("vary")).toBe("Origin");
     expect(denied.headers.get("access-control-allow-origin")).toBeNull();
     expect(preflight.status).toBe(204);
     expect(preflight.headers.get("access-control-allow-origin")).toBe(
       "https://app.example"
     );
+    expect(preflight.headers.get("vary")).toBe("Origin");
     expect(preflight.headers.get("access-control-allow-headers")).toBe(
       "authorization"
     );
