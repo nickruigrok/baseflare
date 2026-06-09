@@ -4,7 +4,10 @@ import { executeQueryDefinition } from "../execution";
 import { logRuntimeEvent } from "../logging";
 import type { D1Database, DurableObjectStub, RuntimeDatabase } from "../types";
 import { RealtimeActiveQueryStore } from "./active-query-store";
-import { hasRelevantVersionGap } from "./evaluation";
+import {
+  hasRelevantVersionGap,
+  restrictSnapshotToDependencies,
+} from "./evaluation";
 import {
   createRealtimeOutboxResponseEvents,
   deleteRealtimeOutboxEventsBefore,
@@ -1702,6 +1705,15 @@ export class RealtimeSubscriptionDO {
 
     this.assertAuthFingerprintLive(activeQuery, registrations);
 
+    // Capture dependency versions BEFORE the query reads data. A commit that
+    // lands during execution then shows up as a version gap on the next event
+    // instead of being silently absorbed into the stored snapshot while its
+    // data is missing from the result (which would skip the subscriber until
+    // the reconciliation alarm).
+    const preVersions: RealtimeVersionSnapshot = activeQuery.dependencies
+      ? await fetchRealtimeVersionSnapshot(database, activeQuery.dependencies)
+      : { partitions: new Map(), tables: new Map() };
+
     const { dependencies, readObserver } = createRealtimeDependencySet();
     const result = await executeQueryDefinition(
       entry.definition as QueryDefinition,
@@ -1727,8 +1739,8 @@ export class RealtimeSubscriptionDO {
       activeQuery.args
     );
     const resultJson = JSON.stringify(result);
-    const versionSnapshot = await fetchRealtimeVersionSnapshot(
-      database,
+    const versionSnapshot = restrictSnapshotToDependencies(
+      preVersions,
       dependencies
     );
 

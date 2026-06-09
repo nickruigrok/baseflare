@@ -9762,9 +9762,19 @@ describe("worker runtime", () => {
         })
       );
 
-    // First catch-up captures the dependency + version snapshot (evaluates once).
+    // First catch-up captures the dependencies (evaluates once). Its stored
+    // snapshot deliberately under-claims: versions are captured before the
+    // query runs, so dependencies discovered during that first run get no
+    // snapshot entry yet.
     const firstBody = (await (await catchUp()).json()) as { evaluated: number };
     expect(firstBody.evaluated).toBe(1);
+
+    // A warm round completes the snapshot: the version-bumping write forces a
+    // re-evaluation whose pre-captured versions now cover the known
+    // dependencies.
+    await createTodoViaRpc("owner-a", "warm");
+    const warmBody = (await (await catchUp()).json()) as { evaluated: number };
+    expect(warmBody.evaluated).toBe(1);
     const deliveredAfterFirst = deliveries.length;
 
     // A later outbox event lands for the same dependency WITHOUT bumping the
@@ -9786,6 +9796,75 @@ describe("worker runtime", () => {
     // proves the dependent registration was skipped on the matching version.
     expect(body).toEqual(expect.objectContaining({ evaluated: 0, failed: 0 }));
     expect(deliveries).toHaveLength(deliveredAfterFirst);
+  });
+
+  it("stores an under-claiming snapshot on first evaluation and converges", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "seed");
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-converges",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    const catchUp = async () => {
+      const response = await subscriptionDo.fetch(
+        new Request("https://baseflare.internal/catch-up", {
+          body: JSON.stringify({ afterSequence: null, limit: 10 }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+      return (await response.json()) as { evaluated: number; failed: number };
+    };
+
+    // First evaluation discovers the dependencies; its snapshot was captured
+    // before the run, so the newly discovered dependencies have no entries.
+    expect((await catchUp()).evaluated).toBe(1);
+
+    const unchangedEvent = (eventId: string) =>
+      createRealtimeOutboxEvent(eventId, Date.now(), {
+        bumpVersions: false,
+        partitions: [todoOwnerPartition("owner-a")],
+        tables: ["todos"],
+      });
+
+    // The missing snapshot entries read as version gaps: the next event for
+    // those dependencies re-runs the query even though versions are unchanged.
+    await unchangedEvent("converge-1");
+    expect((await catchUp()).evaluated).toBe(1);
+
+    // That second run proved freshness for every known dependency, so the
+    // snapshot is now complete and the unchanged-version event is skipped.
+    await unchangedEvent("converge-2");
+    expect((await catchUp()).evaluated).toBe(0);
   });
 
   it("heals a missed delivery during live reconciliation while the socket stays open", async () => {
@@ -10220,7 +10299,7 @@ describe("worker runtime", () => {
         const delivery = await request.json();
         const items = getRealtimeDeliveryItems(delivery);
         const deliveredSubscriptions =
-          deliveryAttempt === 1
+          deliveryAttempt === 2
             ? items
                 .map((item) => item.subscriptionId)
                 .filter((subscriptionId) => subscriptionId === "sub-a")
@@ -10258,6 +10337,23 @@ describe("worker runtime", () => {
       );
     }
     await createTodoViaRpc("owner-a", "stored-replay");
+    // Warm round: the first evaluation discovers dependencies and stores an
+    // under-claiming snapshot, so a second version-bumping round is needed
+    // before version-first replay decisions apply.
+    await createRealtimeOutboxEvent("stored-replay-warm", Date.now(), {
+      partitions: [todoOwnerPartition("owner-a")],
+      tables: ["todos"],
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/notify", {
+        body: JSON.stringify({ eventId: "stored-replay-warm" }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    // Change the data so the next evaluation produces a new result whose
+    // delivery is only partially acknowledged (sub-b stays undelivered).
+    await createTodoViaRpc("owner-a", "stored-replay-2");
     await createRealtimeOutboxEvent("stored-replay-first", Date.now(), {
       partitions: [todoOwnerPartition("owner-a")],
       tables: ["todos"],
@@ -10290,13 +10386,22 @@ describe("worker runtime", () => {
       })
     );
 
+    // The replay round counts the unchanged member's lease refresh plus the
+    // replayed delivery to the stale member — and no query re-run below.
     expect(await replayResponse.json()).toEqual({
-      evaluated: 1,
+      evaluated: 2,
       failed: 0,
       ok: true,
     });
-    expect(realtimeDependencyTrackingQueryCalls).toBe(1);
-    expect(deliveredSubscriptionIds).toEqual(["sub-a", "sub-b"]);
+    // Two real evaluations (warm + partially-acked round); the replay round
+    // reuses the stored result without another query run.
+    expect(realtimeDependencyTrackingQueryCalls).toBe(2);
+    expect(deliveredSubscriptionIds).toEqual([
+      "sub-a",
+      "sub-b",
+      "sub-a",
+      "sub-b",
+    ]);
   });
 
   it("does not share realtime query evaluation across authorization contexts", async () => {

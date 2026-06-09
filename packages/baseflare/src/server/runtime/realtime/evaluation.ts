@@ -7,8 +7,40 @@ import { fetchRealtimeVersionSnapshot } from "./shards";
 import type {
   RealtimeAffectedTargets,
   RealtimeDependencySet,
+  RealtimeVersionSnapshot,
   StoredRealtimeActiveQuery,
 } from "./types";
+
+/**
+ * Builds the version snapshot to store after a successful evaluation from
+ * versions captured BEFORE the query executed. Only dependencies observed by
+ * the run keep an entry; newly discovered dependencies get none, so the stored
+ * snapshot never claims freshness the run did not prove. A missing entry reads
+ * as a version gap in hasRelevantVersionGap, which conservatively re-runs the
+ * query on the next relevant event and completes the snapshot.
+ */
+export function restrictSnapshotToDependencies(
+  snapshot: RealtimeVersionSnapshot,
+  dependencies: RealtimeDependencySet
+): RealtimeVersionSnapshot {
+  const tables = new Map<string, number>();
+  for (const tableName of dependencies.tables) {
+    const version = snapshot.tables.get(tableName);
+    if (version !== undefined) {
+      tables.set(tableName, version);
+    }
+  }
+
+  const partitions = new Map<string, number>();
+  for (const partitionId of dependencies.partitions) {
+    const version = snapshot.partitions.get(partitionId);
+    if (version !== undefined) {
+      partitions.set(partitionId, version);
+    }
+  }
+
+  return { partitions, tables };
+}
 
 /**
  * Version-first reconciliation: decides whether an active query must be
