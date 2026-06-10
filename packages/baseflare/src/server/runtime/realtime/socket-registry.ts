@@ -1,4 +1,4 @@
-import { InternalRuntimeError } from "../errors";
+import { UnauthorizedRuntimeError } from "../errors";
 import { logRuntimeEvent } from "../logging";
 import { getStringField, parseRealtimeSocketAttachment } from "./shared";
 import type {
@@ -94,7 +94,10 @@ export class RealtimeSocketRegistry {
     }
 
     this.closeExpiredSession(socket);
-    throw new InternalRuntimeError("Realtime socket session expired");
+    // Session expiry is client-actionable (reconnect and restore), so it is
+    // an Unauthorized error whose message stays visible to the client rather
+    // than an internal fault that gets redacted.
+    throw new UnauthorizedRuntimeError("Realtime socket session expired");
   }
 
   closeExpiredSession(socket: RuntimeWebSocket): void {

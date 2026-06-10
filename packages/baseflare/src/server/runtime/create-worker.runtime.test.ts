@@ -2368,6 +2368,7 @@ describe("worker runtime", () => {
 
     expect(messages).toEqual([
       {
+        code: "VALIDATION_ERROR",
         error: 'Realtime query "todos:doesNotExist" was not found',
         type: "error",
       },
@@ -5103,7 +5104,9 @@ describe("worker runtime", () => {
 
     expect(
       sentPayloads.map((payload) => JSON.parse(payload) as unknown)
-    ).toEqual([{ error: "bad message", type: "error" }]);
+    ).toEqual([
+      { code: "INTERNAL_ERROR", error: "Internal error", type: "error" },
+    ]);
   });
 
   it("removes non-hibernated realtime sockets after socket errors", async () => {
@@ -5223,6 +5226,7 @@ describe("worker runtime", () => {
 
     expect(sentMessages).toEqual([
       {
+        code: "VALIDATION_ERROR",
         error: `Realtime messages must be at most ${REALTIME_MAX_MESSAGE_BYTES} bytes`,
         type: "error",
       },
@@ -5384,12 +5388,14 @@ describe("worker runtime", () => {
     expect(registerBodies).toEqual([]);
     expect(socketMessages.get(socketA)).toEqual([
       {
+        code: "UNAUTHORIZED",
         error: "Realtime socket session expired",
         type: "error",
       },
     ]);
     expect(socketMessages.get(socketB)).toEqual([
       {
+        code: "UNAUTHORIZED",
         error: "Realtime socket session expired",
         type: "error",
       },
@@ -5542,6 +5548,7 @@ describe("worker runtime", () => {
     expect(registerBodies).toEqual([]);
     expect(messages).toEqual([
       {
+        code: "UNAUTHORIZED",
         error: "Realtime socket session expired",
         type: "error",
       },
@@ -5622,6 +5629,7 @@ describe("worker runtime", () => {
     expect(registerBodies).toEqual([]);
     expect(messages).toEqual([
       {
+        code: "UNAUTHORIZED",
         error: "Realtime socket session expired",
         type: "error",
       },
@@ -7485,6 +7493,7 @@ describe("worker runtime", () => {
     expect(subscriptionDo.requests).toHaveLength(0);
     expect(messages).toEqual([
       {
+        code: "VALIDATION_ERROR",
         error: `Realtime restore can include at most ${REALTIME_MAX_RESTORE_SUBSCRIPTIONS} subscriptions to bound D1 concurrency and connection memory`,
         type: "error",
       },
@@ -7708,7 +7717,7 @@ describe("worker runtime", () => {
       {
         failed: [
           {
-            error: "Realtime subscription registration failed with status 500",
+            error: "Internal error",
             index: 1,
             subscriptionId: "sub-bad",
           },
@@ -8056,7 +8065,7 @@ describe("worker runtime", () => {
       {
         failed: [
           {
-            error: `Realtime restore catch-up failed for shard ${getRealtimeSubscriptionShardName()} with status 500`,
+            error: "Internal error",
             index: -1,
           },
         ],
@@ -8067,6 +8076,9 @@ describe("worker runtime", () => {
   });
 
   it("reports partial realtime restore catch-up failures per shard", async () => {
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
     await env.APP_DB.prepare(
       "UPDATE _bf_realtime_shard_generations SET status = 'draining', drain_after = ? WHERE generation_id = 1"
     )
@@ -8165,17 +8177,105 @@ describe("worker runtime", () => {
       "subscription:g2:0",
       "subscription:g2:1",
     ]);
+    // The client entry is redacted; the shard-level detail stays server-side.
     expect(messages.at(-1)).toEqual({
       failed: [
         {
-          error:
-            "Realtime restore catch-up failed for shard subscription:g2:1 with status 503",
+          error: "Internal error",
           index: -1,
         },
       ],
       reconciled: false,
       type: "restored",
     });
+    expect(warnSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        errors: [
+          expect.stringContaining("shard subscription:g2:1 with status 503"),
+        ],
+        event: "runtime.realtime_restore_catch_up_failed",
+      })
+    );
+  });
+
+  it("schedules reconciliation when wake catch-up fails with nothing left to restore", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let failCatchUp = false;
+    let catchUpAttempts = 0;
+    const subscriptions = new FakeDurableObjectNamespace((_name, request) => {
+      if (new URL(request.url).pathname === "/catch-up") {
+        catchUpAttempts += 1;
+        if (failCatchUp) {
+          return Promise.resolve(Response.json({ ok: false }, { status: 503 }));
+        }
+        return Promise.resolve(
+          Response.json({ evaluated: 0, events: [], failed: 0, ok: true })
+        );
+      }
+      return Promise.resolve(Response.json({ ok: true }));
+    });
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      deserializeAttachment() {
+        return {
+          connectionKey: "client-a",
+          connectionName: getRealtimeConnectionShardName("client-a"),
+          latestDeliveredOutboxSequence: null,
+          runtimeId,
+          subscriptions: [
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-a",
+              subscriptionShardName: "subscription:g1:0",
+            },
+          ],
+        };
+      },
+      send() {
+        // Delivery frames are not asserted in this test.
+      },
+      serializeAttachment() {
+        // Attachment updates are not asserted in this test.
+      },
+    } as unknown as AttachedTestWebSocket;
+    const state = new FakeRealtimeDurableObjectState([socket]);
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: subscriptions,
+    });
+    const internals = connectionDo as unknown as {
+      restoreAttachedSubscriptions(options: {
+        reconcileAfterRestore: boolean;
+      }): Promise<{ accepted: number; rejected: number }>;
+    };
+    // The constructor's wake restore registers the attached subscription, so
+    // the next pass has nothing left to restore and hits the early-exit path.
+    await waitFor(() => catchUpAttempts > 0);
+    failCatchUp = true;
+    state.alarmTime = null;
+
+    const result = await internals.restoreAttachedSubscriptions({
+      reconcileAfterRestore: true,
+    });
+
+    expect(result).toEqual({ accepted: 0, rejected: 0 });
+    expect(state.alarmTime).toEqual(expect.any(Number));
+    expect(errorSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_reconciliation_failed",
+        failedShards: ["subscription:g1:0"],
+      })
+    );
   });
 
   it("does not report direct realtime subscriptions as live after registration errors", async () => {
@@ -8233,7 +8333,8 @@ describe("worker runtime", () => {
 
     expect(messages).toEqual([
       {
-        error: "Realtime subscription registration failed with status 500",
+        code: "INTERNAL_ERROR",
+        error: "Internal error",
         type: "error",
       },
     ]);
@@ -8290,7 +8391,8 @@ describe("worker runtime", () => {
 
     expect(messages).toEqual([
       {
-        error: "Realtime subscription unregister failed with status 500",
+        code: "INTERNAL_ERROR",
+        error: "Internal error",
         type: "error",
       },
     ]);
@@ -8415,6 +8517,7 @@ describe("worker runtime", () => {
 
     expect(messages).toEqual([
       {
+        code: "VALIDATION_ERROR",
         error: 'Realtime field "subscriptions" must be an array',
         type: "error",
       },

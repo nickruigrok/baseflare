@@ -1,4 +1,8 @@
-import { InternalRuntimeError, ValidationRuntimeError } from "../errors";
+import {
+  InternalRuntimeError,
+  toErrorPayload,
+  ValidationRuntimeError,
+} from "../errors";
 import { assertJsonBounds } from "../json-bounds";
 import { logRuntimeEvent } from "../logging";
 import type { BaseflareRuntimeEnv, DurableObjectStub } from "../types";
@@ -471,10 +475,7 @@ export class RealtimeConnectionDO {
           : undefined;
       return [
         {
-          error:
-            result.reason instanceof Error
-              ? result.reason.message
-              : "Realtime subscription restore failed",
+          error: toErrorPayload(result.reason).payload.message,
           index,
           subscriptionId,
         },
@@ -531,21 +532,31 @@ export class RealtimeConnectionDO {
           }
         })
       );
-      const catchUpFailures = catchUpResults.flatMap((result) => {
-        if (result.status === "fulfilled") {
-          return [];
-        }
-
-        return [
-          {
-            error:
-              result.reason instanceof Error
-                ? result.reason.message
-                : "Realtime restore catch-up failed",
-            index: -1,
-          },
-        ];
-      });
+      const catchUpFailures = catchUpResults.flatMap((result) =>
+        result.status === "rejected"
+          ? [
+              {
+                error: toErrorPayload(result.reason).payload.message,
+                index: -1,
+              },
+            ]
+          : []
+      );
+      if (catchUpFailures.length > 0) {
+        // The client entries above are redacted; keep the shard-level detail
+        // server-side.
+        logRuntimeEvent("warn", "runtime.realtime_restore_catch_up_failed", {
+          errors: catchUpResults.flatMap((result) =>
+            result.status === "rejected"
+              ? [
+                  result.reason instanceof Error
+                    ? result.reason.message
+                    : typeof result.reason,
+                ]
+              : []
+          ),
+        });
+      }
       failed.push(...catchUpFailures);
       reconciled = catchUpFailures.length === 0;
       if (reconciled) {
@@ -568,11 +579,11 @@ export class RealtimeConnectionDO {
         this.updateLatestDeliveredOutboxSequence(socket, afterSequence);
       }
     } catch (error) {
+      logRuntimeEvent("warn", "runtime.realtime_restore_catch_up_failed", {
+        errors: [error instanceof Error ? error.message : typeof error],
+      });
       failed.push({
-        error:
-          error instanceof Error
-            ? error.message
-            : "Realtime restore catch-up failed",
+        error: toErrorPayload(error).payload.message,
         index: -1,
       });
     }
@@ -704,7 +715,14 @@ export class RealtimeConnectionDO {
     if (subscriptionsToRestore.length === 0) {
       this.hasPendingHibernationRestoreRetry = false;
       if (options.reconcileAfterRestore) {
-        await this.catchUpActiveSubscriptions();
+        // Mirror the main restore path: the summary advances reconciled shard
+        // cursors and records failures, and a failed catch-up schedules the
+        // retry alarm instead of being silently dropped.
+        const summary = await this.catchUpActiveSubscriptions();
+        this.emitReconciliationSummary(summary);
+        if (summary.failed.length > 0) {
+          await this.scheduleReconciliation();
+        }
       }
       return { accepted: 0, rejected: 0 };
     }
@@ -931,10 +949,13 @@ export class RealtimeConnectionDO {
 
   private sendSocketError(socket: RuntimeWebSocket, error: unknown): void {
     try {
+      // Same redaction contract as HTTP responses: internal failures become
+      // "Internal error" while validation-class messages stay actionable.
+      const { payload } = toErrorPayload(error);
       socket.send(
         JSON.stringify({
-          error:
-            error instanceof Error ? error.message : "Realtime message failed",
+          code: payload.code,
+          error: payload.message,
           type: "error",
         })
       );
