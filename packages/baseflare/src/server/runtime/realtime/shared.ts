@@ -538,8 +538,9 @@ export async function runWithConcurrency<T>(
 
 /**
  * Splits deliveries into /deliver batches bounded by item count AND by
- * cumulative result size, so a burst of near-cap results never serializes a
- * batch body large enough to threaten the 128 MB isolate memory limit. A
+ * cumulative result size in UTF-8 bytes (measured once at evaluation time and
+ * carried on each delivery), so a burst of near-cap results never serializes
+ * a batch body large enough to threaten the 128 MB isolate memory limit. A
  * single delivery always ships, alone if necessary — its result is already
  * bounded by REALTIME_MAX_RESULT_JSON_BYTES.
  */
@@ -550,7 +551,7 @@ export function chunkRealtimeDeliveries(
   let chunk: PendingRealtimeDelivery[] = [];
   let chunkBytes = 0;
   for (const delivery of deliveries) {
-    const deliveryBytes = delivery.resultJson.length;
+    const deliveryBytes = delivery.resultBytes;
     const exceedsBytes =
       chunkBytes + deliveryBytes > REALTIME_DELIVERY_BATCH_MAX_BYTES;
     if (

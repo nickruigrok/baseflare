@@ -7,7 +7,10 @@ import {
 } from "./types";
 
 function delivery(resultBytes: number): PendingRealtimeDelivery {
-  return { resultJson: "x".repeat(resultBytes) } as PendingRealtimeDelivery;
+  return {
+    resultBytes,
+    resultJson: "x".repeat(resultBytes),
+  } as PendingRealtimeDelivery;
 }
 
 describe("chunkRealtimeDeliveries", () => {

@@ -337,9 +337,11 @@ const realtimeGatedQuery = query({
 });
 
 const realtimeOversizedResultQuery = query({
-  args: { chunkCount: v.number() },
+  args: { chunk: v.string().default("x"), chunkCount: v.number() },
   handler(_ctx, args) {
-    return Array.from({ length: args.chunkCount }, () => "x".repeat(100_000));
+    return Array.from({ length: args.chunkCount }, () =>
+      args.chunk.repeat(100_000)
+    );
   },
 });
 
@@ -9991,6 +9993,70 @@ describe("worker runtime", () => {
     );
   });
 
+  it("measures the realtime result cap in UTF-8 bytes, not UTF-16 length", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          // 3 chunks x 100k emoji: ~600k UTF-16 code units (under the cap if
+          // it were measured as .length) but ~1.2 MB of UTF-8 (over it).
+          args: { chunk: "🙂", chunkCount: 3 },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:oversized",
+          runtimeId,
+          subscriptionId: "sub-oversized-utf8",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    await createRealtimeOutboxEvent("oversized-utf8-event");
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+    };
+
+    expect(body.failed).toBeGreaterThanOrEqual(1);
+    expect(body.evaluated).toBe(0);
+    expect(errorSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_query_result_too_large",
+        queryName: "realtime:oversized",
+      })
+    );
+  });
+
   it("waits for an in-flight evaluation and delivers a commit that raced its reads", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await createTodoViaRpc("owner-a", "gated-seed");
@@ -13709,6 +13775,7 @@ describe("worker runtime", () => {
         runtimeId: "runtime:1",
         subscriptionId,
       },
+      resultBytes: 2,
       resultJson: "[]",
       versionSnapshot: { partitions: new Map(), tables: new Map() },
     });
@@ -14880,6 +14947,7 @@ describe("worker runtime", () => {
           subscriptionId,
         },
         registration,
+        resultBytes: 2,
         resultJson: "[]",
         versionSnapshot: { partitions: new Map(), tables: new Map() },
       });

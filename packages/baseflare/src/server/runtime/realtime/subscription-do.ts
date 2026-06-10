@@ -96,6 +96,7 @@ interface RealtimeShardContext {
 interface RealtimeEvaluationResult {
   readonly dependencies: RealtimeDependencySet;
   readonly result: unknown;
+  readonly resultBytes: number;
   readonly resultJson: string;
   readonly versionSnapshot: RealtimeVersionSnapshot;
 }
@@ -1118,6 +1119,9 @@ export class RealtimeSubscriptionDO {
       return {
         dependencies: activeQuery.dependencies,
         result: JSON.parse(activeQuery.lastResultJson) as unknown,
+        // Stored results were capped at creation; re-measure for chunking.
+        resultBytes: new TextEncoder().encode(activeQuery.lastResultJson)
+          .byteLength,
         resultJson: activeQuery.lastResultJson,
         versionSnapshot: activeQuery.versionSnapshot,
       };
@@ -1936,28 +1940,30 @@ export class RealtimeSubscriptionDO {
       activeQuery.args
     );
     const resultJson = JSON.stringify(result);
-    this.assertResultJsonWithinBounds(resultJson, activeQuery.queryName);
+    const resultBytes = this.measureResultJsonBytes(
+      resultJson,
+      activeQuery.queryName
+    );
     const versionSnapshot = restrictSnapshotToDependencies(
       preVersions,
       dependencies
     );
 
-    return { dependencies, result, resultJson, versionSnapshot };
+    return { dependencies, result, resultBytes, resultJson, versionSnapshot };
   }
 
-  private assertResultJsonWithinBounds(
+  /**
+   * Measures a result's UTF-8 byte size once per evaluation; the count rides
+   * with every pending delivery so batch chunking never re-encodes. Throws
+   * when the result exceeds the realtime result cap.
+   */
+  private measureResultJsonBytes(
     resultJson: string,
     queryName: string
-  ): void {
-    // Bytes per UTF-16 code unit never exceed 3 in UTF-8, so short results
-    // skip the encode entirely.
-    if (resultJson.length * 3 <= REALTIME_MAX_RESULT_JSON_BYTES) {
-      return;
-    }
-
+  ): number {
     const bytes = new TextEncoder().encode(resultJson).byteLength;
     if (bytes <= REALTIME_MAX_RESULT_JSON_BYTES) {
-      return;
+      return bytes;
     }
 
     logRuntimeEvent("error", "runtime.realtime_query_result_too_large", {
@@ -2005,6 +2011,7 @@ export class RealtimeSubscriptionDO {
         subscriptionId: registration.subscriptionId,
       },
       registration,
+      resultBytes: evaluation.resultBytes,
       resultJson: evaluation.resultJson,
       versionSnapshot: evaluation.versionSnapshot,
     };

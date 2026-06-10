@@ -205,6 +205,8 @@ export interface PendingRealtimeDelivery {
   readonly dependencies: RealtimeDependencySet;
   readonly message: RealtimeDeliveryMessage;
   readonly registration: StoredRealtimeRegistration;
+  /** UTF-8 size of resultJson, measured once at evaluation time. */
+  readonly resultBytes: number;
   readonly resultJson: string;
   readonly versionSnapshot: RealtimeVersionSnapshot;
 }
