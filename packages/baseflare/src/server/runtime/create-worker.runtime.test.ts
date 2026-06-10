@@ -336,6 +336,13 @@ const realtimeGatedQuery = query({
   },
 });
 
+const realtimeOversizedResultQuery = query({
+  args: { chunkCount: v.number() },
+  handler(_ctx, args) {
+    return Array.from({ length: args.chunkCount }, () => "x".repeat(100_000));
+  },
+});
+
 const realtimeConcurrencyTrackingQuery = query({
   args: { ownerToken: v.string() },
   async handler(ctx, args) {
@@ -699,6 +706,11 @@ function createManifest(
       {
         definition: realtimeGatedQuery,
         exportName: "gated",
+        modulePath: "realtime",
+      },
+      {
+        definition: realtimeOversizedResultQuery,
+        exportName: "oversized",
         modulePath: "realtime",
       },
       {
@@ -9911,6 +9923,72 @@ describe("worker runtime", () => {
     // snapshot is now complete and the unchanged-version event is skipped.
     await unchangedEvent("converge-2");
     expect((await catchUp()).evaluated).toBe(0);
+  });
+
+  it("rejects realtime query results that exceed the size cap", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    const deliveries: unknown[] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          deliveries.push(delivery);
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          // 11 chunks x 100KB exceed the 1_000_000-byte result cap.
+          args: { chunkCount: 11 },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:oversized",
+          runtimeId,
+          subscriptionId: "sub-oversized",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    await createRealtimeOutboxEvent("oversized-event");
+    const response = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const body = (await response.json()) as {
+      evaluated: number;
+      failed: number;
+    };
+
+    expect(body.failed).toBeGreaterThanOrEqual(1);
+    expect(body.evaluated).toBe(0);
+    expect(deliveries).toHaveLength(0);
+    expect(errorSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_query_result_too_large",
+        queryName: "realtime:oversized",
+      })
+    );
   });
 
   it("waits for an in-flight evaluation and delivers a commit that raced its reads", async () => {

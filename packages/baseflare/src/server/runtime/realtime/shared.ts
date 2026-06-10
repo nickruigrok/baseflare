@@ -19,6 +19,7 @@ import type {
 } from "./types";
 import {
   JSON_HEADERS,
+  REALTIME_DELIVERY_BATCH_MAX_BYTES,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_LEASE_MS,
   REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET,
@@ -535,16 +536,38 @@ export async function runWithConcurrency<T>(
   );
 }
 
+/**
+ * Splits deliveries into /deliver batches bounded by item count AND by
+ * cumulative result size, so a burst of near-cap results never serializes a
+ * batch body large enough to threaten the 128 MB isolate memory limit. A
+ * single delivery always ships, alone if necessary — its result is already
+ * bounded by REALTIME_MAX_RESULT_JSON_BYTES.
+ */
 export function chunkRealtimeDeliveries(
   deliveries: readonly PendingRealtimeDelivery[]
 ): PendingRealtimeDelivery[][] {
   const chunks: PendingRealtimeDelivery[][] = [];
-  for (
-    let index = 0;
-    index < deliveries.length;
-    index += REALTIME_DELIVERY_BATCH_SIZE
-  ) {
-    chunks.push(deliveries.slice(index, index + REALTIME_DELIVERY_BATCH_SIZE));
+  let chunk: PendingRealtimeDelivery[] = [];
+  let chunkBytes = 0;
+  for (const delivery of deliveries) {
+    const deliveryBytes = delivery.resultJson.length;
+    const exceedsBytes =
+      chunkBytes + deliveryBytes > REALTIME_DELIVERY_BATCH_MAX_BYTES;
+    if (
+      chunk.length > 0 &&
+      (chunk.length >= REALTIME_DELIVERY_BATCH_SIZE || exceedsBytes)
+    ) {
+      chunks.push(chunk);
+      chunk = [];
+      chunkBytes = 0;
+    }
+
+    chunk.push(delivery);
+    chunkBytes += deliveryBytes;
+  }
+
+  if (chunk.length > 0) {
+    chunks.push(chunk);
   }
 
   return chunks;

@@ -1038,7 +1038,7 @@ item-level, so undelivered subscription results stay retryable.
    - `logout` — revokes OAuth tokens for current or specified profile
    - `whoami` — shows current profile, account name, email, account ID
    - `dev` — lazy-prompts for profile/account/project name on first run, then starts Miniflare with file watcher and codegen
-   - `deploy --env <n>` — lazy-prompts if not configured → create environment if new → Worker bundle → CF Workers API deploy → apply table/index changes to D1
+   - `deploy --env <n>` — lazy-prompts if not configured → create environment if new → Worker bundle → CF Workers API deploy → apply table/index changes to D1. Durable Object classes are declared with `new_sqlite_classes` migrations — required for free-plan support (the free plan only offers SQLite-backed DOs) and assumed by runtime limits (2 MB storage records); the storage backend is sticky after a class's first deploy.
    - `deploy --env <n> --dry-run` — preview table/index changes
    - `generate` — regenerate types
    - `env list` — list environments via CF API (`bf-{project}-*`)

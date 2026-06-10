@@ -231,6 +231,11 @@ export const REALTIME_CATCH_UP_EVENT_LIMIT = 1000;
 
 export const REALTIME_DELIVERY_BATCH_SIZE = 100;
 
+// Bounds the serialized /deliver body so near-cap results cannot accumulate
+// toward the 128 MB isolate memory limit (workers/platform/limits) before a
+// count-based chunk fills up.
+export const REALTIME_DELIVERY_BATCH_MAX_BYTES = 4 * 1024 * 1024;
+
 // Bounds restore-time D1 work and connection DO memory for a single restore frame.
 export const REALTIME_MAX_RESTORE_SUBSCRIPTIONS = 100;
 
@@ -238,7 +243,18 @@ export const REALTIME_MAX_ACTIVE_SUBSCRIPTIONS_PER_SOCKET = 100;
 
 export const REALTIME_MAX_IDENTIFIER_LENGTH = 256;
 
+// Inbound client message cap. Deliberately far below the platform's 32 MiB
+// received-message ceiling (durable-objects/platform/limits): inbound messages
+// are parsed, hashed, and their args persisted, so this is an abuse bound at
+// the trust boundary, aligned with the 1 MB HTTP RPC body cap.
 export const REALTIME_MAX_MESSAGE_BYTES = 1024 * 1024;
+
+// Cap on a realtime query result's JSON. The binding constraint is the
+// SQLite-backed DO storage limit of 2 MB combined key+value per record
+// (durable-objects/platform/limits); the result shares its record with args,
+// dependencies, and member registration keys, so it gets half the budget.
+// Raising this later is backward-compatible; lowering it would break apps.
+export const REALTIME_MAX_RESULT_JSON_BYTES = 1_000_000;
 
 export const REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS = 3;
 

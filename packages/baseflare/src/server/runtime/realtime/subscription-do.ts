@@ -75,6 +75,7 @@ import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
   REALTIME_DELIVERY_BATCHES_METRIC,
   REALTIME_LEASE_MS,
+  REALTIME_MAX_RESULT_JSON_BYTES,
   REALTIME_NOTIFY_EVENT_LOOKUP_ATTEMPTS,
   REALTIME_NOTIFY_EVENT_LOOKUP_RETRY_DELAY_MS,
   REALTIME_OUTBOX_CLEANUP_INTERVAL_MS,
@@ -1935,12 +1936,38 @@ export class RealtimeSubscriptionDO {
       activeQuery.args
     );
     const resultJson = JSON.stringify(result);
+    this.assertResultJsonWithinBounds(resultJson, activeQuery.queryName);
     const versionSnapshot = restrictSnapshotToDependencies(
       preVersions,
       dependencies
     );
 
     return { dependencies, result, resultJson, versionSnapshot };
+  }
+
+  private assertResultJsonWithinBounds(
+    resultJson: string,
+    queryName: string
+  ): void {
+    // Bytes per UTF-16 code unit never exceed 3 in UTF-8, so short results
+    // skip the encode entirely.
+    if (resultJson.length * 3 <= REALTIME_MAX_RESULT_JSON_BYTES) {
+      return;
+    }
+
+    const bytes = new TextEncoder().encode(resultJson).byteLength;
+    if (bytes <= REALTIME_MAX_RESULT_JSON_BYTES) {
+      return;
+    }
+
+    logRuntimeEvent("error", "runtime.realtime_query_result_too_large", {
+      bytes,
+      limit: REALTIME_MAX_RESULT_JSON_BYTES,
+      queryName,
+    });
+    throw new ValidationRuntimeError(
+      `Realtime query "${queryName}" returned ${bytes} bytes of JSON; realtime results must stay at or below ${REALTIME_MAX_RESULT_JSON_BYTES} bytes. Narrow the query or paginate.`
+    );
   }
 
   private assertAuthFingerprintLive(
