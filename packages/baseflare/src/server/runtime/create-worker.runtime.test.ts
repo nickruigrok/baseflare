@@ -7124,6 +7124,98 @@ describe("worker runtime", () => {
     expect(attachment.latestDeliveredOutboxSequence).toBe(10);
   });
 
+  it("holds the delivery cursor when any restore shard catch-up fails", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const messages: Array<{ reconciled?: boolean; type: string }> = [];
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      close() {
+        // Not expected in this test.
+      },
+      deserializeAttachment() {
+        return {
+          connectionKey: "client-a",
+          connectionName: getRealtimeConnectionShardName("client-a"),
+          latestDeliveredOutboxSequence: 5,
+          runtimeId,
+          subscriptions: [
+            {
+              args: { ownerToken: "owner-a" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-a",
+              subscriptionShardName: "subscription:g1:0",
+            },
+            {
+              args: { ownerToken: "owner-b" },
+              epoch: 1,
+              queryName: "todos:list",
+              subscriptionId: "sub-b",
+              subscriptionShardName: "subscription:g1:1",
+            },
+          ],
+        };
+      },
+      send(payload: string) {
+        messages.push(
+          JSON.parse(payload) as { reconciled?: boolean; type: string }
+        );
+      },
+    } as AttachedTestWebSocket;
+    let failSecondShard = true;
+    const subscriptions = new FakeDurableObjectNamespace((name, request) => {
+      if (new URL(request.url).pathname !== "/catch-up") {
+        return Promise.resolve(Response.json({ ok: true }));
+      }
+      if (name === "subscription:g1:1" && failSecondShard) {
+        return Promise.resolve(Response.json({ ok: false }, { status: 500 }));
+      }
+      return Promise.resolve(
+        Response.json({
+          latestSequence: name === "subscription:g1:0" ? 100 : 90,
+          ok: true,
+        })
+      );
+    });
+    const connectionDo = new RealtimeConnectionDO(
+      new FakeRealtimeDurableObjectState([socket]),
+      {
+        APP_DB: env.APP_DB,
+        REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+        REALTIME_SUBSCRIPTIONS: subscriptions,
+      }
+    );
+    const attachmentCursor = () =>
+      [...getRealtimeSocketTestState(connectionDo).socketStates.values()][0]
+        ?.attachment.latestDeliveredOutboxSequence;
+    const restore = () =>
+      connectionDo.webSocketMessage(
+        socket,
+        JSON.stringify({ afterSequence: 5, subscriptions: [], type: "restore" })
+      );
+
+    // One shard's catch-up fails: the socket-global cursor must not move,
+    // or the failed shard's missed events would be skipped forever.
+    await restore();
+    expect(messages.at(-1)).toMatchObject({
+      reconciled: false,
+      type: "restored",
+    });
+    expect(attachmentCursor()).toBe(5);
+
+    // Once every shard catches up, the cursor advances to the LOWEST latest
+    // sequence every shard has provably processed (min, not max).
+    failSecondShard = false;
+    await restore();
+    expect(messages.at(-1)).toMatchObject({
+      reconciled: true,
+      type: "restored",
+    });
+    expect(attachmentCursor()).toBe(90);
+  });
+
   it("restores realtime subscriptions without serial register round trips", async () => {
     createRealtimeRuntimeId();
     let activeRegistrations = 0;

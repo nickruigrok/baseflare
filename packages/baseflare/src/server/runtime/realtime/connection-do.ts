@@ -514,11 +514,7 @@ export class RealtimeConnectionDO {
                 `Realtime restore catch-up failed for shard ${catchUpTarget.shardName} with status ${catchUpResponse.status}`
               );
             }
-            const latestSequence =
-              await this.readCatchUpLatestSequence(catchUpResponse);
-            if (latestSequence !== null) {
-              this.updateLatestDeliveredOutboxSequence(socket, latestSequence);
-            }
+            return await this.readCatchUpLatestSequence(catchUpResponse);
           } catch (error) {
             if (
               error instanceof Error &&
@@ -553,6 +549,22 @@ export class RealtimeConnectionDO {
       failed.push(...catchUpFailures);
       reconciled = catchUpFailures.length === 0;
       if (reconciled) {
+        // The cursor claims every subscribed shard processed everything up to
+        // it, so it advances only when ALL shard catch-ups succeeded, and only
+        // to the lowest sequence every shard has provably reached - mirroring
+        // updateDeliveredSequencesForReconciledShards. A partial advance would
+        // permanently skip the failed shards' missed events.
+        const latestSequences = catchUpResults.flatMap((result) =>
+          result.status === "fulfilled" && result.value !== null
+            ? [result.value]
+            : []
+        );
+        if (latestSequences.length > 0) {
+          this.updateLatestDeliveredOutboxSequence(
+            socket,
+            Math.min(...latestSequences)
+          );
+        }
         this.updateLatestDeliveredOutboxSequence(socket, afterSequence);
       }
     } catch (error) {
