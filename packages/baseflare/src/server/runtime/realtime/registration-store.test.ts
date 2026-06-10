@@ -476,6 +476,32 @@ describe("RealtimeRegistrationStore", () => {
     expect(store.get(registrationKey("sub-active"))).toBe(activeRegistration);
   });
 
+  it("syncs the stored instance when a stale reference is delivered or renewed", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const store = new RealtimeRegistrationStore(state);
+    const key = registrationKey("sub-a");
+    await store.upsert(key, registration("sub-a"));
+    const heldReference = store.get(key);
+    if (!heldReference) {
+      throw new Error("Expected stored registration");
+    }
+    // Re-registration replaces the stored instance; the held reference is now
+    // a different (older) object, as for an in-flight delivery.
+    await store.upsert(key, registration("sub-a"));
+    expect(store.get(key)).not.toBe(heldReference);
+
+    const resultJson = JSON.stringify([{ id: "1" }]);
+    const deliveredLease = Date.now() + 120_000;
+    await store.markDelivered(heldReference, resultJson, deliveredLease);
+    expect(store.get(key)?.lastResultJson).toBe(resultJson);
+    expect(store.get(key)?.leaseExpiresAt).toBe(deliveredLease);
+
+    const renewedLease = Date.now() + 240_000;
+    await store.renewLease(heldReference, renewedLease);
+    expect(store.get(key)?.leaseExpiresAt).toBe(renewedLease);
+    expect(heldReference.leaseExpiresAt).toBe(renewedLease);
+  });
+
   it("does not advance delivered memory when delivery persistence fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const store = new RealtimeRegistrationStore(state);

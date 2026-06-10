@@ -42,6 +42,13 @@ export interface RealtimeRegistrationStoreSnapshot {
   readonly registrations: Map<string, StoredRealtimeRegistration>;
 }
 
+/**
+ * Owns subscriber registration state for one subscription shard. Write
+ * contract: in-memory state changes only AFTER the storage write succeeds,
+ * and field updates are applied to both the passed registration and the
+ * stored instance when they differ, so references held across an upsert
+ * (e.g. by in-flight deliveries) never diverge from the store.
+ */
 export class RealtimeRegistrationStore {
   private readonly registrations = new Map<
     string,
@@ -273,44 +280,25 @@ export class RealtimeRegistrationStore {
     registration: StoredRealtimeRegistration,
     retryAt = Date.now() + REALTIME_REEVALUATION_FAILURE_RETRY_MS
   ): Promise<void> {
-    const registrationKey = createRegistrationKey(
-      registration.connectionKey,
-      registration.subscriptionId
-    );
-    await this.persistByKey(registrationKey, {
-      ...registration,
+    await this.commitRegistrationFields(registration, {
       reEvaluationRetryAt: retryAt,
     });
-    registration.reEvaluationRetryAt = retryAt;
-    const storedRegistration = this.registrations.get(registrationKey);
-    if (storedRegistration && storedRegistration !== registration) {
-      storedRegistration.reEvaluationRetryAt = retryAt;
-    }
   }
 
   async clearBackoff(registration: StoredRealtimeRegistration): Promise<void> {
-    const nextRegistration = {
-      ...registration,
+    await this.commitRegistrationFields(registration, {
       reEvaluationRetryAt: undefined,
-    };
-
-    await this.persist(nextRegistration);
-    registration.reEvaluationRetryAt = undefined;
+    });
   }
 
   async renewLease(
     registration: StoredRealtimeRegistration,
     leaseExpiresAt: number
   ): Promise<void> {
-    const nextRegistration = {
-      ...registration,
+    await this.commitRegistrationFields(registration, {
       leaseExpiresAt,
       reEvaluationRetryAt: undefined,
-    };
-
-    await this.persist(nextRegistration);
-    registration.leaseExpiresAt = leaseExpiresAt;
-    registration.reEvaluationRetryAt = undefined;
+    });
   }
 
   async markDelivered(
@@ -318,35 +306,49 @@ export class RealtimeRegistrationStore {
     lastResultJson: string,
     leaseExpiresAt: number
   ): Promise<void> {
-    const nextRegistration = {
-      ...registration,
+    await this.commitRegistrationFields(registration, {
       lastResultJson,
       leaseExpiresAt,
       reEvaluationRetryAt: undefined,
-    };
+    });
+  }
 
-    await this.persist(nextRegistration);
-    registration.lastResultJson = lastResultJson;
-    registration.leaseExpiresAt = leaseExpiresAt;
-    registration.reEvaluationRetryAt = undefined;
+  /**
+   * Persists the field updates, then applies them to BOTH the passed
+   * registration and the stored instance when the caller holds a different
+   * (older) one — e.g. a delivery captured before an upsert replaced the
+   * stored object. In-memory state never changes before the write succeeds.
+   * Every key in `fields` is applied explicitly, so `undefined` values clear
+   * the field on both instances.
+   */
+  private async commitRegistrationFields(
+    registration: StoredRealtimeRegistration,
+    fields: Partial<
+      Pick<
+        StoredRealtimeRegistration,
+        "lastResultJson" | "leaseExpiresAt" | "reEvaluationRetryAt"
+      >
+    >
+  ): Promise<void> {
+    const registrationKey = createRegistrationKey(
+      registration.connectionKey,
+      registration.subscriptionId
+    );
+    await this.persistByKey(registrationKey, {
+      ...registration,
+      ...fields,
+    });
+    const storedRegistration = this.registrations.get(registrationKey);
+    Object.assign(registration, fields);
+    if (storedRegistration && storedRegistration !== registration) {
+      Object.assign(storedRegistration, fields);
+    }
   }
 
   snapshotForTest(): RealtimeRegistrationStoreSnapshot {
     return {
       registrations: this.registrations,
     };
-  }
-
-  private async persist(
-    registration: StoredRealtimeRegistration
-  ): Promise<void> {
-    await this.persistByKey(
-      createRegistrationKey(
-        registration.connectionKey,
-        registration.subscriptionId
-      ),
-      registration
-    );
   }
 
   private async persistByKey(
