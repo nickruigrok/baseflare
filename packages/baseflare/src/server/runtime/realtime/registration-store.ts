@@ -76,7 +76,6 @@ export class RealtimeRegistrationStore {
         REALTIME_REGISTRATION_STORAGE_PREFIX
       );
     const activeQueryKeysBeforeSync = new Map<string, string | undefined>();
-    const sanitizedRegistrationKeys = new Set<string>();
     for (const [storageKey, value] of storedRegistrations) {
       const registration = await this.parseStoredRegistrationValue(value);
       if (!registration) {
@@ -93,36 +92,25 @@ export class RealtimeRegistrationStore {
       const registrationKey = storageKey.slice(
         REALTIME_REGISTRATION_STORAGE_PREFIX.length
       );
-      if (
-        registration.activeQueryKey &&
-        !isRealtimeActiveQueryKey(registration.activeQueryKey)
-      ) {
-        registration.activeQueryKey = undefined;
-        sanitizedRegistrationKeys.add(registrationKey);
-      }
       this.registrations.set(registrationKey, registration);
       activeQueryKeysBeforeSync.set(
         registrationKey,
         registration.activeQueryKey
       );
-      if (
-        typeof (value as { readonly authorizationHeader?: unknown })
-          .authorizationHeader === "string"
-      ) {
-        sanitizedRegistrationKeys.add(registrationKey);
-      }
     }
+    // Sync recomputes each registration's canonical active-query key; persist
+    // any registration whose stored pointer was repaired (e.g. after a crash
+    // mid-move or a dropped active-query entry).
     await this.activeQueryStore?.syncRegistrations(this.values());
-    for (const [registrationKey, activeQueryKey] of activeQueryKeysBeforeSync) {
-      if (
-        this.registrations.get(registrationKey)?.activeQueryKey !==
-        activeQueryKey
-      ) {
-        sanitizedRegistrationKeys.add(registrationKey);
-      }
-    }
+    const repairedRegistrationKeys = [...activeQueryKeysBeforeSync]
+      .filter(
+        ([registrationKey, activeQueryKey]) =>
+          this.registrations.get(registrationKey)?.activeQueryKey !==
+          activeQueryKey
+      )
+      .map(([registrationKey]) => registrationKey);
     await Promise.all(
-      [...sanitizedRegistrationKeys].map((registrationKey) => {
+      repairedRegistrationKeys.map((registrationKey) => {
         const registration = this.registrations.get(registrationKey);
         return registration
           ? this.persistByKey(registrationKey, registration)
@@ -421,7 +409,8 @@ export class RealtimeRegistrationStore {
             ? input.reEvaluationRetryAt
             : undefined,
         activeQueryKey:
-          typeof input.activeQueryKey === "string"
+          typeof input.activeQueryKey === "string" &&
+          isRealtimeActiveQueryKey(input.activeQueryKey)
             ? input.activeQueryKey
             : undefined,
         versionSnapshot: parseRealtimeVersionSnapshotValue(

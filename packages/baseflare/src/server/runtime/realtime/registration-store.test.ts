@@ -55,31 +55,15 @@ describe("RealtimeRegistrationStore", () => {
     expect(reloadedStore.size()).toBe(1);
   });
 
-  it("sanitizes legacy raw authorization headers when registrations reload", async () => {
-    const state = new FakeRealtimeDurableObjectState();
-    const key = registrationKey("sub-a");
-    await state.storage.put(`realtime:registration:${key}`, {
-      ...registration("sub-a"),
-      authorizationHeader: "Bearer owner-a",
-    });
-
-    const reloadedStore = new RealtimeRegistrationStore(state);
-    await reloadedStore.loadOnce();
-
-    const reloaded = reloadedStore.get(key);
-    expect(reloaded?.authorizationFingerprint).toMatch(/^[0-9a-f]{64}$/);
-    expect(JSON.stringify([...state.durableStorage.values()])).not.toContain(
-      "Bearer owner-a"
-    );
-  });
-
-  it("replaces legacy active query keys during registration reload", async () => {
+  it("repairs malformed active query pointers during registration reload", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const activeQueryStore = new RealtimeActiveQueryStore(state);
     const key = registrationKey("sub-a");
+    // A corrupt pointer is rejected by the stored-value parser; reload sync
+    // then recomputes the canonical key and re-persists the repaired record.
     await state.storage.put(`realtime:registration:${key}`, {
       ...registration("sub-a"),
-      activeQueryKey: "legacy-active-query-key",
+      activeQueryKey: "not-an-active-query-key",
     });
 
     const reloadedStore = new RealtimeRegistrationStore(
@@ -92,7 +76,7 @@ describe("RealtimeRegistrationStore", () => {
     expect(reloaded?.activeQueryKey).toMatch(/^aq:/);
     expect(activeQueryStore.get(reloaded?.activeQueryKey ?? "")).toBeDefined();
     expect(JSON.stringify([...state.durableStorage.values()])).not.toContain(
-      "legacy-active-query-key"
+      "not-an-active-query-key"
     );
   });
 

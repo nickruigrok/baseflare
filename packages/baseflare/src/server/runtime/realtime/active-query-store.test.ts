@@ -162,11 +162,11 @@ describe("RealtimeActiveQueryStore", () => {
     ).toBe(150);
   });
 
-  it("drops legacy active query storage keys during reload", async () => {
+  it("drops invalid active query storage keys during reload", async () => {
     const state = new FakeRealtimeDurableObjectState();
-    await state.storage.put("realtime:active-query:legacy-key", {
+    await state.storage.put("realtime:active-query:invalid-key", {
       args: {},
-      key: "legacy-key",
+      key: "invalid-key",
       memberRegistrationKeys: [registrationKey("sub-a")],
       queryName: "todos:list",
       runtimeId: "runtime:1",
@@ -176,7 +176,7 @@ describe("RealtimeActiveQueryStore", () => {
     await reloadedStore.loadOnce();
 
     expect(reloadedStore.size()).toBe(0);
-    expect(state.durableStorage.has("realtime:active-query:legacy-key")).toBe(
+    expect(state.durableStorage.has("realtime:active-query:invalid-key")).toBe(
       false
     );
   });
