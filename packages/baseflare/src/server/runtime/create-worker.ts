@@ -239,6 +239,10 @@ async function handleRpcRequest(
     }
 
     if (request.method !== "POST") {
+      // Deliberate fall-through: RPC routes reserve only POST. Other methods
+      // first get a chance at the app's custom HTTP routes; when none match,
+      // the final fallthrough throws the getRpcMethodError "must use POST"
+      // validation error instead of an opaque 404.
       return null;
     }
 

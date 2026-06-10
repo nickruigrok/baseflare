@@ -230,12 +230,6 @@ export async function evaluateRealtimeAutoscaling(
   const now = input.now ?? Date.now();
   await retireDrainedRealtimeShardGenerations(database, now);
   const activeGeneration = await fetchActiveRealtimeShardGeneration(database);
-  const targetRegistrations =
-    activeGeneration.subscriptionShardCount *
-    REALTIME_AUTOSCALE_TARGET_REGISTRATIONS_PER_SHARD;
-  const lowRegistrations =
-    activeGeneration.subscriptionShardCount *
-    REALTIME_AUTOSCALE_MIN_REGISTRATIONS_PER_SHARD;
   const state = await bindStatement(
     database,
     `SELECT scale_up_started_at, scale_down_started_at
@@ -246,11 +240,20 @@ export async function evaluateRealtimeAutoscaling(
     scale_down_started_at: number | null;
     scale_up_started_at: number | null;
   }>();
+  // The pressure snapshot describes ONE subscription shard, so it compares
+  // against the per-shard constants directly. Multiplying by the cluster's
+  // shard count would make scale-up unreachable for balanced load and
+  // scale-down fire on healthy shards. Cross-shard safety comes from the
+  // shared autoscale state: any shard with non-low pressure resets the
+  // scale-down window for the whole cluster.
   const highPressure = hasHighRealtimePressure(
     input.pressure,
-    targetRegistrations
+    REALTIME_AUTOSCALE_TARGET_REGISTRATIONS_PER_SHARD
   );
-  const lowPressure = hasLowRealtimePressure(input.pressure, lowRegistrations);
+  const lowPressure = hasLowRealtimePressure(
+    input.pressure,
+    REALTIME_AUTOSCALE_MIN_REGISTRATIONS_PER_SHARD
+  );
 
   if (
     highPressure &&

@@ -1705,6 +1705,61 @@ describe("worker runtime", () => {
     ).run();
   });
 
+  it("evaluates autoscaling thresholds per shard, not per cluster", async () => {
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_realtime_shard_generations"
+    ).run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (2, 2, 'active', 0, NULL)"
+    ).run();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_autoscale_state SET scale_up_started_at = NULL, scale_down_started_at = NULL, updated_at = 0 WHERE id = 1"
+    ).run();
+    const startedAt = 2_000_000;
+
+    // A shard above the per-shard minimum is healthy: it must not register
+    // low pressure just because the cluster has more shards (400 used to
+    // compare against 2 shards x 250 = 500 and trigger scale-down).
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 400,
+      now: startedAt,
+    });
+    const noScaleDown = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 400,
+      now: startedAt + 24 * 60 * 60 * 1000,
+    });
+    expect(noScaleDown).toBeNull();
+
+    // A shard at the per-shard target triggers scale-up; it used to need one
+    // shard to hold the whole cluster's capacity (2 shards x 1000 = 2000),
+    // which a balanced cluster never reaches.
+    const highLoadStartedAt = startedAt + 25 * 60 * 60 * 1000;
+    await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: highLoadStartedAt,
+    });
+    const scaledUp = await evaluateRealtimeAutoscalingForTest(env.APP_DB, {
+      activeRegistrationCount: 1000,
+      now: highLoadStartedAt + 10 * 60 * 1000,
+    });
+    const activeGeneration = await env.APP_DB.prepare(
+      "SELECT subscription_shard_count FROM _bf_realtime_shard_generations WHERE status = 'active'"
+    ).first<{ subscription_shard_count: number }>();
+
+    expect(scaledUp).toBe("scaled_up");
+    expect(activeGeneration?.subscription_shard_count).toBe(4);
+
+    await env.APP_DB.prepare(
+      "DELETE FROM _bf_realtime_shard_generations"
+    ).run();
+    await env.APP_DB.prepare(
+      "INSERT INTO _bf_realtime_shard_generations (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (1, 1, 'active', 0, NULL)"
+    ).run();
+    await env.APP_DB.prepare(
+      "UPDATE _bf_realtime_autoscale_state SET scale_up_started_at = NULL, scale_down_started_at = NULL, updated_at = 0 WHERE id = 1"
+    ).run();
+  });
+
   it("treats concurrent realtime scale transitions as benign races", async () => {
     const info = vi.spyOn(console, "info").mockImplementation(() => undefined);
     const startedAt = 1_500_000;
