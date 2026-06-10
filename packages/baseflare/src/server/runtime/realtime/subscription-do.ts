@@ -1530,25 +1530,29 @@ export class RealtimeSubscriptionDO {
       async (group) => {
         let groupEvaluated = 0;
         let groupFailed = 0;
-        try {
-          for (const deliveries of chunkRealtimeDeliveries(group.deliveries)) {
+        const chunks = chunkRealtimeDeliveries(group.deliveries);
+        for (const [index, deliveries] of chunks.entries()) {
+          try {
             const result = await this.flushPendingDeliveryGroup({
               ...group,
               deliveries,
             });
             groupEvaluated += result.evaluated;
             groupFailed += result.failed;
+          } catch (error) {
+            // Chunks that already flushed handled their own outcome; only
+            // the failing chunk and the unflushed remainder are unknown, so
+            // already-delivered registrations are not backed off.
+            const remaining = chunks.slice(index).flat();
+            for (const delivery of remaining) {
+              this.releaseRegistrationEvaluation(delivery.registration);
+            }
+            await Promise.allSettled(
+              remaining.map((delivery) => this.backOffDelivery(delivery, error))
+            );
+            groupFailed += remaining.length;
+            break;
           }
-        } catch (error) {
-          for (const delivery of group.deliveries) {
-            this.releaseRegistrationEvaluation(delivery.registration);
-          }
-          await Promise.allSettled(
-            group.deliveries.map((delivery) =>
-              this.backOffDelivery(delivery, error)
-            )
-          );
-          groupFailed = group.deliveries.length;
         }
         emitRealtimeMetric(REALTIME_DELIVERY_BATCHES_METRIC, 1, {
           result: getRealtimeDeliveryGroupMetricResult(
@@ -1626,7 +1630,7 @@ export class RealtimeSubscriptionDO {
 
       let evaluated = 0;
       let failed = 0;
-      const stateUpdates: Promise<void>[] = [];
+      const stateUpdates: Promise<boolean>[] = [];
       for (const delivery of group.deliveries) {
         if (!deliveredSubscriptions.has(delivery.registration.subscriptionId)) {
           failed += 1;
@@ -1648,7 +1652,12 @@ export class RealtimeSubscriptionDO {
           this.logRegistrationStateUpdateFailure(delivery.registration, error);
         }
       }
-      await Promise.allSettled(stateUpdates);
+      // updateDeliveredRegistrationState never rejects; it reports failures
+      // as false. `evaluated` keeps counting the client delivery (the client
+      // did receive data), while `failed` additionally surfaces the degraded
+      // post-delivery state update so the batch metric reads partial.
+      const stateResults = await Promise.all(stateUpdates);
+      failed += stateResults.filter((succeeded) => !succeeded).length;
       this.lastDeliveryBatchLatencyMs = Date.now() - startedAt;
       return { evaluated, failed };
     } finally {
@@ -1718,15 +1727,22 @@ export class RealtimeSubscriptionDO {
     }
   }
 
+  /**
+   * Applies the delivered evaluation's dependency state to the registration.
+   * Returns false when the update failed and the registration was expired or
+   * backed off instead, so the caller can surface the degradation in its
+   * failure accounting.
+   */
   private async updateDeliveredRegistrationState(
     delivery: PendingRealtimeDelivery
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
       await this.updateRegistrationDependencies(
         delivery.registration,
         delivery.dependencies,
         delivery.versionSnapshot
       );
+      return true;
     } catch (error) {
       this.logRegistrationStateUpdateFailure(delivery.registration, error);
       try {
@@ -1741,6 +1757,7 @@ export class RealtimeSubscriptionDO {
           recoveryError
         );
       }
+      return false;
     }
   }
 

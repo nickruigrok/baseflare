@@ -70,6 +70,7 @@ import type {
 } from "./realtime/types";
 import {
   REALTIME_CATCH_UP_EVENT_LIMIT,
+  REALTIME_DELIVERY_BATCH_MAX_BYTES,
   REALTIME_DELIVERY_BATCH_SIZE,
   REALTIME_MAX_MESSAGE_BYTES,
   REALTIME_MAX_RESTORE_SUBSCRIPTIONS,
@@ -13331,7 +13332,8 @@ describe("worker runtime", () => {
       ok: boolean;
     };
 
-    expect(firstBody).toEqual({ evaluated: 2, failed: 0, ok: true });
+    // The degraded state update is surfaced in the failed count.
+    expect(firstBody).toEqual({ evaluated: 2, failed: 1, ok: true });
     expect(deliveries).toHaveLength(1);
     expect(
       getRealtimeDeliveryItems(deliveries[0]).map((item) => item.subscriptionId)
@@ -14118,6 +14120,148 @@ describe("worker runtime", () => {
     expect(result).toEqual({ evaluated: 1, failed: 1 });
     expect(attemptedConnectionKeys).toEqual(["client-a", "client-b"]);
     expect(flushPendingDeliveryGroup).toHaveBeenCalledTimes(2);
+  });
+
+  it("backs off only unflushed chunks when a delivery chunk throws", async () => {
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    let flushCalls = 0;
+    vi.spyOn(
+      subscriptionDo as unknown as {
+        flushPendingDeliveryGroup(group: {
+          deliveries: readonly PendingRealtimeDelivery[];
+        }): Promise<{ evaluated: number; failed: number }>;
+      },
+      "flushPendingDeliveryGroup"
+    ).mockImplementation((group) => {
+      flushCalls += 1;
+      if (flushCalls > 1) {
+        return Promise.reject(new Error("chunk transport unavailable"));
+      }
+
+      return Promise.resolve({
+        evaluated: group.deliveries.length,
+        failed: 0,
+      });
+    });
+    const overHalfBudget =
+      Math.floor(REALTIME_DELIVERY_BATCH_MAX_BYTES / 2) + 1;
+    const createDelivery = (
+      subscriptionId: string
+    ): PendingRealtimeDelivery => ({
+      dependencies: { partitions: new Set(), tables: new Set(["todos"]) },
+      message: { result: [], sequence: 1, subscriptionId },
+      registration: {
+        args: { ownerToken: "owner-a" },
+        authorizationFingerprint: "auth-owner-a",
+        connectionKey: "client-a",
+        connectionName: getRealtimeConnectionShardName("client-a"),
+        epoch: 1,
+        leaseExpiresAt: Date.now() + 60_000,
+        queryName: "todos:list",
+        runtimeId: "runtime:1",
+        subscriptionId,
+      },
+      // Over half the byte budget so each delivery flushes as its own chunk.
+      resultBytes: overHalfBudget,
+      resultJson: "[]",
+      versionSnapshot: { partitions: new Map(), tables: new Map() },
+    });
+    const deliveredChunk = createDelivery("sub-delivered");
+    const failedChunk = createDelivery("sub-failed");
+
+    const result = await (
+      subscriptionDo as unknown as {
+        flushPendingDeliveries(
+          deliveries: readonly PendingRealtimeDelivery[]
+        ): Promise<{ evaluated: number; failed: number }>;
+      }
+    ).flushPendingDeliveries([deliveredChunk, failedChunk]);
+
+    expect(result).toEqual({ evaluated: 1, failed: 1 });
+    // The already-flushed chunk's registration is untouched; only the failing
+    // chunk's registration is backed off.
+    expect(deliveredChunk.registration.reEvaluationRetryAt).toBeUndefined();
+    expect(failedChunk.registration.reEvaluationRetryAt).toEqual(
+      expect.any(Number)
+    );
+  });
+
+  it("counts post-delivery state update failures as failed", async () => {
+    const errorSpy = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => undefined);
+    let failGenerationLookup = false;
+    const database = Object.create(env.APP_DB) as D1Database;
+    database.prepare = (sql: string) => {
+      if (
+        failGenerationLookup &&
+        sql.includes("_bf_realtime_shard_generations")
+      ) {
+        throw new Error("generation lookup unavailable");
+      }
+      return env.APP_DB.prepare(sql);
+    };
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: database,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const delivery: PendingRealtimeDelivery = {
+      dependencies: { partitions: new Set(), tables: new Set(["todos"]) },
+      message: { result: [], sequence: 1, subscriptionId: "sub-degraded" },
+      registration: {
+        args: { ownerToken: "owner-a" },
+        authorizationFingerprint: "auth-owner-a",
+        connectionKey: "client-a",
+        connectionName: getRealtimeConnectionShardName("client-a"),
+        epoch: 1,
+        leaseExpiresAt: Date.now() + 60_000,
+        queryName: "todos:list",
+        runtimeId: "runtime:1",
+        subscriptionId: "sub-degraded",
+      },
+      resultBytes: 2,
+      resultJson: "[]",
+      versionSnapshot: { partitions: new Map(), tables: new Map() },
+    };
+    failGenerationLookup = true;
+
+    const result = await (
+      subscriptionDo as unknown as {
+        flushPendingDeliveries(
+          deliveries: readonly PendingRealtimeDelivery[]
+        ): Promise<{ evaluated: number; failed: number }>;
+      }
+    ).flushPendingDeliveries([delivery]);
+    failGenerationLookup = false;
+
+    // The client received the delivery (evaluated), but the degraded
+    // post-delivery state update is surfaced in the failed count.
+    expect(result).toEqual({ evaluated: 1, failed: 1 });
+    expect(delivery.registration.reEvaluationRetryAt).toEqual(
+      expect.any(Number)
+    );
+    expect(errorSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_registration_state_update_failed",
+        subscriptionId: "sub-degraded",
+      })
+    );
   });
 
   it("counts fully undelivered accepted realtime batches as failed", async () => {
@@ -15152,7 +15296,8 @@ describe("worker runtime", () => {
       ok: boolean;
     };
 
-    expect(body).toEqual({ evaluated: 1, failed: 0, ok: true });
+    // The degraded state update is surfaced in the failed count.
+    expect(body).toEqual({ evaluated: 1, failed: 1, ok: true });
     expect(deliveries).toHaveLength(1);
     const stateUpdateLogs = errorLog.mock.calls.filter(
       ([label, payload]) =>
