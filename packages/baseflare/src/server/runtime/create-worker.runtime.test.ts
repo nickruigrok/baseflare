@@ -5341,6 +5341,80 @@ describe("worker runtime", () => {
     ]);
   });
 
+  it("acknowledges subscriptions when reconciliation alarm scheduling fails", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const messages: unknown[] = [];
+    const socket = {
+      accept() {
+        // Hibernated sockets are already accepted.
+      },
+      close() {
+        // Not expected in this test.
+      },
+      deserializeAttachment() {
+        return {
+          connectionKey: "client-a",
+          connectionName: getRealtimeConnectionShardName("client-a"),
+          latestDeliveredOutboxSequence: null,
+          runtimeId,
+          subscriptions: [],
+        };
+      },
+      send(payload: string) {
+        messages.push(JSON.parse(payload) as unknown);
+      },
+    } as AttachedTestWebSocket;
+    const state = new FakeRealtimeDurableObjectState([socket]);
+    const failingAlarmError = new Error("alarm storage unavailable");
+    const storage = state.storage as { getAlarm: () => Promise<number | null> };
+    const workingGetAlarm = storage.getAlarm;
+    storage.getAlarm = () => Promise.reject(failingAlarmError);
+    const connectionDo = new RealtimeConnectionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(
+        async (_name, _request) => Response.json({ ok: true })
+      ),
+    });
+    const subscribe = (subscriptionId: string) =>
+      connectionDo.webSocketMessage(
+        socket,
+        JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          epoch: 1,
+          queryName: "todos:list",
+          subscriptionId,
+          type: "subscribe",
+        })
+      );
+
+    // The registration succeeds; a failing alarm write must not replace the
+    // acknowledgement with an error frame.
+    await subscribe("sub-alarm-fail");
+    expect(messages).toEqual([
+      { subscriptionId: "sub-alarm-fail", type: "subscribed" },
+    ]);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_reconciliation_schedule_failed",
+      })
+    );
+
+    // Scheduling self-heals on the next activity once storage recovers.
+    storage.getAlarm = workingGetAlarm;
+    await subscribe("sub-alarm-recovered");
+    expect(messages.at(-1)).toEqual({
+      subscriptionId: "sub-alarm-recovered",
+      type: "subscribed",
+    });
+    expect(state.alarmTime).toEqual(expect.any(Number));
+    warnSpy.mockRestore();
+  });
+
   it("closes hibernated realtime socket attachments with empty runtime ids", async () => {
     const registerBodies: Array<{ runtimeId: string; subscriptionId: string }> =
       [];

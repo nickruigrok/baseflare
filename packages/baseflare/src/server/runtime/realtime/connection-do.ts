@@ -1313,19 +1313,33 @@ export class RealtimeConnectionDO {
   }
 
   private async scheduleReconciliation(): Promise<void> {
-    if (!this.hasActiveSocketSubscriptions()) {
-      await this.clearReconciliationAlarm();
-      return;
-    }
+    try {
+      if (!this.hasActiveSocketSubscriptions()) {
+        await this.clearReconciliationAlarm();
+        return;
+      }
 
-    const pendingAlarm = await this.state.storage?.getAlarm();
-    if (pendingAlarm != null) {
-      return;
-    }
+      const pendingAlarm = await this.state.storage?.getAlarm();
+      if (pendingAlarm != null) {
+        return;
+      }
 
-    await this.state.storage?.setAlarm(
-      Date.now() + REALTIME_RECONCILIATION_INTERVAL_MS
-    );
+      await this.state.storage?.setAlarm(
+        Date.now() + REALTIME_RECONCILIATION_INTERVAL_MS
+      );
+    } catch (error) {
+      // The reconciliation alarm is an opportunistic safety net that is
+      // re-attempted on every register/deliver/restore/alarm pass, so a
+      // transient storage failure here must never fail an operation that
+      // already succeeded (e.g. swallow a client acknowledgement).
+      logRuntimeEvent(
+        "warn",
+        "runtime.realtime_reconciliation_schedule_failed",
+        {
+          errorName: error instanceof Error ? error.name : typeof error,
+        }
+      );
+    }
   }
 
   private async clearReconciliationAlarm(): Promise<void> {
