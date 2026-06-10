@@ -200,6 +200,68 @@ describe("RealtimeRegistrationStore", () => {
     ).toBe(false);
   });
 
+  it("moves a registration between active queries in one atomic batch", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    const key = registrationKey("sub-a");
+    const oldRegistration = registration("sub-a", { args: { filter: "old" } });
+    await store.upsert(key, oldRegistration);
+    const oldActiveQueryKey = oldRegistration.activeQueryKey;
+    if (!oldActiveQueryKey) {
+      throw new Error("Expected old active query key");
+    }
+
+    const movedRegistration = registration("sub-a", {
+      args: { filter: "new" },
+    });
+    await store.upsert(key, movedRegistration);
+    const newActiveQueryKey = movedRegistration.activeQueryKey;
+
+    expect(newActiveQueryKey).toBeDefined();
+    expect(newActiveQueryKey).not.toBe(oldActiveQueryKey);
+    expect(store.get(key)?.activeQueryKey).toBe(newActiveQueryKey);
+    expect(activeQueryStore.get(oldActiveQueryKey)).toBeUndefined();
+    expect(
+      activeQueryStore
+        .get(newActiveQueryKey ?? "")
+        ?.memberRegistrationKeys.has(key)
+    ).toBe(true);
+    const storedActiveQueryKeys = [...state.durableStorage.keys()].filter(
+      (storageKey) => storageKey.startsWith("realtime:active-query:")
+    );
+    expect(storedActiveQueryKeys).toEqual([
+      `realtime:active-query:${newActiveQueryKey}`,
+    ]);
+  });
+
+  it("keeps the old active query membership when a move batch fails", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    const key = registrationKey("sub-a");
+    const oldRegistration = registration("sub-a", { args: { filter: "old" } });
+    await store.upsert(key, oldRegistration);
+    const oldActiveQueryKey = oldRegistration.activeQueryKey;
+    if (!oldActiveQueryKey) {
+      throw new Error("Expected old active query key");
+    }
+    state.failedStoragePuts = 1;
+
+    await expect(
+      store.upsert(key, registration("sub-a", { args: { filter: "new" } }))
+    ).rejects.toThrow("Storage put failed");
+
+    expect(store.get(key)).toMatchObject({
+      activeQueryKey: oldActiveQueryKey,
+      args: { filter: "old" },
+    });
+    expect(activeQueryStore.size()).toBe(1);
+    expect(
+      activeQueryStore.get(oldActiveQueryKey)?.memberRegistrationKeys.has(key)
+    ).toBe(true);
+  });
+
   it("keeps the previous registration when a replacement batch fails", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const activeQueryStore = new RealtimeActiveQueryStore(state);

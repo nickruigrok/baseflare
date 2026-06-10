@@ -5,6 +5,7 @@ import {
   createRealtimeAffectedTargets,
   createRegistrationKey,
 } from "./routing";
+import { writeRealtimeStorageBatch } from "./storage-batch";
 import type {
   RealtimeDependencySet,
   RealtimePartitionTarget,
@@ -358,7 +359,12 @@ describe("RealtimeActiveQueryStore", () => {
       storedRegistration
     );
 
-    await store.detachRegistration(registrationKey("sub-a"), activeQueryKey);
+    const detachChange = store.prepareDetachRegistration(
+      registrationKey("sub-a"),
+      activeQueryKey
+    );
+    await writeRealtimeStorageBatch(state.storage, detachChange.operations);
+    detachChange.apply();
     const reloadedStore = new RealtimeActiveQueryStore(state);
     await reloadedStore.loadOnce();
 

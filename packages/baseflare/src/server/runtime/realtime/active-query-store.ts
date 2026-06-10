@@ -292,18 +292,6 @@ export class RealtimeActiveQueryStore {
     };
   }
 
-  async detachRegistration(
-    registrationKey: string,
-    activeQueryKey: string | undefined
-  ): Promise<void> {
-    const change = this.prepareDetachRegistration(
-      registrationKey,
-      activeQueryKey
-    );
-    await writeRealtimeStorageBatch(this.state.storage, change.operations);
-    change.apply();
-  }
-
   prepareDetachRegistration(
     registrationKey: string,
     activeQueryKey: string | undefined

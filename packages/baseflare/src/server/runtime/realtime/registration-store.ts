@@ -165,23 +165,25 @@ export class RealtimeRegistrationStore {
         registrationKey,
         nextRegistration
       );
+    // The old active-query detach joins the same batch so a failed write can
+    // never leave the registration attached to one entry in storage and
+    // another in memory.
+    const detachChange =
+      existing && existing.activeQueryKey !== nextRegistration.activeQueryKey
+        ? this.activeQueryStore?.prepareDetachRegistration(
+            registrationKey,
+            existing.activeQueryKey
+          )
+        : undefined;
     await writeRealtimeStorageBatch(this.state.storage, [
       this.putOperation(registrationKey, nextRegistration),
       ...(activeQueryChange?.operations ?? []),
+      ...(detachChange?.operations ?? []),
     ]);
     registration.activeQueryKey = nextRegistration.activeQueryKey;
     this.registrations.set(registrationKey, nextRegistration);
     activeQueryChange?.apply();
-
-    if (
-      existing &&
-      existing.activeQueryKey !== nextRegistration.activeQueryKey
-    ) {
-      await this.detachRegistrationFromActiveQuery(
-        registrationKey,
-        existing.activeQueryKey
-      );
-    }
+    detachChange?.apply();
   }
 
   async delete(registrationKey: string): Promise<void> {
@@ -191,14 +193,16 @@ export class RealtimeRegistrationStore {
       return;
     }
 
-    await writeRealtimeStorageBatch(this.state.storage, [
-      this.deleteOperation(registrationKey),
-    ]);
-    this.registrations.delete(registrationKey);
-    await this.detachRegistrationFromActiveQuery(
+    const detachChange = this.activeQueryStore?.prepareDetachRegistration(
       registrationKey,
       registration.activeQueryKey
     );
+    await writeRealtimeStorageBatch(this.state.storage, [
+      this.deleteOperation(registrationKey),
+      ...(detachChange?.operations ?? []),
+    ]);
+    this.registrations.delete(registrationKey);
+    detachChange?.apply();
   }
 
   async deleteExpired(
@@ -256,21 +260,24 @@ export class RealtimeRegistrationStore {
         nextRegistration,
         { recomputeKey: true }
       );
+    const detachChange =
+      previousActiveQueryKey === nextRegistration.activeQueryKey
+        ? undefined
+        : this.activeQueryStore?.prepareDetachRegistration(
+            registrationKey,
+            previousActiveQueryKey
+          );
     await writeRealtimeStorageBatch(this.state.storage, [
       this.putOperation(registrationKey, nextRegistration),
       ...(activeQueryChange?.operations ?? []),
+      ...(detachChange?.operations ?? []),
     ]);
     registration.dependencies = dependencies;
     registration.versionSnapshot = versionSnapshot;
     registration.activeQueryKey = nextRegistration.activeQueryKey;
     this.registrations.set(registrationKey, registration);
     activeQueryChange?.apply();
-    if (previousActiveQueryKey !== registration.activeQueryKey) {
-      await this.detachRegistrationFromActiveQuery(
-        registrationKey,
-        previousActiveQueryKey
-      );
-    }
+    detachChange?.apply();
   }
 
   async markBackedOff(
@@ -390,32 +397,6 @@ export class RealtimeRegistrationStore {
       key: this.registrationStorageKey(registrationKey),
       type: "delete",
     };
-  }
-
-  private async detachRegistrationFromActiveQuery(
-    registrationKey: string,
-    activeQueryKey: string | undefined
-  ): Promise<void> {
-    try {
-      await this.activeQueryStore?.detachRegistration(
-        registrationKey,
-        activeQueryKey
-      );
-    } catch (error) {
-      logRuntimeEvent("error", "runtime.realtime_registration_detach_failed", {
-        errorName: error instanceof Error ? error.name : typeof error,
-        registrationKey,
-      });
-      try {
-        await this.activeQueryStore?.syncRegistrations(this.values());
-      } catch (syncError) {
-        logRuntimeEvent("error", "runtime.realtime_active_query_sync_failed", {
-          errorName:
-            syncError instanceof Error ? syncError.name : typeof syncError,
-          registrationKey,
-        });
-      }
-    }
   }
 
   private async parseStoredRegistrationValue(
