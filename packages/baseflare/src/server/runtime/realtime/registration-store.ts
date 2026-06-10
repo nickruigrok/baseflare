@@ -86,6 +86,7 @@ export class RealtimeRegistrationStore {
             storageKey,
           }
         );
+        await storage.delete(storageKey);
         continue;
       }
 

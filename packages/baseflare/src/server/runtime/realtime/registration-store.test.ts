@@ -55,6 +55,18 @@ describe("RealtimeRegistrationStore", () => {
     expect(reloadedStore.size()).toBe(1);
   });
 
+  it("deletes malformed registration entries during reload", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const storageKey = `realtime:registration:${registrationKey("sub-a")}`;
+    await state.storage.put(storageKey, {});
+
+    const reloadedStore = new RealtimeRegistrationStore(state);
+    await reloadedStore.loadOnce();
+
+    expect(reloadedStore.size()).toBe(0);
+    expect(state.durableStorage.has(storageKey)).toBe(false);
+  });
+
   it("repairs malformed active query pointers during registration reload", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const activeQueryStore = new RealtimeActiveQueryStore(state);
