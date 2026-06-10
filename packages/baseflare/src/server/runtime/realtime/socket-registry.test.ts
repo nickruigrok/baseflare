@@ -166,6 +166,48 @@ describe("RealtimeSocketRegistry", () => {
     expect(registry.hasSockets("client:client-a")).toBe(true);
   });
 
+  it("contains removal failures so delivery reaches remaining sockets", () => {
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const registry = new RealtimeSocketRegistry({
+      onRemoveAttachment: () => {
+        throw new Error("attachment cleanup failed");
+      },
+    });
+    const failedSocket = createSocket();
+    const healthySocket = createSocket();
+    failedSocket.failSends = true;
+    const subscriptions = [
+      {
+        args: {},
+        epoch: 1,
+        queryName: "todos:list",
+        subscriptionId: "sub-a",
+        subscriptionShardName: "subscription:g1:0",
+      },
+    ];
+    registry.add(failedSocket, attachment("client:client-a", subscriptions));
+    registry.add(healthySocket, attachment("client:client-a", subscriptions));
+
+    const result = registry.deliver("client:client-a", "subscription:g1:0", [
+      { result: [], sequence: 9, subscriptionId: "sub-a" },
+    ]);
+
+    expect(result).toEqual({
+      delivered: 1,
+      deliveredSubscriptions: ["sub-a"],
+    });
+    expect(healthySocket.sentMessages).toHaveLength(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_socket_remove_failed",
+      })
+    );
+    warnSpy.mockRestore();
+  });
+
   it("delivers only to sockets that own the subscription id", () => {
     const registry = new RealtimeSocketRegistry();
     const owningSocket = createSocket();

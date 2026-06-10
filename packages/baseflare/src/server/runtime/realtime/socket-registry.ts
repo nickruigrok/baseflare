@@ -1,4 +1,5 @@
 import { InternalRuntimeError } from "../errors";
+import { logRuntimeEvent } from "../logging";
 import { getStringField, parseRealtimeSocketAttachment } from "./shared";
 import type {
   RealtimeDeliveryResult,
@@ -373,11 +374,26 @@ export class RealtimeSocketRegistry {
         this.updateDeliveredSequence(socket, message.sequence);
         delivered += 1;
       } catch {
-        this.remove(socket);
+        this.removeContained(socket);
       }
     }
 
     return delivered;
+  }
+
+  /**
+   * Removes a socket while containing failures — a dead socket's
+   * deserializeAttachment is a platform call that can throw — so cleanup
+   * inside delivery and rollback loops never aborts the remaining sockets.
+   */
+  private removeContained(socket: RuntimeWebSocket): void {
+    try {
+      this.remove(socket);
+    } catch (error) {
+      logRuntimeEvent("warn", "runtime.realtime_socket_remove_failed", {
+        errorName: error instanceof Error ? error.name : typeof error,
+      });
+    }
   }
 
   private removeSocketFromConnectionIndex(
@@ -413,7 +429,7 @@ export class RealtimeSocketRegistry {
         } catch {
           // Best-effort close: the socket may already be closing.
         }
-        this.remove(update.socket);
+        this.removeContained(update.socket);
       }
     }
   }
