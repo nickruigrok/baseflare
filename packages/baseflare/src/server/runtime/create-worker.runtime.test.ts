@@ -8743,20 +8743,16 @@ describe("worker runtime", () => {
 
     expect(notifyAttempts).toBe(2);
     expect(catchUpAttempts).toBe(1);
-    expect(
-      errorLog.mock.calls.some(([, payload]) => {
-        const event = payload as {
-          errorName?: string;
-          event?: string;
-          shardName?: string;
-        };
-        return (
-          event.event === "runtime.realtime_notify_failed" &&
-          event.errorName === "TypeError" &&
-          event.shardName === undefined
-        );
-      })
-    ).toBe(true);
+    // Exactly one log entry per failing shard, emitted at the failure site
+    // with full shard detail - no duplicate aggregate or caller-level entry.
+    const failureLogs = errorLog.mock.calls
+      .map(([, payload]) => payload as Record<string, unknown>)
+      .filter((payload) => payload.event === "runtime.realtime_notify_failed");
+    expect(failureLogs).toHaveLength(1);
+    expect(failureLogs[0]).toMatchObject({
+      errorName: "TypeError",
+      shardName: expect.any(String),
+    });
   });
 
   it("does not retry non-retryable realtime shard notification failures", async () => {
@@ -8859,6 +8855,10 @@ describe("worker runtime", () => {
     expect(
       new Set(failureLogs.map((log) => log.shardName)).size
     ).toBeGreaterThanOrEqual(2);
+    // One entry per failing shard - no duplicates from aggregate logging.
+    expect(failureLogs.length).toBe(
+      new Set(failureLogs.map((log) => log.shardName)).size
+    );
   });
 
   it("lets subscription Durable Objects catch up from the realtime outbox", async () => {

@@ -153,7 +153,11 @@ async function notifyRealtimeSubscriptionShards(
     getRealtimeAffectedSubscriptionRouteTargets(event),
     generations
   );
-  const results = await Promise.allSettled(
+  // Each failing shard logs exactly once at its failure site below; the
+  // settled rejections are intentionally not re-logged or rethrown - the
+  // durable outbox remains the correctness path for missed notifies, and the
+  // caller's catch only covers failures outside per-shard handling.
+  await Promise.allSettled(
     stubs.map(async ({ generation, shardName, stub }) => {
       try {
         await notifyRealtimeSubscriptionShard(
@@ -198,49 +202,6 @@ async function notifyRealtimeSubscriptionShards(
       }
     })
   );
-  const failures = results.filter((result) => result.status === "rejected");
-  if (failures.length === 1 && failures[0]) {
-    throw failures[0].reason;
-  }
-
-  if (failures.length > 0) {
-    const failureDetails = results.flatMap((result, index) => {
-      if (result.status === "fulfilled") {
-        return [];
-      }
-      const stub = stubs[index];
-      if (!stub) {
-        return [];
-      }
-      const detail = {
-        errorMessage:
-          result.reason instanceof Error ? result.reason.message : undefined,
-        errorName:
-          result.reason instanceof Error
-            ? result.reason.name
-            : typeof result.reason,
-        generationId: stub.generation.generationId,
-        shardName: stub.shardName,
-        status: getRealtimeNotifyErrorStatus(result.reason),
-      };
-      logRuntimeEvent("error", "runtime.realtime_notify_failed", {
-        ...detail,
-        eventId: event.eventId,
-      });
-      return [detail];
-    });
-    const reasons = failureDetails
-      .map(
-        (failure) =>
-          `${failure.shardName}:${failure.errorName}${
-            failure.status ? `:${failure.status}` : ""
-          }${failure.errorMessage ? `:${failure.errorMessage}` : ""}`
-      )
-      .join(", ");
-    throw new InternalRuntimeError(
-      `Realtime notify failed for ${failures.length} shards: ${reasons}`
-    );
-  }
 }
 
 async function catchUpRealtimeSubscriptionShard(
