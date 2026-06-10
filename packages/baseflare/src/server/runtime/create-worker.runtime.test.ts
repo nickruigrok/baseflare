@@ -4725,10 +4725,11 @@ describe("worker runtime", () => {
     });
     await notify("stable-renewal-prime");
     const registrationKey = realtimeRegistrationKey("client-a", "sub-a");
-    const registration =
-      getRealtimeIndexTestState(subscriptionDo).registrations.get(
-        registrationKey
-      );
+    const registration = getRealtimeIndexTestState(
+      subscriptionDo
+    ).registrations.get(registrationKey) as
+      | StoredRealtimeRegistration
+      | undefined;
     if (!registration) {
       throw new Error("Expected realtime registration");
     }
@@ -4743,28 +4744,48 @@ describe("worker runtime", () => {
     const renewLease = vi
       .spyOn(registrationStore, "renewLease")
       .mockRejectedValueOnce(new Error("Storage put failed"));
+    const handleUnchangedRegistration = (
+      subscriptionDo as unknown as {
+        handleUnchangedRegistration(
+          registration: StoredRealtimeRegistration
+        ): Promise<{
+          active: boolean;
+          evaluated: number;
+          failed: number;
+          skipped: number;
+        }>;
+      }
+    ).handleUnchangedRegistration.bind(subscriptionDo);
 
-    await createRealtimeOutboxEvent("stable-renewal-failure", Date.now(), {
-      partitions: [todoOwnerPartition("owner-a")],
-      tables: ["todos"],
-    });
-    const failedResponse = await notify("stable-renewal-failure");
-    const failedBody = (await failedResponse.json()) as {
-      evaluated: number;
-      failed: number;
-      ok: boolean;
-    };
+    const failedResult = await handleUnchangedRegistration(registration);
     const retainedRegistration =
       getRealtimeIndexTestState(subscriptionDo).registrations.get(
         registrationKey
       );
 
-    expect(failedBody).toEqual({ evaluated: 0, failed: 1, ok: true });
+    expect(failedResult).toEqual({
+      active: false,
+      evaluated: 0,
+      failed: 1,
+      skipped: 0,
+    });
     expect(renewLease).toHaveBeenCalledTimes(1);
     expect(retainedRegistration).toBeDefined();
     expect(retainedRegistration?.reEvaluationRetryAt).toBeGreaterThan(
       Date.now()
     );
+    const renewedResult = await handleUnchangedRegistration(
+      retainedRegistration as StoredRealtimeRegistration
+    );
+    expect(renewedResult).toEqual({
+      active: true,
+      evaluated: 1,
+      failed: 0,
+      skipped: 0,
+    });
+    expect(renewLease).toHaveBeenCalledTimes(2);
+    expect(retainedRegistration?.leaseExpiresAt).toBeGreaterThan(Date.now());
+    expect(retainedRegistration?.reEvaluationRetryAt).toBeUndefined();
     expect(errorLog).toHaveBeenCalledWith(
       "baseflare-runtime",
       expect.objectContaining({

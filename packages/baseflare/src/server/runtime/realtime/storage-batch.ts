@@ -37,8 +37,11 @@ export async function writeRealtimeStorageBatch(
     deleteKeys.push(operation.key);
   }
 
-  // Issue every chunked call synchronously before awaiting so Durable Object
-  // write coalescing commits the whole batch atomically.
+  // Issue every chunked call synchronously before awaiting: Durable Object
+  // write coalescing commits all writes issued without an intervening await
+  // as one atomic batch. Chunking exists only for the 128-key per-call API
+  // limit and is NOT an atomicity boundary on its own - the guarantee rests
+  // on no awaits between the calls below.
   const writes: Promise<void>[] = [];
   const putKeys = Object.keys(putEntries);
   for (let index = 0; index < putKeys.length; index += MAX_KEYS_PER_CALL) {

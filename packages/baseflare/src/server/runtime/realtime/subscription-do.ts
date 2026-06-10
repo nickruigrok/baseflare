@@ -1379,7 +1379,7 @@ export class RealtimeSubscriptionDO {
     } catch (error) {
       await this.registrationStore.markBackedOff(latestRegistration);
       this.logReEvaluationFailure(latestRegistration, error);
-      return { active: true, evaluated: 0, failed: 1, skipped: 0 };
+      return { active: false, evaluated: 0, failed: 1, skipped: 0 };
     }
   }
 
