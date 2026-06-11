@@ -67,6 +67,7 @@ export class RealtimeActiveQueryStore {
   private readonly activeQueryKeysWithoutDependencies = new Set<string>();
   private readonly state: RealtimeDurableObjectState;
   private loaded = false;
+  private loadPromise: Promise<void> | undefined;
 
   constructor(state: RealtimeDurableObjectState) {
     this.state = state;
@@ -77,6 +78,18 @@ export class RealtimeActiveQueryStore {
       return;
     }
 
+    // Coalesce concurrent callers: input gates only close during storage
+    // operations, so a fetch and an alarm can interleave at the load's
+    // non-storage awaits and would otherwise both run the full load.
+    this.loadPromise ??= this.performLoadOnce().catch((error: unknown) => {
+      // A failed load must not poison future attempts.
+      this.loadPromise = undefined;
+      throw error;
+    });
+    await this.loadPromise;
+  }
+
+  private async performLoadOnce(): Promise<void> {
     const storage = this.state.storage;
     if (!storage) {
       this.loaded = true;

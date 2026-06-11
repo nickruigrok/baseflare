@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { FakeRealtimeDurableObjectState } from "../realtime.test-helpers";
 import { RealtimeActiveQueryStore } from "./active-query-store";
 import { RealtimeRegistrationStore } from "./registration-store";
@@ -53,6 +53,34 @@ describe("RealtimeRegistrationStore", () => {
       reloadedStore.get(registrationKey("sub-a"))?.dependencies?.tables
     ).toEqual(new Set(["todos"]));
     expect(reloadedStore.size()).toBe(1);
+  });
+
+  it("coalesces concurrent loads into one storage pass", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const seedStore = new RealtimeRegistrationStore(state);
+    await seedStore.upsert(registrationKey("sub-a"), registration("sub-a"));
+    const listSpy = vi.spyOn(state.storage, "list");
+
+    const store = new RealtimeRegistrationStore(state);
+    await Promise.all([store.loadOnce(), store.loadOnce()]);
+
+    expect(listSpy).toHaveBeenCalledTimes(1);
+    expect(store.size()).toBe(1);
+  });
+
+  it("retries the load after a failed attempt", async () => {
+    const state = new FakeRealtimeDurableObjectState();
+    const seedStore = new RealtimeRegistrationStore(state);
+    await seedStore.upsert(registrationKey("sub-a"), registration("sub-a"));
+    const workingList = state.storage.list;
+    state.storage.list = () => Promise.reject(new Error("list unavailable"));
+
+    const store = new RealtimeRegistrationStore(state);
+    await expect(store.loadOnce()).rejects.toThrow("list unavailable");
+
+    state.storage.list = workingList;
+    await store.loadOnce();
+    expect(store.size()).toBe(1);
   });
 
   it("deletes malformed registration entries during reload", async () => {

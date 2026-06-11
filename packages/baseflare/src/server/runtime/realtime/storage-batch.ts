@@ -12,6 +12,9 @@ export type RealtimeStorageBatchOperation =
     };
 
 // Durable Object storage accepts at most 128 keys per put()/delete() call.
+// Note: puts and deletes are grouped per call, so a batch must not contain a
+// put AND a delete for the same key - intra-batch per-key ordering is not
+// preserved. No current caller does this.
 const MAX_KEYS_PER_CALL = 128;
 
 export async function writeRealtimeStorageBatch(
