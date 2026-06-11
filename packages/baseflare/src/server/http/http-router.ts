@@ -14,6 +14,10 @@ function assertPath(path: string, label: string): void {
   }
 }
 
+/**
+ * Routes custom HTTP requests to `httpAction` handlers. Exact paths win over
+ * prefixes; among matching prefixes, the longest wins.
+ */
 export class HttpRouter {
   private readonly exactRoutes = new Map<string, HttpActionHandler>();
   private readonly prefixRoutes: Array<{
@@ -23,6 +27,7 @@ export class HttpRouter {
     handler: HttpActionHandler;
   }> = [];
 
+  /** Registers a handler for one exact `method` + `path` pair. */
   route(config: HttpRouteConfig): void {
     assertPath(config.path, "Route path");
     const method = normalizeMethod(config.method);
@@ -35,6 +40,7 @@ export class HttpRouter {
     this.exactRoutes.set(key, config.handler.handler);
   }
 
+  /** Registers a handler for every path under `pathPrefix`. */
   routeWithPrefix(config: HttpPrefixRouteConfig): void {
     assertPath(config.pathPrefix, "Route prefix");
     const method = normalizeMethod(config.method);
@@ -54,6 +60,7 @@ export class HttpRouter {
     });
   }
 
+  /** Resolves the handler for a request, or null when no route matches. */
   lookup(method: string, path: string): HttpActionHandler | null {
     const normalizedMethod = normalizeMethod(method);
     const exactMatch = this.exactRoutes.get(`${normalizedMethod}:${path}`);
@@ -64,7 +71,8 @@ export class HttpRouter {
     const matchingPrefixes = this.prefixRoutes
       .filter(
         (route) =>
-          route.method === normalizedMethod && path.startsWith(route.pathPrefix)
+          route.method === normalizedMethod &&
+          matchesPathPrefix(path, route.pathPrefix)
       )
       .sort((left, right) => right.pathPrefix.length - left.pathPrefix.length);
 
@@ -72,6 +80,14 @@ export class HttpRouter {
   }
 }
 
+function matchesPathPrefix(path: string, prefix: string): boolean {
+  return (
+    path === prefix ||
+    path.startsWith(prefix.endsWith("/") ? prefix : `${prefix}/`)
+  );
+}
+
+/** Creates the router exported from `baseflare/http.ts` for custom HTTP endpoints. */
 export function httpRouter(): HttpRouter {
   return new HttpRouter();
 }

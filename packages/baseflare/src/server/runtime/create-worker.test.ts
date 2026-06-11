@@ -60,6 +60,21 @@ class FakePreparedStatement implements D1PreparedStatement {
   }
 }
 
+const inertDatabase: D1Database = {
+  batch() {
+    throw new Error("Expected no D1 batch");
+  },
+  prepare() {
+    throw new Error("Expected no D1 prepare");
+  },
+};
+
+const testExecutionContext = {
+  waitUntil() {
+    // Test execution context stub.
+  },
+};
+
 describe("worker request body reader", () => {
   it("cancels oversized request body streams", async () => {
     let cancelled = false;
@@ -101,21 +116,175 @@ describe("worker request body reader", () => {
     );
   });
 
-  it("does not require D1 Sessions for direct action context construction", () => {
-    const database: D1Database = {
-      batch() {
-        throw new Error("Expected no D1 batch");
+  it("does not treat raw bearer headers as authenticated identity before auth is configured", async () => {
+    const authProbe = action({
+      args: {},
+      async handler(ctx) {
+        return await ctx.auth.getUserIdentity();
       },
-      prepare() {
-        throw new Error("Expected no D1 prepare");
-      },
+    });
+    const worker = createWorker(
+      buildBaseflareManifest({
+        actions: [
+          {
+            definition: authProbe,
+            exportName: "identity",
+            modulePath: "auth",
+          },
+        ],
+        schema,
+      })
+    );
+
+    const response = await worker.fetch(
+      new Request("http://example.com/api/action/auth:identity", {
+        body: JSON.stringify({ args: {} }),
+        headers: { authorization: "Bearer arbitrary" },
+        method: "POST",
+      }),
+      { APP_DB: inertDatabase },
+      testExecutionContext
+    );
+    const body = (await response.json()) as { result: unknown };
+
+    expect(response.status).toBe(200);
+    expect(body.result).toBeNull();
+  });
+
+  it("rejects structurally oversized RPC JSON before execution", async () => {
+    const queryProbe = query({
+      args: {},
+      handler: () => "unreachable",
+    });
+    const worker = createWorker(
+      buildBaseflareManifest({
+        queries: [
+          {
+            definition: queryProbe,
+            exportName: "probe",
+            modulePath: "bounds",
+          },
+        ],
+        schema,
+      })
+    );
+    let nested: unknown = "leaf";
+    for (let depth = 0; depth < 40; depth += 1) {
+      nested = { nested };
+    }
+
+    const response = await worker.fetch(
+      new Request("http://example.com/api/query/bounds:probe", {
+        body: JSON.stringify({ args: nested }),
+        method: "POST",
+      }),
+      { APP_DB: inertDatabase },
+      testExecutionContext
+    );
+    const body = (await response.json()) as {
+      error: { code: ErrorCode; message: string };
     };
+
+    expect(response.status).toBe(400);
+    expect(body.error.code).toBe(ErrorCode.ValidationError);
+    expect(body.error.message).toContain("levels deep");
+  });
+
+  it("applies configured CORS headers and preflight responses", async () => {
+    const actionProbe = action({
+      args: {},
+      handler: () => "ok",
+    });
+    const worker = createWorker(
+      buildBaseflareManifest({
+        actions: [
+          {
+            definition: actionProbe,
+            exportName: "probe",
+            modulePath: "cors",
+          },
+        ],
+        config: {
+          cors: {
+            maxAge: 600,
+            origins: ["https://app.example"],
+          },
+          project: "cors-project",
+        },
+        schema,
+      })
+    );
+
+    const allowed = await worker.fetch(
+      new Request("http://example.com/api/action/cors:probe", {
+        body: JSON.stringify({ args: {} }),
+        headers: { origin: "https://app.example" },
+        method: "POST",
+      }),
+      { APP_DB: inertDatabase },
+      testExecutionContext
+    );
+    const denied = await worker.fetch(
+      new Request("http://example.com/api/action/cors:probe", {
+        body: JSON.stringify({ args: {} }),
+        headers: { origin: "https://evil.example" },
+        method: "POST",
+      }),
+      { APP_DB: inertDatabase },
+      testExecutionContext
+    );
+    const preflight = await worker.fetch(
+      new Request("http://example.com/api/action/cors:probe", {
+        headers: {
+          "access-control-request-headers": "authorization",
+          "access-control-request-method": "POST",
+          origin: "https://app.example",
+        },
+        method: "OPTIONS",
+      }),
+      { APP_DB: inertDatabase },
+      testExecutionContext
+    );
+    const deniedPreflight = await worker.fetch(
+      new Request("http://example.com/api/action/cors:probe", {
+        headers: {
+          "access-control-request-method": "POST",
+          origin: "https://evil.example",
+        },
+        method: "OPTIONS",
+      }),
+      { APP_DB: inertDatabase },
+      testExecutionContext
+    );
+
+    expect(allowed.headers.get("access-control-allow-origin")).toBe(
+      "https://app.example"
+    );
+    expect(allowed.headers.get("vary")).toBe("Origin");
+    expect(denied.headers.get("access-control-allow-origin")).toBeNull();
+    expect(preflight.status).toBe(204);
+    expect(preflight.headers.get("access-control-allow-origin")).toBe(
+      "https://app.example"
+    );
+    expect(preflight.headers.get("vary")).toBe("Origin");
+    expect(preflight.headers.get("access-control-allow-headers")).toBe(
+      "authorization"
+    );
+    expect(preflight.headers.get("access-control-max-age")).toBe("600");
+    expect(deniedPreflight.status).toBe(204);
+    expect(
+      deniedPreflight.headers.get("access-control-allow-origin")
+    ).toBeNull();
+    expect(deniedPreflight.headers.get("vary")).toBeNull();
+  });
+
+  it("does not require D1 Sessions for direct action context construction", () => {
     const pureAction = action({
       args: {},
       handler: () => "ok",
     });
     const ctx = createActionContext({
-      database,
+      database: inertDatabase,
       executionContext: {
         waitUntil() {
           // Test execution context stub.
@@ -135,14 +304,6 @@ describe("worker request body reader", () => {
   });
 
   it("does not require D1 Sessions for pure action execution", async () => {
-    const database: D1Database = {
-      batch() {
-        throw new Error("Expected no D1 batch");
-      },
-      prepare() {
-        throw new Error("Expected no D1 prepare");
-      },
-    };
     const pureAction = action({
       args: {},
       handler: () => "ok",
@@ -152,7 +313,7 @@ describe("worker request body reader", () => {
       executeActionDefinition(
         pureAction,
         {
-          database,
+          database: inertDatabase,
           executionContext: {
             waitUntil() {
               // Test execution context stub.

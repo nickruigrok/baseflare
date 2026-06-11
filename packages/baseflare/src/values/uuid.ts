@@ -22,19 +22,29 @@ function assertUuidV7Timestamp(milliseconds: number): void {
   }
 }
 
+/** Returns true when `value` is a well-formed UUIDv7 string (Baseflare document id format). */
 export function isUuidV7(value: string): boolean {
   return UUID_V7_PATTERN.test(value);
 }
 
+/** Generates a new time-sortable UUIDv7 document id. */
 export function generateId(): string {
   return uuidv7();
 }
 
+/**
+ * Returns the smallest possible document id for the given Unix-millisecond
+ * timestamp. Useful for time-range filters on `_id`.
+ */
 export function minIdForMs(milliseconds: number): string {
   assertUuidV7Timestamp(milliseconds);
   return UUID.fromFieldsV7(milliseconds, 0, 0, 0).toString();
 }
 
+/**
+ * Returns the largest possible document id for the given Unix-millisecond
+ * timestamp. Useful for time-range filters on `_id`.
+ */
 export function maxIdForMs(milliseconds: number): string {
   assertUuidV7Timestamp(milliseconds);
   return UUID.fromFieldsV7(
@@ -45,6 +55,7 @@ export function maxIdForMs(milliseconds: number): string {
   ).toString();
 }
 
+/** Extracts the creation time in Unix milliseconds embedded in a UUIDv7 document id. */
 export function getCreatedMsFromId(id: string): number {
   if (!isUuidV7(id)) {
     throw new Error(`Expected a UUIDv7 string, received "${id}"`);
@@ -54,6 +65,7 @@ export function getCreatedMsFromId(id: string): number {
   return Number.parseInt(hexTimestamp, 16);
 }
 
+/** Extracts the creation time embedded in a UUIDv7 document id as a Date. */
 export function getCreatedAtFromId(id: string): Date {
   return new Date(getCreatedMsFromId(id));
 }

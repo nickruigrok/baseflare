@@ -46,6 +46,13 @@ export class PayloadTooLargeRuntimeError extends RuntimeError {
   }
 }
 
+export class UnauthorizedRuntimeError extends RuntimeError {
+  constructor(message = "Unauthorized", data?: unknown) {
+    super(ErrorCode.Unauthorized, message, 401, data);
+    this.name = "UnauthorizedRuntimeError";
+  }
+}
+
 export class PermissionDeniedRuntimeError extends RuntimeError {
   constructor(message = "Permission denied", data?: unknown) {
     super(ErrorCode.PermissionDenied, message, 403, data);
@@ -214,43 +221,69 @@ function normalizeBaseflareError(error: BaseflareError): {
   };
 }
 
-export function toErrorResponse(error: unknown): Response {
-  let payload: RPCError;
-  let status = 500;
-
+/**
+ * Maps any thrown value to the client-safe error contract shared by HTTP
+ * responses and realtime socket frames: internal/unknown failures are
+ * redacted to "Internal error", while validation-class errors keep their
+ * developer-actionable messages.
+ */
+export function toErrorPayload(error: unknown): {
+  readonly payload: RPCError;
+  readonly status: number;
+} {
   if (error instanceof InternalRuntimeError) {
-    status = error.status;
-    payload = {
-      code: ErrorCode.InternalError,
-      message: "Internal error",
-    };
-  } else if (error instanceof RuntimeError) {
-    status = error.status;
-    payload = {
-      code: error.runtimeCode,
-      data: error.data,
-      message: error.message,
-    };
-  } else if (error instanceof ValidationError || error instanceof SchemaError) {
-    status = 400;
-    payload = {
-      code: error.code,
-      message: error.message,
-    };
-  } else if (error instanceof BaseflareError) {
-    const normalized = normalizeBaseflareError(error);
-    status = normalized.status;
-    payload = {
-      code: normalized.code,
-      data: normalized.data,
-      message: normalized.message,
-    };
-  } else {
-    payload = {
-      code: ErrorCode.InternalError,
-      message: "Internal error",
+    return {
+      payload: {
+        code: ErrorCode.InternalError,
+        message: "Internal error",
+      },
+      status: error.status,
     };
   }
 
+  if (error instanceof RuntimeError) {
+    return {
+      payload: {
+        code: error.runtimeCode,
+        data: error.data,
+        message: error.message,
+      },
+      status: error.status,
+    };
+  }
+
+  if (error instanceof ValidationError || error instanceof SchemaError) {
+    return {
+      payload: {
+        code: error.code,
+        message: error.message,
+      },
+      status: 400,
+    };
+  }
+
+  if (error instanceof BaseflareError) {
+    const normalized = normalizeBaseflareError(error);
+    return {
+      payload: {
+        code: normalized.code,
+        data: normalized.data,
+        message: normalized.message,
+      },
+      status: normalized.status,
+    };
+  }
+
+  return {
+    payload: {
+      code: ErrorCode.InternalError,
+      message: "Internal error",
+    },
+    status: 500,
+  };
+}
+
+export function toErrorResponse(error: unknown): Response {
+  const { payload, status } = toErrorPayload(error);
   return Response.json({ error: payload }, { status });
 }

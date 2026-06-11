@@ -572,7 +572,12 @@ function recordValidator<TValueValidator extends AnyValidator>(
 
       const result: Record<string, unknown> = {};
       for (const [key, entry] of Object.entries(value)) {
-        result[key] = valueValidator.validate(entry, `${path}.${key}`);
+        Object.defineProperty(result, key, {
+          configurable: true,
+          enumerable: true,
+          value: valueValidator.validate(entry, `${path}.${key}`),
+          writable: true,
+        });
       }
 
       return result as Record<string, OutputValue<TValueValidator>>;
@@ -702,6 +707,12 @@ function optionalValidator<
   return validator.optional();
 }
 
+/**
+ * Validator builders for schema fields, function args, and return values —
+ * e.g. `v.string().min(1)`, `v.id("users")`, `v.optional(v.number())`.
+ * Validators run at write/call time; chain `.optional()`, `.default()`,
+ * `.min()`/`.max()`, and `.searchable()` where supported.
+ */
 export const v = {
   string: stringValidator,
   number: numberValidator,

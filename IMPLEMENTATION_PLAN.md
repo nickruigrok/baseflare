@@ -338,12 +338,12 @@ npx baseflare deploy --env production
 ```
 
 1. CLI bundles the `baseflare/` directory with the Baseflare Worker bundler, aligned with the Rolldown/tsdown toolchain used for package builds
-2. CLI wraps the bundle into a Worker entry point template:
+2. CLI wraps the bundle into a Worker entry point template (`baseflare/runtime` is the internal deployment entry — generated code only, never app code):
    ```typescript
-   import { createWorker } from 'baseflare/server'
+   import { createWorker } from 'baseflare/runtime'
    import * as userCode from './bundle.js'
    export default createWorker(userCode)
-   export { RealtimeConnectionDO, RealtimeSubscriptionDO } from 'baseflare/server'
+   export { RealtimeConnectionDO, RealtimeSubscriptionDO } from 'baseflare/runtime'
    ```
 3. CLI deploys the Worker via Cloudflare Workers API (`PUT /client/v4/accounts/{id}/workers/scripts/{name}`)
 4. CLI applies table/index changes to D1 before traffic reaches the Worker. `createWorker()` does not run DDL during requests.
@@ -509,6 +509,9 @@ queries route to table/global subscription instances so they remain correct.
 
 Partition metadata is a shared table concept, not realtime-only. It can later
 support tenant sharding, bulk workflows, observability, and data placement.
+Realtime invalidation granularity follows the partition axis: writes to a
+partitioned table re-evaluate only subscriptions reading the affected
+partitions, while unpartitioned tables invalidate table-wide.
 
 ### 1.11 Backups
 
@@ -767,7 +770,7 @@ const createdAt = getCreatedAtFromId(id)
 4. Internal function routing — `internalQuery`/`internalMutation`/`internalAction` not exposed via RPC, only callable via `ctx.runQuery()`/`ctx.runMutation()`/`ctx.runAction()`
 5. Action context — `ActionCtx` with `runQuery`, `runMutation`, `runAction`, `scheduler`, `storage`, `auth`
 6. Mutation context — `MutationCtx` with `db`, `auth`, `storage`, `scheduler`, `runQuery`
-7. Auth token extraction from headers, `ctx.auth` population
+7. `ctx.auth` hook is present but returns `null` until Phase 5 installs a verified Better Auth-backed identity provider; raw bearer headers are not treated as trusted identity
 8. Permission enforcement on every operation
 9. Collection table/index creation in D1 on deploy (document tables with `_id`, `_data`, `_rev` columns + `json_extract()` indexes); schema application is deploy-owned and never runs inside `createWorker()`
 10. Transaction support via `env.APP_DB.batch()`
@@ -819,71 +822,147 @@ curl -X POST http://localhost:4510/api/query/todos:list \
 
 **Execution model:**
 
-Realtime generalizes the singleton model into one sharded-capable engine.
-`N=1` is the simple degenerate mode for small apps and local development.
-Higher shard counts use the same routing, registration, invalidation, and
-delivery code rather than a second implementation.
+Realtime is one sharded-capable engine. The v1 production default is `N=1`,
+which is the degenerate singleton mode, but the runtime uses the same route,
+registration, invalidation, recovery, and delivery machinery for every shard
+count. Raw shard counts are internal control-plane policy, not app developer
+configuration.
 
 Two internal Durable Object roles split the work:
 
-- `RealtimeConnectionDO` holds WebSockets, client/session state, reconnect
-  state, and delivery to clients. Connection DOs shard by client/session id for
-  even connection spread.
-- `RealtimeSubscriptionDO` owns subscription registration, dependency tracking,
-  query re-evaluation, and fanout planning. Subscription DOs shard by data
-  partition so subscribers to the same data are colocated.
+- `RealtimeConnectionDO` holds WebSockets, hibernated socket attachments,
+  client/session delivery state, reconnect restore state, live reconciliation
+  alarms, and delivery to clients. Connection DOs use a fixed internal shard
+  count by client/session key.
+- `RealtimeSubscriptionDO` owns active query state, subscriber registrations,
+  version-first reconciliation, query re-evaluation, outbox catch-up, and
+  fanout planning.
 
-Batched subscription-to-connection delivery bridges the two roles. The client
-SDK still presents one WebSocket and normal query subscriptions by default.
+Subscription DO routing uses internal route targets:
 
-Shard count is internal deployment policy, not public API. App developers do
-not configure shards in v1. Live shard-count autoscaling/resharding is future
-enterprise work. **Open Phase 3 decision:** default production count, `N=1` vs
-`N=32`, decided by hibernation/performance tests.
+- `global` for unknown or conservative work;
+- `table` for broad table dependencies;
+- `partition` for partition-aligned dependencies.
+
+Subscription shard generations are stored in D1 runtime metadata. Active and
+draining generations use deterministic DO names:
+`subscription:g{generationId}:{shardIndex}`. New registrations use the active
+generation global route until the first successful query run captures
+dependencies. The owning subscription shard may then adopt the registration via
+an internal `/adopt-registration` handoff. The target remains pending until the
+connection DO owner pointer moves and the target is activated; only then does
+the source shard remove its copy. Draining generations keep serving existing
+registrations until leases expire and outbox catch-up closes the gap. Live
+WebSockets are not moved between connection DOs; reconnect, hibernation restore,
+and lease drain make generation changes safe.
+
+Managed autoscaling is conservative and internal for subscription DOs.
+Baseflare observes realtime pressure, scales subscription shards geometrically
+(`1 -> 2 -> 4 -> 8 -> 16 -> 32`), caps v1 at 32 shards, scales up only after
+sustained pressure, and scales down only after sustained low load and safe
+drain. It never increments by `+1` and never downscales below one shard.
 
 **Subscription tracking:**
-- Each subscription is: `{ subscriptionId, clientId, queryName, queryArgs, lastDeliveredVersion, tableDependencies, partitionDependencies }`
-- `RealtimeSubscriptionDO` maintains table/partition dependency indexes for affected subscription lookup.
-- Query-to-table dependency is tracked at **runtime**, not static analysis. When a query handler executes, `ctx.db` is wrapped with a tracking proxy that records every table accessed (`ctx.db.query("todos")`, `ctx.db.get("users", id)`) into a `Set<string>`. The first execution captures the dependency set, stored with the subscription. This correctly handles helper functions, imported utilities, `ctx.runQuery()`, and any other indirect table access.
-- The dependency set is recaptured on every re-evaluation (a query might access different tables or partitions based on args or data). The indexes are updated accordingly.
-- Partitioned queries route to data-local subscription DO instances. Cross-partition queries route to table/global subscription DO instances so they never silently go stale. Table/global paths are correct but expensive, so they use stronger debounce and observability.
+
+- Each internal registration is keyed by `{ connectionKey, subscriptionId }`,
+  so client-local subscription ids cannot collide across sockets.
+- Anonymous sockets get server-generated connection keys. Explicit `clientId`
+  or `sessionId` values group intentional multi-tab sessions only after being
+  hashed with the runtime id and authorization fingerprint.
+- Identical safe subscriptions share one active query per subscription shard.
+  Active query keys include runtime id, query name, canonical args,
+  authorization header, and current home route, so different auth contexts never
+  coalesce.
+- Query dependencies are captured at runtime through the D1 read observer, not
+  static analysis. Point reads and broad/unpartitioned queries record table
+  dependencies. Partition-aligned queries record partition dependencies.
+- `RealtimeSubscriptionDO` persists active queries and registrations in Durable
+  Object storage. On wake it rebuilds active query membership, dependency
+  indexes, and conservative unknown-dependency indexes before notify/catch-up.
+- Active queries own dependencies, version snapshots, last result JSON, retry
+  state, and member registration keys. Registrations own subscriber lifecycle:
+  connection key, connection DO name, subscription id, epoch, lease, owner shard,
+  pending move state, and active query membership.
+- Dependency snapshots are replaced only after a successful re-evaluation. A
+  failed re-evaluation keeps the previous snapshot so future events still find
+  the active query.
 
 **Notification pipeline:**
 1. Mutation executes on D1 via Worker.
 2. The mutation writes compact realtime outbox events in the same D1 commit as data writes.
 3. Outbox events include changed tables and every partition value a document enters or leaves. Inserts emit new partition values, deletes emit old values, and patches/replaces emit both old and new values when a partition field changes.
-4. Worker sends `notify(eventId)` to affected `RealtimeSubscriptionDO` instances as the fast path.
-5. Subscription DOs catch up from the D1 outbox when notifications are missed.
-6. Subscription DOs re-run affected queries against D1 with tracking enabled and compare monotonic table/partition versions before re-querying when possible.
-7. Changed results are batched per `RealtimeConnectionDO`; connection DOs deliver to clients via WebSocket.
+4. Worker sends `notify(eventId)` to affected active and draining
+   `RealtimeSubscriptionDO` generation shards as the fast path.
+5. Subscription DOs catch up from `_bf_realtime_outbox` when notifications are
+   missed or coalesced under pressure.
+6. Subscription DOs resolve affected active queries from dependency indexes and
+   compare monotonic table/partition versions before re-querying. Unknown
+   dependencies and retained-history gaps fall back to full active-query
+   re-evaluation.
+7. Each changed active query executes once per shard evaluation pass, then fans
+   out one pending delivery per member registration whose subscriber should
+   receive the new result.
+8. Changed results are batched per `{ connectionName, connectionKey }` and sent
+   to `RealtimeConnectionDO` through subscription-aware, item-acknowledged
+   internal `/deliver` calls.
+9. Connection DOs deliver individual `{ type: "delivery", message }` WebSocket
+   frames. Delivery messages include internal outbox `sequence` metadata.
 
-**Recovery model:** Worker-to-subscription notification is recovered by D1 outbox catch-up. Subscription-to-connection delivery is recovered by connection reconciliation. Connection DOs track last delivered table/partition versions per subscription and reconcile before re-querying. **Open Phase 3 decision:** live periodic reconciliation interval, balancing worst-case staleness against idle DO hibernation.
+**Recovery model:** Worker-to-subscription notification is recovered by D1
+outbox catch-up. Reconnect restore accepts an optional `afterSequence`; direct
+`subscribe` sends `{ type: "subscribed" }`, while `restore` sends one final
+`{ type: "restored", failed, reconciled }` completion frame. Connection DO
+hibernation stores socket attachments with active subscriptions and latest
+delivered outbox sequence. On wake, the connection DO rebuilds socket maps,
+re-registers attached subscriptions, and catches up from the stored sequence.
+Live reconciliation alarms run while active subscriptions exist and call
+catch-up using a per-subscription-shard minimum latest delivered sequence across
+active sockets.
+
+Outbox cleanup is cursor-safe. Each active or draining subscription shard
+records `lastProcessedOutboxSequence`; cleanup preserves rows at or after the
+oldest required cursor and uses the retained-window policy only for older rows.
+If catch-up detects that retained history is incomplete, the shard performs a
+full active-query re-evaluation and reports internal diagnostics.
 
 **Registration lifecycle:** Connection-to-subscription registrations use leases and epochs. Subscription DOs expire stale registrations and ignore old epochs so restarted/evicted connection DOs do not leave phantom delivery targets.
 
-**Result comparison:** Result hashes may still be used to avoid duplicate pushes after re-evaluation, but reconciliation must compare monotonic table/partition versions first. Hash-only reconciliation would stampede D1 during reconnect storms.
+**Result comparison:** Reconciliation is version-first. Broad/table
+dependencies compare table versions. Partition dependencies compare partition
+versions. Point reads continue using row `_rev` for mutation OCC, while
+realtime point-read subscriptions use table dependencies. Result JSON/hash is
+only used to suppress duplicate pushes after version relevance is established.
 
-**Fanout limits:** Subscription DOs debounce invalidations, dedupe identical subscription keys, and bound D1 re-evaluation concurrency. Table/global subscription paths use stronger debounce and observability because broad realtime queries are correct but expensive.
+**Fanout limits:** Subscription DOs dedupe in-flight subscription keys, bound D1
+re-evaluation concurrency to 8, cap restore payloads at 100 subscriptions, cap
+delivery batches at 100 items, and cap catch-up reads at 1000 events per call.
+Fast-path notify work is bounded and duplicate event work may be coalesced; the
+durable outbox remains the correctness path. Batch acknowledgements are
+item-level, so undelivered subscription results stay retryable.
 
 **Deliverables:**
 1. `RealtimeConnectionDO` Durable Object class:
    - Holds WebSocket connections via Hibernation API
    - Tracks client/session delivery state
    - Registers subscriptions with `RealtimeSubscriptionDO`
-   - Reconciles subscriptions on reconnect and periodic checks
+   - Reconciles subscriptions on reconnect, hibernation wake, and live alarms
 2. `RealtimeSubscriptionDO` Durable Object class:
-   - Tracks subscriptions with table/partition dependency indexes
+   - Tracks active queries with table/partition dependency indexes and shard cursors
+   - Tracks subscriber registrations as active query members
    - Handles outbox catch-up and `notify(eventId)`
-   - Re-runs affected queries, re-evaluates permissions, and batches delivery per connection DO
+   - Compares versions, re-runs each affected active query once, re-evaluates permissions, and batches delivery per connection DO
 3. Realtime outbox:
    - D1-backed, append-only, compact event rows written with mutation commits
    - Outbox GC based on shard cursors and retained-window fallback
    - Full re-evaluation fallback when a shard cursor falls outside retained history
-4. WebSocket endpoint on environment Worker (`GET /api/subscribe`)
-5. Client reconnection with subscription restore through connection DO reconciliation
-6. Release performance suite:
-   - `pnpm test:perf` for deterministic local/simulated realtime scale tests
-   - optional `pnpm test:perf:cloudflare` for staging WebSocket/platform stress tests
+4. Realtime shard metadata:
+   - D1-backed active/draining/retired subscription shard generations
+   - Internal autoscale state and per-shard outbox cursors
+5. WebSocket endpoint on environment Worker (`GET /api/subscribe`)
+6. Client reconnection with subscription restore through connection DO reconciliation
+7. Release performance suite:
+   - `pnpm test:perf` for deterministic local workerd-backed realtime scale tests
+   - optional `pnpm test:perf:cloudflare` for staging WebSocket/platform stress tests (deferred to Phase 4 — it requires the CLI deploy pipeline to provision a staging environment)
    - tracks fanout latency, D1 re-evaluations, queue depth, outbox lag, delivery batching, recovery time, and idle DO hibernation
 
 **"Done" criteria:**
@@ -905,21 +984,38 @@ enterprise work. **Open Phase 3 decision:** default production count, `N=1` vs
 **Phase 3 test plan:**
 - Correctness:
   - `N=1` and sharded modes use the same engine behavior
+  - global/table/partition route targets resolve deterministically and stay bounded
   - partition moves invalidate old and new partition subscribers
   - deletes invalidate old partition subscribers
   - broad queries receive writes from all partitions
+  - duplicate client-local subscription ids stay isolated by connection key
+  - anonymous clients never share delivery buckets
 - Recovery:
   - missed Worker-to-subscription notify recovers from outbox
-  - missed subscription-to-connection delivery recovers through connection reconciliation
-  - reconnect with no version gap avoids D1 re-query
-  - reconnect with version gap re-evaluates and delivers current data
+  - reconnect restore with a current outbox sequence avoids unnecessary re-evaluation
+  - reconnect restore with a stale outbox sequence catches up and delivers current data
+  - hibernated sockets restore attachments, re-register, and catch up
+  - live reconciliation heals missed delivery while the WebSocket remains open
+  - catch-up with retained-history gaps triggers full re-evaluation
   - expired connection leases and stale epochs stop phantom deliveries
+  - draining shard generations continue serving existing registrations until safe retirement
+- Autoscaling:
+  - sustained high load creates a larger active generation
+  - new registrations route to the active generation
+  - existing registrations on old generations continue through drain
+  - scale-up uses geometric counts only
+  - scale-down happens only after sustained low load and safe drain
+  - raw shard counts are never exposed to app developers
+- Version-first reconciliation:
+  - no version gap avoids D1 re-query
+  - table version gaps re-evaluate table/broad subscriptions
+  - partition version gaps re-evaluate matching partition subscriptions
+  - unrelated partition version changes do not re-query
+  - unknown dependency/version state remains conservative
 - Performance:
-  - compare idle cost/hibernation for `N=1` vs `N=32`
-  - verify idle connection/subscription DOs hibernate between reconciliation checks
-  - simulate 25k subscriptions distributed across realtime DO instances
-  - hot partition evaluates once per subscription key and batches connection delivery
-  - broad table/global queries are debounced and bounded by D1 concurrency
+  - local workerd-backed `pnpm test:perf` simulates high registration counts, hot partitions, broad subscriptions, reconnect storms, hibernation wake, autoscale decisions, and retained-cursor cleanup
+  - hot shared partitions evaluate once per active query and batch connection delivery
+  - broad table/global queries are bounded by D1 concurrency
   - outbox GC and catch-up stay within configured lag budgets
 - Release commands:
   - `pnpm lint`
@@ -942,7 +1038,7 @@ enterprise work. **Open Phase 3 decision:** default production count, `N=1` vs
    - `logout` — revokes OAuth tokens for current or specified profile
    - `whoami` — shows current profile, account name, email, account ID
    - `dev` — lazy-prompts for profile/account/project name on first run, then starts Miniflare with file watcher and codegen
-   - `deploy --env <n>` — lazy-prompts if not configured → create environment if new → Worker bundle → CF Workers API deploy → apply table/index changes to D1
+   - `deploy --env <n>` — lazy-prompts if not configured → create environment if new → Worker bundle → CF Workers API deploy → apply table/index changes to D1. Durable Object classes are declared with `new_sqlite_classes` migrations — required for free-plan support (the free plan only offers SQLite-backed DOs) and assumed by runtime limits (2 MB storage records); the storage backend is sticky after a class's first deploy.
    - `deploy --env <n> --dry-run` — preview table/index changes
    - `generate` — regenerate types
    - `env list` — list environments via CF API (`bf-{project}-*`)
@@ -1078,11 +1174,12 @@ npx baseflare dashboard
    - Auth table names: `_auth_user`, `_auth_session`, `_auth_account`, `_auth_verification`
    - Auth table migrations run on deploy alongside developer table migrations
 3. Route mounting at `/api/auth/*` on environment Worker
-4. `ctx.auth` population from session token in every query/mutation/action
-5. Per-request auth instance (D1 bindings only available in fetch handler)
-6. Uses D1 `batch()` for atomicity
-7. better-auth provider configuration passed through from `defineAuth()` (Google, GitHub, email/password, etc.)
-8. Per-environment auth isolation (separate D1 databases)
+4. `ctx.auth` population from verified Better Auth session token in every query/mutation/action
+5. Realtime re-auth on push — subscription DOs currently evaluate active queries with no auth context (Phase 3 design; active-query keys already include the authorization fingerprint so credentials never coalesce). Phase 5 must re-resolve verified identity per active query on every evaluation and stop delivery when the credential is revoked, so "session revoked → next push excludes that subscriber" holds.
+6. Per-request auth instance (D1 bindings only available in fetch handler)
+7. Uses D1 `batch()` for atomicity
+8. better-auth provider configuration passed through from `defineAuth()` (Google, GitHub, email/password, etc.)
+9. Per-environment auth isolation (separate D1 databases)
 
 **"Done" criteria:**
 ```bash
@@ -1439,7 +1536,8 @@ Deferred to post-v1. Includes `createTestCtx()`, mock utilities, subscription tr
   "exports": {
     "./values": "./dist/values/index.js",
     "./server": "./dist/server/index.js",
-    "./client": "./dist/client/index.js"
+    "./client": "./dist/client/index.js",
+    "./runtime": "./dist/runtime/index.js"
   }
 }
 ```
@@ -1644,27 +1742,11 @@ interface StorageActionWriter extends StorageWriter {
   store(blob: Blob): Promise<string>;  // server-side upload, returns storage ID
 }
 
-// Document serialization
-export function serialize(doc: Record<string, unknown>): { _data: string }
-export function deserialize(row: { _id: string; _data: string }): Record<string, unknown>
-
-// Schema diffing + validation (internal)
-export function diffSchemas(current: Schema, target: Schema): SchemaDiff
-export function validateInsertData(table: TableDefinition, data: Record<string, unknown>): Record<string, unknown>
-export function validateReplaceData(table: TableDefinition, data: Record<string, unknown>): Record<string, unknown>
-export function validatePatchData(
-  table: TableDefinition,
-  current: Record<string, unknown>,
-  patch: Record<string, unknown>,
-): Record<string, unknown>
-
-// Worker entry point factory
-export function createWorker(userCode: UserCodeBundle): ExportedHandler
-
-// Durable Objects
-export class RealtimeConnectionDO implements DurableObject { ... }
-export class RealtimeSubscriptionDO implements DurableObject { ... }
 ```
+
+**Internal modules (not exported from `baseflare/server`):** document serialization (`serialize`/`deserialize`), schema diffing (`diffSchemas`), write-validation helpers (`validateInsertData`/`validateReplaceData`/`validatePatchData`), permission evaluation (`evaluateRules`), and the raw query builder factory are runtime/CLI plumbing. The CLI lives in the same package and deep-imports them from `src/`; they have no public home. The public export surface of every subpath is locked by a snapshot test (`src/public-api.test.ts`).
+
+**`baseflare/runtime` (internal subpath):** `createWorker`, `RealtimeConnectionDO`, `RealtimeSubscriptionDO`, and the manifest/runtime env types live on a dedicated `baseflare/runtime` entry consumed only by the CLI-generated worker entry — same package, one extra `exports` key (precedent: `react/jsx-runtime`). It is documented as internal and not semver-stable; app code never imports it.
 
 **Key design note:** Actions do not have direct `ctx.db` access. Use `ctx.runQuery()` and `ctx.runMutation()` for database work from actions. Each `ctx.runMutation()` call is its own mutation transaction, so atomic multi-write workflows should live in one mutation.
 

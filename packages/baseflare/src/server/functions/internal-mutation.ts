@@ -7,6 +7,11 @@ import {
   type MutationCtx,
 } from "./types";
 
+/**
+ * Defines a server-only mutation: never exposed over RPC, callable only
+ * through `ctx.runMutation` from other functions. Same atomicity and retry
+ * semantics as `mutation`.
+ */
 export function internalMutation<
   TArgs extends ValidatorShape,
   TReturns extends AnyValidator | undefined = undefined,

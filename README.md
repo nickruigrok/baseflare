@@ -54,19 +54,31 @@ export const schema = defineSchema({
 Rules are deny-by-default. If a table or operation has no rule, access is
 denied.
 
+`ctx.auth.getUserIdentity()` is the stable auth hook. It returns `null` until
+the Better Auth integration phase installs a verified identity provider; raw
+`Authorization` headers are not treated as trusted identity.
+
 ```ts
 import { defineRules } from "baseflare/server";
 
 export const rules = defineRules({
   todos: {
-    read: async ({ ctx, doc }) =>
-      doc.ownerId === (await ctx.auth.getUserIdentity()),
-    insert: async ({ ctx, value }) =>
-      value.ownerId === (await ctx.auth.getUserIdentity()),
-    update: async ({ ctx, existingDoc }) =>
-      existingDoc.ownerId === (await ctx.auth.getUserIdentity()),
-    delete: async ({ ctx, existingDoc }) =>
-      existingDoc.ownerId === (await ctx.auth.getUserIdentity()),
+    read: async ({ ctx, doc }) => {
+      const identity = await ctx.auth.getUserIdentity();
+      return identity !== null && doc.ownerId === identity.id;
+    },
+    insert: async ({ ctx, value }) => {
+      const identity = await ctx.auth.getUserIdentity();
+      return identity !== null && value.ownerId === identity.id;
+    },
+    update: async ({ ctx, existingDoc }) => {
+      const identity = await ctx.auth.getUserIdentity();
+      return identity !== null && existingDoc.ownerId === identity.id;
+    },
+    delete: async ({ ctx, existingDoc }) => {
+      const identity = await ctx.auth.getUserIdentity();
+      return identity !== null && existingDoc.ownerId === identity.id;
+    },
   },
 });
 ```

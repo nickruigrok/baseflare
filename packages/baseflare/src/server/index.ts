@@ -7,7 +7,6 @@ export type {
   BaseflareWorkerConfig,
 } from "./config";
 export { defineConfig } from "./config";
-export { deserialize } from "./db/deserialize";
 export type {
   FieldFilter,
   FilterObject,
@@ -15,19 +14,12 @@ export type {
   FilterValue,
   LogicalFilterKey,
 } from "./db/filters";
-export { createQueryBuilder } from "./db/query-builder";
 export type {
   DatabaseReader,
   QueryBuilder,
   QueryOrderDirection,
 } from "./db/reader";
-export { serialize } from "./db/serialize";
 export type { DocumentData, DocumentPatch } from "./db/write-validation";
-export {
-  validateInsertData,
-  validatePatchData,
-  validateReplaceData,
-} from "./db/write-validation";
 export type { DatabaseWriter } from "./db/writer";
 export { action } from "./functions/action";
 export { internalAction } from "./functions/internal-action";
@@ -57,31 +49,13 @@ export type {
   HttpMethod,
 } from "./http/types";
 export { defineRules } from "./permissions/define-rules";
-export { evaluateRules } from "./permissions/evaluate-rules";
 export type { RuleOperation, Rules, TableRules } from "./permissions/types";
-export { createWorker } from "./runtime/create-worker";
-export type {
-  BaseflareExecutionContext,
-  BaseflareFunctionEntry,
-  BaseflareManifest,
-  BaseflareManifestSource,
-  BaseflareRuntimeEnv,
-  D1BindingValue,
-  D1Database,
-  D1PreparedStatement,
-  D1Result,
-  ExportedHandler,
-} from "./runtime/types";
 export { defineSchema } from "./schema/define-schema";
 export { defineTable } from "./schema/define-table";
-export { diffSchemas } from "./schema/diff-schemas";
 export type {
   DataModelFromSchema,
-  DiffedIndex,
   Doc,
-  NormalizedSchemaTables,
   Schema,
-  SchemaDiff,
   SchemaTables,
   TableBuilder,
   TableDefinition,

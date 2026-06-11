@@ -6,14 +6,17 @@ import {
 } from "../db/cursor";
 import { deserialize } from "../db/deserialize";
 import {
-  assertQueryField,
+  combineFilters,
   compileFilter,
   type FilterObject,
   type FilterValue,
 } from "../db/filters";
 import {
+  assertDirection,
   assertTableIdentifier,
   buildOrderClause,
+  createBaseQueryState,
+  normalizeOrderField,
   type QueryState,
 } from "../db/query-builder";
 import type { QueryBuilder, QueryOrderDirection } from "../db/reader";
@@ -34,6 +37,10 @@ import {
   ValidationRuntimeError,
   withDatabaseErrorHandling,
 } from "./errors";
+import {
+  getPartitionReadTarget,
+  type PartitionReadTarget,
+} from "./partitioning";
 import { assertReadRulesConfigured, canReadDocument } from "./permissions";
 import type {
   D1BindingValue,
@@ -84,9 +91,15 @@ export interface RuntimeScanQueryOptions {
   readonly offset?: number;
 }
 
+export interface RuntimeReadObserver {
+  onPartitionRead(partition: PartitionReadTarget): void;
+  onTableRead(tableName: string): void;
+}
+
 interface RuntimeQueryOptions<TContext> {
   readonly database: RuntimeDatabase;
   readonly getContext: () => TContext;
+  readonly readObserver?: RuntimeReadObserver;
   readonly rules?: Rules;
   readonly schema: Schema;
   readonly tableName: string;
@@ -243,7 +256,7 @@ export function deserializeVersionedRuntimeDocument(
   };
 }
 
-export function fetchStoredDocument(
+function fetchStoredDocument(
   database: D1PrepareDatabase,
   tableName: string,
   id: string
@@ -255,41 +268,13 @@ export function fetchStoredDocument(
   );
 }
 
-export async function fetchVersionedDocument(
+async function fetchVersionedDocument(
   database: D1PrepareDatabase,
   tableName: string,
   id: string
 ): Promise<VersionedRuntimeDocument | null> {
   const row = await fetchStoredDocument(database, tableName, id);
   return row ? deserializeVersionedRuntimeDocument(tableName, row) : null;
-}
-
-function createBaseQueryState(): QueryState {
-  return { order: { field: "_id", direction: "asc" } };
-}
-
-function assertDirection(value: string): asserts value is QueryOrderDirection {
-  if (value !== "asc" && value !== "desc") {
-    throw new Error(
-      `Order direction must be "asc" or "desc", received "${value}"`
-    );
-  }
-}
-
-function normalizeOrderField(field: string): string {
-  if (field === "_id" || field === "_createdAt") {
-    return "_id";
-  }
-
-  assertQueryField(field);
-  return field;
-}
-
-function mergeFilters(
-  left: FilterObject | undefined,
-  right: FilterObject
-): FilterObject {
-  return left ? { AND: [left, right] } : right;
 }
 
 function toScalarCursorValue(value: unknown): FilterValue | undefined {
@@ -412,7 +397,7 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
   }
 
   filter(filter: FilterObject): QueryBuilder<RuntimeDocument> {
-    return this.clone({ filter: mergeFilters(this.state.filter, filter) });
+    return this.clone({ filter: combineFilters(this.state.filter, filter) });
   }
 
   order(direction: QueryOrderDirection): QueryBuilder<RuntimeDocument>;
@@ -530,6 +515,17 @@ class D1RuntimeQueryBuilder<TContext> implements QueryBuilder<RuntimeDocument> {
     scanBudgetMessage = DEFAULT_SCAN_BUDGET_MESSAGE
   ): Promise<RuntimeDocument[]> {
     assertReadRulesConfigured(this.options.rules);
+    const table = assertKnownTable(this.options.schema, this.options.tableName);
+    const partition = getPartitionReadTarget(
+      this.options.tableName,
+      table,
+      this.state
+    );
+    if (partition) {
+      this.options.readObserver?.onPartitionRead(partition);
+    } else {
+      this.options.readObserver?.onTableRead(this.options.tableName);
+    }
 
     const documents: RuntimeDocument[] = [];
     let scanPosition: RuntimeScanPosition = { cursor, offset: 0 };
@@ -607,17 +603,20 @@ export function assertWithinScanBudget(
 export class D1DatabaseAdapter<TContext = unknown> {
   private readonly database: RuntimeDatabase;
   private readonly getContext: () => TContext;
+  private readonly readObserver?: RuntimeReadObserver;
   private readonly rules?: Rules;
   private readonly schema: Schema;
 
   constructor(options: {
     database: RuntimeDatabase;
     getContext: () => TContext;
+    readObserver?: RuntimeReadObserver;
     rules?: Rules;
     schema: Schema;
   }) {
     this.database = options.database;
     this.getContext = options.getContext;
+    this.readObserver = options.readObserver;
     this.rules = options.rules;
     this.schema = options.schema;
   }
@@ -625,6 +624,7 @@ export class D1DatabaseAdapter<TContext = unknown> {
   async get(tableName: string, id: string): Promise<RuntimeDocument | null> {
     assertKnownTable(this.schema, tableName);
     assertReadRulesConfigured(this.rules);
+    this.readObserver?.onTableRead(tableName);
     const versioned = await fetchVersionedDocument(
       this.database,
       tableName,
@@ -649,6 +649,7 @@ export class D1DatabaseAdapter<TContext = unknown> {
     return new D1RuntimeQueryBuilder({
       database: this.database,
       getContext: this.getContext,
+      readObserver: this.readObserver,
       rules: this.rules,
       schema: this.schema,
       tableName,

@@ -7,6 +7,10 @@ import {
   type QueryCtx,
 } from "./types";
 
+/**
+ * Defines a server-only query: never exposed over RPC, callable only through
+ * `ctx.runQuery` from other functions.
+ */
 export function internalQuery<
   TArgs extends ValidatorShape,
   TReturns extends AnyValidator | undefined = undefined,

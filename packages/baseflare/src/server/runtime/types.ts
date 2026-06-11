@@ -144,8 +144,23 @@ export interface D1Database {
 
 export type RuntimeDatabase = D1Database | D1DatabaseSession;
 
+export interface DurableObjectId {
+  readonly name?: string;
+}
+
+export interface DurableObjectStub {
+  fetch(input: Request | string | URL, init?: RequestInit): Promise<Response>;
+}
+
+export interface DurableObjectNamespace {
+  get(id: DurableObjectId): DurableObjectStub;
+  idFromName(name: string): DurableObjectId;
+}
+
 export interface BaseflareRuntimeEnv {
   APP_DB: D1Database;
+  REALTIME_CONNECTIONS?: DurableObjectNamespace;
+  REALTIME_SUBSCRIPTIONS?: DurableObjectNamespace;
 }
 
 export interface BaseflareExecutionContext {

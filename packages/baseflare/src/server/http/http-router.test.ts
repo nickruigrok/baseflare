@@ -34,4 +34,19 @@ describe("HttpRouter", () => {
     expect(router.lookup("POST", "/missing")).toBeNull();
     expect(router).toBeInstanceOf(HttpRouter);
   });
+
+  it("matches prefix routes on path segment boundaries", () => {
+    const router = httpRouter();
+    const adminHandler = httpAction(async () => new Response("admin"));
+
+    router.routeWithPrefix({
+      handler: adminHandler,
+      method: "GET",
+      pathPrefix: "/admin",
+    });
+
+    expect(router.lookup("GET", "/admin")).toBe(adminHandler.handler);
+    expect(router.lookup("GET", "/admin/users")).toBe(adminHandler.handler);
+    expect(router.lookup("GET", "/administer")).toBeNull();
+  });
 });

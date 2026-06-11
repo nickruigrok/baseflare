@@ -9,6 +9,12 @@ const IDENTIFIER_PATTERN = /^[A-Za-z][A-Za-z0-9_]*$/;
 const FILTER_LOGIC_FIELD_NAMES = new Set(["AND", "OR", "NOT"]);
 export const TABLE_VERSION_TABLE_NAME = "_bf_table_versions";
 export const PARTITION_VERSION_TABLE_NAME = "_bf_partition_versions";
+export const REALTIME_OUTBOX_TABLE_NAME = "_bf_realtime_outbox";
+export const REALTIME_SHARD_CURSORS_TABLE_NAME = "_bf_realtime_shard_cursors";
+export const REALTIME_SHARD_GENERATIONS_TABLE_NAME =
+  "_bf_realtime_shard_generations";
+export const REALTIME_AUTOSCALE_STATE_TABLE_NAME =
+  "_bf_realtime_autoscale_state";
 
 export interface TableIndexOptions {
   readonly partition?: boolean;
@@ -119,6 +125,9 @@ export function assertFieldName(name: string): void {
 }
 
 export function createTableStatement(tableName: string): string {
+  // Schema parsing already validates identifiers; assert again here so no
+  // future caller can interpolate an unvalidated name into DDL.
+  assertTableName(tableName);
   return `CREATE TABLE ${tableName} (_id TEXT PRIMARY KEY, _data TEXT NOT NULL, _rev INTEGER NOT NULL DEFAULT 0 CHECK(_rev >= 0))`;
 }
 
@@ -127,12 +136,15 @@ export function createIndexStatement(
   index: TableIndex,
   options: { ifNotExists?: boolean } = {}
 ): string {
-  const expressions = index.fields
-    .map((field) => `json_extract(_data, '$.${field}')`)
-    .join(", ");
+  assertTableName(tableName);
+  assertIdentifier(index.name, "Index name");
+  const expressions = index.fields.map((field) => {
+    assertFieldName(field);
+    return `json_extract(_data, '$.${field}')`;
+  });
   const ifNotExists = options.ifNotExists ? " IF NOT EXISTS" : "";
 
-  return `CREATE INDEX${ifNotExists} ${tableName}_${index.name} ON ${tableName} (${expressions})`;
+  return `CREATE INDEX${ifNotExists} ${tableName}_${index.name} ON ${tableName} (${expressions.join(", ")})`;
 }
 
 export function createTableVersionStatements(
@@ -159,6 +171,46 @@ export function createPartitionVersionStatements(): SqlStatement[] {
   return [
     {
       sql: `CREATE TABLE IF NOT EXISTS ${PARTITION_VERSION_TABLE_NAME} (table_name TEXT NOT NULL, partition_key TEXT NOT NULL, partition_value TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 0 CHECK(version >= 0), PRIMARY KEY (table_name, partition_key, partition_value))`,
+      params: [],
+    },
+  ];
+}
+
+export function createRealtimeOutboxStatements(): SqlStatement[] {
+  return [
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME} (sequence INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT NOT NULL UNIQUE, created_at INTEGER NOT NULL, tables TEXT NOT NULL, partitions TEXT NOT NULL)`,
+      params: [],
+    },
+    {
+      // Retention cleanup uses created_at; sequence catch-up scans use the
+      // INTEGER PRIMARY KEY clustered index on `sequence`.
+      sql: `CREATE INDEX IF NOT EXISTS ${REALTIME_OUTBOX_TABLE_NAME}_created_at ON ${REALTIME_OUTBOX_TABLE_NAME} (created_at)`,
+      params: [],
+    },
+  ];
+}
+
+export function createRealtimeShardMetadataStatements(): SqlStatement[] {
+  return [
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_SHARD_GENERATIONS_TABLE_NAME} (generation_id INTEGER PRIMARY KEY, subscription_shard_count INTEGER NOT NULL CHECK(subscription_shard_count > 0), status TEXT NOT NULL CHECK(status IN ('active', 'draining', 'retired')), created_at INTEGER NOT NULL, drain_after INTEGER)`,
+      params: [],
+    },
+    {
+      sql: `INSERT OR IGNORE INTO ${REALTIME_SHARD_GENERATIONS_TABLE_NAME} (generation_id, subscription_shard_count, status, created_at, drain_after) VALUES (1, 1, 'active', 0, NULL)`,
+      params: [],
+    },
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_SHARD_CURSORS_TABLE_NAME} (shard_name TEXT PRIMARY KEY, generation_id INTEGER NOT NULL, last_processed_outbox_sequence INTEGER, updated_at INTEGER NOT NULL)`,
+      params: [],
+    },
+    {
+      sql: `CREATE TABLE IF NOT EXISTS ${REALTIME_AUTOSCALE_STATE_TABLE_NAME} (id INTEGER PRIMARY KEY CHECK(id = 1), scale_up_started_at INTEGER, scale_down_started_at INTEGER, updated_at INTEGER NOT NULL)`,
+      params: [],
+    },
+    {
+      sql: `INSERT OR IGNORE INTO ${REALTIME_AUTOSCALE_STATE_TABLE_NAME} (id, scale_up_started_at, scale_down_started_at, updated_at) VALUES (1, NULL, NULL, 0)`,
       params: [],
     },
   ];

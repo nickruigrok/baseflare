@@ -116,6 +116,11 @@ function validatePartitionIndex(
   }
 }
 
+/**
+ * Defines the application schema: a map of table names to `defineTable(...)`
+ * definitions. Validates names, fields, and index/partition rules eagerly so
+ * misconfigurations fail at startup, not at request time.
+ */
 export function defineSchema<TTables extends SchemaTables>(
   tables: TTables
 ): Schema<NormalizedSchemaTables<TTables>> {

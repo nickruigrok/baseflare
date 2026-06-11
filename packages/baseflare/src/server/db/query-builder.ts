@@ -48,13 +48,24 @@ export function assertTableIdentifier(tableName: string): void {
   }
 }
 
-function assertDirection(value: string): asserts value is OrderDirection {
+export function assertDirection(
+  value: string
+): asserts value is OrderDirection {
   if (value !== "asc" && value !== "desc") {
     throw new ValidationError(
       "order",
       `Order direction must be "asc" or "desc", received "${value}"`
     );
   }
+}
+
+export function normalizeOrderField(field: string): string {
+  if (field === "_id" || field === "_createdAt") {
+    return "_id";
+  }
+
+  assertQueryField(field);
+  return field;
 }
 
 export function createBaseQueryState(): QueryState {
@@ -108,15 +119,12 @@ class BaseflareQueryBuilder<TDocument extends Record<string, unknown>>
     }
 
     assertDirection(maybeDirection);
-    const field =
-      fieldOrDirection === "_id" || fieldOrDirection === "_createdAt"
-        ? "_id"
-        : fieldOrDirection;
-    if (field !== "_id") {
-      assertQueryField(field);
-    }
-
-    return this.clone({ order: { field, direction: maybeDirection } });
+    return this.clone({
+      order: {
+        direction: maybeDirection,
+        field: normalizeOrderField(fieldOrDirection),
+      },
+    });
   }
 
   limit(limit: number): QueryBuilder<TDocument> {

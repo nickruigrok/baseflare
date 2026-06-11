@@ -7,6 +7,10 @@ import {
   type InternalActionDefinition,
 } from "./types";
 
+/**
+ * Defines a server-only action: never exposed over RPC, callable only through
+ * `ctx.runAction` from other actions.
+ */
 export function internalAction<
   TArgs extends ValidatorShape,
   TReturns extends AnyValidator | undefined = undefined,

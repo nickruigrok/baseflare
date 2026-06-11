@@ -18,6 +18,10 @@
       "types": "./dist/client/index.d.ts",
       "import": "./dist/client/index.js"
     },
+    "./runtime": {
+      "types": "./dist/runtime/index.d.ts",
+      "import": "./dist/runtime/index.js"
+    },
     "./server": {
       "types": "./dist/server/index.d.ts",
       "import": "./dist/server/index.js"
@@ -35,6 +39,7 @@
     "build": "tsdown --config tsdown.config.ts",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "vitest run --config vitest.unit.config.ts && vitest run --config vitest.runtime.config.ts",
+    "test:perf": "vitest run --config vitest.perf.config.ts",
     "clean": "rimraf dist"
   },
   "dependencies": {

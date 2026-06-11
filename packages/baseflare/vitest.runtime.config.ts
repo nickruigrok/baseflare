@@ -20,11 +20,16 @@ export default defineWorkersConfig({
     poolOptions: {
       workers: {
         isolatedStorage: false,
+        main: sourcePath("./src/server/runtime/realtime-test-worker.ts"),
         miniflare: {
           compatibilityDate: "2025-12-13",
           compatibilityFlags: ["nodejs_compat"],
           d1Databases: {
             APP_DB: "baseflare-runtime-test-db",
+          },
+          durableObjects: {
+            REALTIME_CONNECTIONS: "RealtimeConnectionDO",
+            REALTIME_SUBSCRIPTIONS: "RealtimeSubscriptionDO",
           },
         },
       },
