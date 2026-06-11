@@ -686,7 +686,6 @@ export class RealtimeSubscriptionDO {
     let skipped = 0;
     const candidateActiveQueries: RealtimeActiveQueryCandidate[] = [];
     const deferredWaits: RealtimeDeferredActiveQueryWait[] = [];
-    const pendingDeliveries: PendingRealtimeDelivery[] = [];
     const activeQueryKeys = [...this.activeQueryStore.getRelevantKeys(targets)];
     skipped += Math.max(
       0,
@@ -716,6 +715,11 @@ export class RealtimeSubscriptionDO {
       }
     );
 
+    // Candidate locks are held through evaluation AND delivery flush: a
+    // deferred waiter (here or in another invocation) must only wake after
+    // the holder's deliveries are acknowledged, or its re-evaluation could
+    // race a second delivery for the same registrations against one still in
+    // flight - with no ordering guarantee between the two /deliver calls.
     const evaluationResult = await this.evaluateActiveQueries(
       candidateActiveQueries,
       targets.sequence,
@@ -723,11 +727,18 @@ export class RealtimeSubscriptionDO {
     );
     evaluated += evaluationResult.evaluated;
     failed += evaluationResult.failed;
-    pendingDeliveries.push(...evaluationResult.deliveries);
+    const deliveryResult = await this.flushPendingDeliveries(
+      evaluationResult.deliveries
+    );
+    evaluated += deliveryResult.evaluated;
+    failed += deliveryResult.failed;
+    for (const candidate of candidateActiveQueries) {
+      this.releaseActiveQueryEvaluationByKey(candidate.activeQuery.key);
+    }
 
-    // Deferred waits run only after evaluateActiveQueries has released every
-    // lock this invocation acquired, so waiting cannot deadlock with another
-    // invocation waiting on one of our candidates.
+    // Deferred waits run only after this invocation has flushed and released
+    // every lock it acquired, so waiting always happens while holding
+    // nothing - no hold-and-wait cycle with another invocation is possible.
     if (deferredWaits.length > 0) {
       const waitedCandidates: RealtimeActiveQueryCandidate[] = [];
       await runWithConcurrency(
@@ -756,12 +767,15 @@ export class RealtimeSubscriptionDO {
       );
       evaluated += waitedResult.evaluated;
       failed += waitedResult.failed;
-      pendingDeliveries.push(...waitedResult.deliveries);
+      const waitedDeliveryResult = await this.flushPendingDeliveries(
+        waitedResult.deliveries
+      );
+      evaluated += waitedDeliveryResult.evaluated;
+      failed += waitedDeliveryResult.failed;
+      for (const candidate of waitedCandidates) {
+        this.releaseActiveQueryEvaluationByKey(candidate.activeQuery.key);
+      }
     }
-
-    const deliveryResult = await this.flushPendingDeliveries(pendingDeliveries);
-    evaluated += deliveryResult.evaluated;
-    failed += deliveryResult.failed;
     emitRealtimeMetric(REALTIME_RE_EVALUATIONS_METRIC, evaluated, {
       result: "evaluated",
       source,
@@ -1039,7 +1053,6 @@ export class RealtimeSubscriptionDO {
         evaluation.versionSnapshot
       );
       const result = await this.createActiveQueryDeliveries(
-        activeQuery,
         registrations,
         sequence,
         evaluation
@@ -1083,7 +1096,6 @@ export class RealtimeSubscriptionDO {
     try {
       const evaluation = this.storedActiveQueryEvaluation(activeQuery);
       return await this.createActiveQueryDeliveries(
-        activeQuery,
         registrations,
         sequence,
         evaluation
@@ -1138,7 +1150,6 @@ export class RealtimeSubscriptionDO {
   }
 
   private async createActiveQueryDeliveries(
-    activeQuery: StoredRealtimeActiveQuery,
     registrations: readonly StoredRealtimeRegistration[],
     sequence: number | null,
     evaluation: RealtimeEvaluationResult
@@ -1183,7 +1194,10 @@ export class RealtimeSubscriptionDO {
       }
     }
 
-    this.releaseActiveQueryEvaluation(activeQuery);
+    // The active-query lock stays held: it is released by
+    // reEvaluateActiveRegistrations only after these deliveries flush, so a
+    // deferred waiter can never race a second delivery for the same
+    // registrations against one still in flight.
     return { deliveries, evaluated, failed };
   }
 

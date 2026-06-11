@@ -10641,6 +10641,107 @@ describe("worker runtime", () => {
     expect(deliveredResults.at(-1)).toContain("late");
   });
 
+  it("serializes deliveries while a prior flush for the query is in flight", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "serialize-seed");
+    const deliveryGate = createDeferred();
+    let parkDeliveries = false;
+    let deliverCalls = 0;
+    const deliveredTexts: string[][] = [];
+    const connections = new FakeDurableObjectNamespace(
+      async (_name, request) => {
+        deliverCalls += 1;
+        const delivery = await request.json();
+        const items = getRealtimeDeliveryItems(delivery);
+        if (parkDeliveries) {
+          await deliveryGate.promise;
+        }
+        for (const item of items) {
+          deliveredTexts.push(item.result.map((todo) => todo.text));
+        }
+        return Response.json({
+          delivered: items.length,
+          deliveredSubscriptions: items.map((item) => item.subscriptionId),
+          ok: true,
+        });
+      }
+    );
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: connections,
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "realtime:gated",
+          runtimeId,
+          subscriptionId: "sub-serialized",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const notify = (eventId: string) =>
+      subscriptionDo.fetch(
+        new Request("https://baseflare.internal/notify", {
+          body: JSON.stringify({ eventId }),
+          headers: { "content-type": "application/json" },
+          method: "POST",
+        })
+      );
+    const bumpedEvent = (eventId: string) =>
+      createRealtimeOutboxEvent(eventId, Date.now(), {
+        partitions: [todoOwnerPartition("owner-a")],
+        tables: ["todos"],
+      });
+    // Two warm rounds complete the version snapshot.
+    await bumpedEvent("serialize-warm-1");
+    await notify("serialize-warm-1");
+    await bumpedEvent("serialize-warm-2");
+    await notify("serialize-warm-2");
+    const warmedDeliverCalls = deliverCalls;
+
+    // Park the first evaluation inside the query so its snapshot provably
+    // precedes the second commit, then park its delivery flush.
+    const queryGate = createDeferred();
+    const entered = createDeferred();
+    realtimeGatedQueryGate = queryGate.promise;
+    realtimeGatedQueryEntered = () => entered.resolve(undefined);
+    parkDeliveries = true;
+    await createTodoViaRpc("owner-a", "serialize-v1");
+    await bumpedEvent("serialize-a");
+    const notifyA = notify("serialize-a");
+    await entered.promise;
+    realtimeGatedQueryEntered = null;
+    realtimeGatedQueryGate = null;
+    await createTodoViaRpc("owner-a", "serialize-v2");
+    await bumpedEvent("serialize-b");
+    queryGate.resolve(undefined);
+    const notifyB = notify("serialize-b");
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    // The racing notify must not issue a second delivery for the same
+    // registration while the first is still in flight.
+    expect(deliverCalls).toBe(warmedDeliverCalls + 1);
+
+    parkDeliveries = false;
+    deliveryGate.resolve(undefined);
+    await Promise.all([notifyA, notifyB]);
+
+    // The waiter delivered strictly after the holder: in order, newest last.
+    expect(deliverCalls).toBe(warmedDeliverCalls + 2);
+    const racedDeliveries = deliveredTexts.slice(-2);
+    expect(racedDeliveries[0]).not.toContain("serialize-v2");
+    expect(racedDeliveries[1]).toContain("serialize-v1");
+    expect(racedDeliveries[1]).toContain("serialize-v2");
+  });
+
   it("coalesces a notify burst into one evaluation", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await createTodoViaRpc("owner-a", "burst-seed");
