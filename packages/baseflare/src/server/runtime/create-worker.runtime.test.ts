@@ -10204,6 +10204,146 @@ describe("worker runtime", () => {
     expect(deliveries).toHaveLength(deliveredAfterFirst);
   });
 
+  it("evaluates realtime queries with the same results as authenticated HTTP requests", async () => {
+    // Pre-Phase-5 invariant: createAuth ignores headers on every path, so the
+    // realtime re-evaluation (empty headers) and the authenticated HTTP path
+    // must produce identical results. Phase 5's identity resolution must
+    // update both paths together (IMPLEMENTATION_PLAN.md Phase 5, item 5).
+    const runtimeId = createRealtimeRuntimeId();
+    await createTodoViaRpc("owner-a", "parity-a");
+    await createTodoViaRpc("owner-a", "parity-b");
+    const httpResponse = await invoke("/api/query/todos:list", {
+      body: rpcBody({ ownerToken: "owner-a" }),
+      headers: { authorization: "Bearer owner-a" },
+      method: "POST",
+    });
+    const httpResult = ((await httpResponse.json()) as { result: unknown })
+      .result;
+
+    const deliveredResults: unknown[] = [];
+    const subscriptionDo = new RealtimeSubscriptionDO(null, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(
+        async (_name, request) => {
+          const delivery = await request.json();
+          const items = getRealtimeDeliveryItems(delivery);
+          for (const item of items) {
+            deliveredResults.push(item.result);
+          }
+          return Response.json({
+            delivered: items.length,
+            deliveredSubscriptions: items.map((item) => item.subscriptionId),
+            ok: true,
+          });
+        }
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/register", {
+        body: JSON.stringify({
+          args: { ownerToken: "owner-a" },
+          authorizationHeader: "Bearer owner-a",
+          connectionKey: "client-a",
+          connectionName: "connection:0",
+          epoch: 1,
+          leaseExpiresAt: Date.now() + 60_000,
+          queryName: "todos:list",
+          runtimeId,
+          subscriptionId: "sub-parity",
+        }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+    const catchUpResponse = await subscriptionDo.fetch(
+      new Request("https://baseflare.internal/catch-up", {
+        body: JSON.stringify({ afterSequence: null, limit: 10 }),
+        headers: { "content-type": "application/json" },
+        method: "POST",
+      })
+    );
+
+    expect(catchUpResponse.ok).toBe(true);
+    expect(deliveredResults).toHaveLength(1);
+    expect(deliveredResults[0]).toEqual(httpResult);
+  });
+
+  it("treats a registration as inactive when its expired lease cannot be renewed", async () => {
+    const runtimeId = createRealtimeRuntimeId();
+    const state = new FakeRealtimeDurableObjectState();
+    const subscriptionDo = new RealtimeSubscriptionDO(state, {
+      APP_DB: env.APP_DB,
+      REALTIME_CONNECTIONS: new FakeDurableObjectNamespace(() =>
+        Promise.resolve(Response.json({ connected: true, ok: true }))
+      ),
+      REALTIME_SUBSCRIPTIONS: new FakeDurableObjectNamespace(),
+    });
+    const internals = subscriptionDo as unknown as {
+      handleUnchangedRegistration(
+        registration: StoredRealtimeRegistration
+      ): Promise<{
+        active: boolean;
+        evaluated: number;
+        failed: number;
+        skipped: number;
+      }>;
+      registrationStore: {
+        get(registrationKey: string): StoredRealtimeRegistration | undefined;
+        upsert(
+          registrationKey: string,
+          registration: StoredRealtimeRegistration
+        ): Promise<void>;
+      };
+    };
+    const registration: StoredRealtimeRegistration = {
+      args: { ownerToken: "owner-a" },
+      authorizationFingerprint: "auth-owner-a",
+      connectionKey: "client-a",
+      connectionName: getRealtimeConnectionShardName("client-a"),
+      epoch: 1,
+      leaseExpiresAt: Date.now() - 1000,
+      queryName: "todos:list",
+      runtimeId,
+      subscriptionId: "sub-expired-lease",
+    };
+    await internals.registrationStore.upsert(
+      createRegistrationKey("client-a", "sub-expired-lease"),
+      registration
+    );
+    // Consumed by renewLease's persist; the catch's markBackedOff succeeds.
+    state.failedStoragePuts = 1;
+
+    const failedRenewal =
+      await internals.handleUnchangedRegistration(registration);
+
+    expect(failedRenewal).toEqual({
+      active: false,
+      evaluated: 0,
+      failed: 1,
+      skipped: 0,
+    });
+    expect(
+      internals.registrationStore.get(
+        createRegistrationKey("client-a", "sub-expired-lease")
+      )?.reEvaluationRetryAt
+    ).toEqual(expect.any(Number));
+
+    // Self-healing: with storage recovered, the next pass renews the lease.
+    const renewed = await internals.handleUnchangedRegistration(registration);
+    expect(renewed).toEqual({
+      active: true,
+      evaluated: 1,
+      failed: 0,
+      skipped: 0,
+    });
+    expect(
+      internals.registrationStore.get(
+        createRegistrationKey("client-a", "sub-expired-lease")
+      )?.leaseExpiresAt
+    ).toBeGreaterThan(Date.now());
+  });
+
   it("stores an under-claiming snapshot on first evaluation and converges", async () => {
     const runtimeId = createRealtimeRuntimeId();
     await createTodoViaRpc("owner-a", "seed");

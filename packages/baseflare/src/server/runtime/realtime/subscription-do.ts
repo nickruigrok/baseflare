@@ -1379,6 +1379,10 @@ export class RealtimeSubscriptionDO {
     } catch (error) {
       await this.registrationStore.markBackedOff(latestRegistration);
       this.logReEvaluationFailure(latestRegistration, error);
+      // The lease is still expired and could not be renewed; reporting the
+      // registration active would let the caller migrate or update stale
+      // state mid-storage-failure. It stays stored and backed off; the next
+      // pass or the cleanup liveness renewal retries.
       return { active: false, evaluated: 0, failed: 1, skipped: 0 };
     }
   }
@@ -1945,11 +1949,14 @@ export class RealtimeSubscriptionDO {
         functionIndex: runtime.functionIndex,
         readObserver,
         // Phase 3 evaluates realtime queries with no auth context by design:
-        // ctx.auth is null everywhere until Phase 5, and active-query keys
-        // include the authorization fingerprint so different credentials never
-        // coalesce. Phase 5 must re-resolve verified identity per active query
-        // on every evaluation and stop delivery on revocation (see
-        // assertAuthFingerprintLive).
+        // createAuth ignores headers and yields null identity on EVERY path
+        // (pinned by auth.test.ts and the HTTP/realtime parity runtime test),
+        // so empty headers here cannot change results. Credential isolation
+        // holds via fingerprint-keyed active queries and
+        // assertAuthFingerprintLive. Phase 5 must re-resolve verified identity
+        // per evaluation through the session store - never by replaying raw
+        // headers - and stop delivery on revocation (IMPLEMENTATION_PLAN.md
+        // Phase 5, deliverable 5).
         requestHeaders: new Headers(),
         rules: runtime.rules,
         schema: runtime.schema,
