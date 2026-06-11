@@ -106,7 +106,7 @@ export class RealtimeRegistrationStore {
             storageKey,
           }
         );
-        await storage.delete(storageKey);
+        await this.deleteQuietly(storage, storageKey);
         continue;
       }
 
@@ -130,7 +130,10 @@ export class RealtimeRegistrationStore {
           activeQueryKey
       )
       .map(([registrationKey]) => registrationKey);
-    await Promise.all(
+    // Best-effort hygiene: memory is already repaired; a failed persist just
+    // leaves the stale stored pointer to be repaired again on the next load
+    // and must not fail this one.
+    const repairResults = await Promise.allSettled(
       repairedRegistrationKeys.map((registrationKey) => {
         const registration = this.registrations.get(registrationKey);
         return registration
@@ -138,7 +141,34 @@ export class RealtimeRegistrationStore {
           : Promise.resolve();
       })
     );
+    for (const [index, result] of repairResults.entries()) {
+      if (result.status === "rejected") {
+        logRuntimeEvent("warn", "runtime.realtime_load_cleanup_failed", {
+          errorName:
+            result.reason instanceof Error
+              ? result.reason.name
+              : typeof result.reason,
+          storageKey: repairedRegistrationKeys[index],
+        });
+      }
+    }
     this.loaded = true;
+  }
+
+  private async deleteQuietly(
+    storage: NonNullable<RealtimeDurableObjectState["storage"]>,
+    storageKey: string
+  ): Promise<void> {
+    try {
+      await storage.delete(storageKey);
+    } catch (error) {
+      // Best-effort hygiene: the entry is already excluded from memory; a
+      // failed delete must not fail the load. The next load retries it.
+      logRuntimeEvent("warn", "runtime.realtime_load_cleanup_failed", {
+        errorName: error instanceof Error ? error.name : typeof error,
+        storageKey,
+      });
+    }
   }
 
   get(registrationKey: string): StoredRealtimeRegistration | undefined {

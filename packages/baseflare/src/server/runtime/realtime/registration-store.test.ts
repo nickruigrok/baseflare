@@ -83,6 +83,81 @@ describe("RealtimeRegistrationStore", () => {
     expect(store.size()).toBe(1);
   });
 
+  it("loads despite a failed malformed-entry cleanup", async () => {
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const state = new FakeRealtimeDurableObjectState();
+    const seedStore = new RealtimeRegistrationStore(state);
+    await seedStore.upsert(registrationKey("sub-a"), registration("sub-a"));
+    const malformedKey = `realtime:registration:${registrationKey("sub-bad")}`;
+    await state.storage.put(malformedKey, {});
+    const workingDelete = state.storage.delete;
+    state.storage.delete = () =>
+      Promise.reject(new Error("delete unavailable"));
+
+    const store = new RealtimeRegistrationStore(state);
+    await store.loadOnce();
+
+    expect(store.size()).toBe(1);
+    expect(store.get(registrationKey("sub-a"))).toBeDefined();
+    expect(warnSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_load_cleanup_failed",
+        storageKey: malformedKey,
+      })
+    );
+
+    // Deferred hygiene: the next load with healthy storage deletes the entry.
+    state.storage.delete = workingDelete;
+    const retryStore = new RealtimeRegistrationStore(state);
+    await retryStore.loadOnce();
+    expect(state.durableStorage.has(malformedKey)).toBe(false);
+    warnSpy.mockRestore();
+  });
+
+  it("loads despite a failed pointer repair persist", async () => {
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const state = new FakeRealtimeDurableObjectState();
+    const key = registrationKey("sub-a");
+    await state.storage.put(`realtime:registration:${key}`, {
+      ...registration("sub-a"),
+      activeQueryKey: "not-an-active-query-key",
+    });
+    // Sync's active-query writes succeed; only the repair's registration
+    // persist fails.
+    const workingPut = state.storage.put;
+    state.storage.put = ((keyOrEntries: unknown, value?: unknown) => {
+      const keys =
+        typeof keyOrEntries === "string"
+          ? [keyOrEntries]
+          : Object.keys(keyOrEntries as Record<string, unknown>);
+      if (keys.some((entry) => entry.startsWith("realtime:registration:"))) {
+        return Promise.reject(new Error("registration put unavailable"));
+      }
+      return workingPut(keyOrEntries as Record<string, unknown>, value);
+    }) as typeof state.storage.put;
+
+    const activeQueryStore = new RealtimeActiveQueryStore(state);
+    const store = new RealtimeRegistrationStore(state, activeQueryStore);
+    await store.loadOnce();
+
+    // Memory carries the repaired canonical pointer even though persisting
+    // the repair failed; the next load repairs storage again.
+    expect(store.get(key)?.activeQueryKey).toMatch(/^aq:/);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_load_cleanup_failed",
+      })
+    );
+    state.storage.put = workingPut;
+    warnSpy.mockRestore();
+  });
+
   it("deletes malformed registration entries during reload", async () => {
     const state = new FakeRealtimeDurableObjectState();
     const storageKey = `realtime:registration:${registrationKey("sub-a")}`;

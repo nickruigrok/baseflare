@@ -196,6 +196,48 @@ describe("RealtimeActiveQueryStore", () => {
     expect(store.size()).toBe(1);
   });
 
+  it("loads despite a failed invalid-entry cleanup", async () => {
+    const warnSpy = vi
+      .spyOn(console, "warn")
+      .mockImplementation(() => undefined);
+    const state = new FakeRealtimeDurableObjectState();
+    const seedStore = new RealtimeActiveQueryStore(state);
+    await seedStore.upsertFromRegistration(
+      registrationKey("sub-a"),
+      registration("sub-a")
+    );
+    await state.storage.put("realtime:active-query:invalid-key", {
+      args: {},
+      key: "invalid-key",
+      memberRegistrationKeys: [registrationKey("sub-a")],
+      queryName: "todos:list",
+      runtimeId: "runtime:1",
+    });
+    const workingDelete = state.storage.delete;
+    state.storage.delete = () =>
+      Promise.reject(new Error("delete unavailable"));
+
+    const store = new RealtimeActiveQueryStore(state);
+    await store.loadOnce();
+
+    expect(store.size()).toBe(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "baseflare-runtime",
+      expect.objectContaining({
+        event: "runtime.realtime_load_cleanup_failed",
+        storageKey: "realtime:active-query:invalid-key",
+      })
+    );
+
+    state.storage.delete = workingDelete;
+    const retryStore = new RealtimeActiveQueryStore(state);
+    await retryStore.loadOnce();
+    expect(state.durableStorage.has("realtime:active-query:invalid-key")).toBe(
+      false
+    );
+    warnSpy.mockRestore();
+  });
+
   it("drops invalid active query storage keys during reload", async () => {
     const state = new FakeRealtimeDurableObjectState();
     await state.storage.put("realtime:active-query:invalid-key", {

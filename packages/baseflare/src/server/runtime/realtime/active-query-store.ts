@@ -117,7 +117,16 @@ export class RealtimeActiveQueryStore {
             storageKey,
           }
         );
-        await storage.delete(storageKey);
+        try {
+          await storage.delete(storageKey);
+        } catch (error) {
+          // Best-effort hygiene: the entry is already excluded from memory;
+          // a failed delete must not fail the load. The next load retries.
+          logRuntimeEvent("warn", "runtime.realtime_load_cleanup_failed", {
+            errorName: error instanceof Error ? error.name : typeof error,
+            storageKey,
+          });
+        }
         continue;
       }
 
